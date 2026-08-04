@@ -473,6 +473,21 @@ https://hydra.cc/docs/advanced/instantiate_objects/overview/
 _agent_loop_registry: dict[str, dict] = {}
 
 
+def _get_tb_opd_cfg(config) -> dict:
+    """Return the ``distillation.tb_opd`` sub-config as a plain mapping.
+
+    Robust to the subtree being absent so that standard OPD is unaffected.
+    """
+    try:
+        dist = config.get("distillation", None)
+    except Exception:  # noqa: BLE001
+        return {}
+    if dist is None:
+        return {}
+    tb = dist.get("tb_opd", None) if hasattr(dist, "get") else None
+    return tb if tb is not None else {}
+
+
 def register(agent_name: str):
     """Register agent loop class."""
 
@@ -555,6 +570,11 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+        # Token-level branching OPD (TB-OPD). Defensive .get so absence of the
+        # config subtree leaves standard OPD (B1) untouched.
+        self.tb_opd_cfg = _get_tb_opd_cfg(self.config)
+        self.tb_opd_enabled = bool(self.tb_opd_cfg.get("enable", False))
+
     def _get_mm_processor_kwargs(self, audio_data: Optional[list[Any]] = None) -> dict[str, Any]:
         """Return multimodal processor kwargs with audio sampling-rate defaults."""
         mm_processor_kwargs = dict(self.mm_processor_kwargs or {})
@@ -587,6 +607,12 @@ class AgentLoopWorker:
         """
         config = self.rollout_config
         validate = batch.meta_info.get("validate", False)
+
+        # TB-OPD: token-level branching. Never branches on validation (eval must
+        # stay standard). All other paths are unchanged when tb_opd is disabled.
+        if self.tb_opd_enabled and not validate:
+            return await self._generate_sequences_tb_opd(batch)
+
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
@@ -692,6 +718,401 @@ class AgentLoopWorker:
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    def _make_agent_loop(self, agent_name: str):
+        """Instantiate a concrete agent loop (mirrors ``_run_agent_loop``)."""
+        assert agent_name in _agent_loop_registry, (
+            f"Agent loop {agent_name} not registered, registered: {_agent_loop_registry.keys()}"
+        )
+        return hydra.utils.instantiate(
+            config=_agent_loop_registry[agent_name],
+            trainer_config=DictConfigWrap(config=self.config),
+            server_manager=self.llm_client,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
+            data_config=DictConfigWrap(self.config.data),
+            tools=ToolListWrap(self.tools),
+        )
+
+    async def _generate_sequences_tb_opd(self, batch: DataProto) -> DataProto:
+        """TB-OPD rollout: per-prompt fixed-slot fan-out (main + k branches).
+
+        The batch reaching a worker is already repeated by ``rollout.n`` with
+        ``interleave=True``, so rows sharing ``index`` are contiguous groups of
+        exactly ``n``. Each group produces exactly ``n`` outputs (slot 0 = main,
+        slots 1..k = branches or plain rollouts), preserving row count/order so
+        the trainer's ``batch.repeat(n).union(gen)`` remains valid.
+        """
+        config = self.rollout_config
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+
+        if "agent_name" not in batch.non_tensor_batch:
+            batch.non_tensor_batch["agent_name"] = np.array(
+                [config.agent.default_agent_loop] * len(batch), dtype=object
+            )
+
+        if "index" in batch.non_tensor_batch:
+            index = batch.non_tensor_batch["index"]
+        else:
+            index = np.arange(len(batch))
+
+        trajectory_info = await get_trajectory_info(
+            batch.meta_info.get("global_steps", -1), index.tolist(), False
+        )
+
+        # Group a prompt's contiguous rollouts. Prefer ``uid`` (guaranteed unique
+        # per prompt by the trainer and shared across the n interleaved repeats);
+        # ``index`` can collapse for datasets that don't populate extra_info.index.
+        if "uid" in batch.non_tensor_batch:
+            group_key = list(batch.non_tensor_batch["uid"])
+        else:
+            group_key = list(index)
+
+        groups: list[list[int]] = []
+        start = 0
+        for i in range(1, len(group_key) + 1):
+            if i == len(group_key) or group_key[i] != group_key[start]:
+                groups.append(list(range(start, i)))
+                start = i
+
+        default_agent = config.agent.default_agent_loop
+
+        def _row_kwargs(row: int) -> dict:
+            # Drop internal keys; ``agent_name`` is consumed separately (keyword-only
+            # in the standard path) and must not reach ``run`` / postprocess.
+            return {
+                k: v[row]
+                for k, v in batch.non_tensor_batch.items()
+                if k not in ("__do_sample__", "agent_name")
+            }
+
+        def _row_agent(row: int) -> str:
+            if "agent_name" in batch.non_tensor_batch:
+                return batch.non_tensor_batch["agent_name"][row]
+            return default_agent
+
+        group_tasks = [
+            self._run_tb_opd_group(
+                [(row, trajectory_info[row], _row_kwargs(row)) for row in group],
+                _row_agent(group[0]),
+                dict(sampling_params),
+            )
+            for group in groups
+        ]
+        group_outputs = await asyncio.gather(*group_tasks)
+
+        outputs: list[Optional[_InternalAgentLoopOutput]] = [None] * len(batch)
+        for group, gout in zip(groups, group_outputs, strict=True):
+            for slot, row in enumerate(group):
+                outputs[row] = gout[slot]
+        assert all(o is not None for o in outputs), "TB-OPD produced a hole in the output batch"
+
+        return self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=False)
+
+    async def _run_tb_opd_group(
+        self, rows: list[tuple[int, dict, dict]], agent_name: str, sampling_params: dict
+    ) -> list[_InternalAgentLoopOutput]:
+        """Coordinate one prompt's ``n`` slots into ``n`` post-processed outputs."""
+        from verl.experimental.agent_loop import tb_opd
+
+        cfg = self.tb_opd_cfg
+        only_fail = bool(cfg.get("only_fail", True))
+        fork_metric = str(cfg.get("fork_metric", "entropy"))
+        topk_logprobs = int(cfg.get("topk_logprobs", 20))
+        branch_min_tokens = int(cfg.get("branch_min_tokens", 8))
+        correct_threshold = float(cfg.get("correct_threshold", 1.0))
+        fork_select = str(cfg.get("fork_select", "argmax"))
+        fork_topk_positions = int(cfg.get("fork_topk_positions", 20))
+        fork_skip_first = int(cfg.get("fork_skip_first", 1))
+        fork_min_token_strip_len = int(cfg.get("fork_min_token_strip_len", 1))
+        fork_min_entropy = float(cfg.get("fork_min_entropy", 0.0))
+        fork_dedup_main = bool(cfg.get("fork_dedup_main", True))
+        fork_token_filter = str(cfg.get("fork_token_filter", "math_aware"))
+        # Scheme B: read fork candidates from the main rollout's own top-k logprobs
+        # (requested via logprobs=k during generation) instead of a second forward.
+        scheme_b = bool(cfg.get("scheme_b", False))
+        scheme_b_validate = bool(cfg.get("scheme_b_validate", False))
+        branch_mode = str(cfg.get("branch_mode", "forced_topk"))
+        resample_temperature = float(cfg.get("resample_temperature", -1.0))
+
+        # Cache the tokenizer's special-id set once for the CURE-style filter.
+        special_ids = getattr(self, "_tb_opd_special_ids", None)
+        if special_ids is None:
+            special_ids = {int(x) for x in getattr(self.tokenizer, "all_special_ids", [])}
+            self._tb_opd_special_ids = special_ids
+
+        n_slots = len(rows)
+        _, _, main_kwargs = rows[0]
+        agent_loop = self._make_agent_loop(agent_name)
+
+        # Slot 0: main trajectory (standard single-turn generation). Under Scheme B
+        # request per-token top-k logprobs so fork selection can read candidates
+        # from this pass alone (no second forward).
+        main_sp = dict(sampling_params)
+        if scheme_b:
+            main_sp["logprobs"] = topk_logprobs
+        main_out: AgentLoopOutput = await agent_loop.run(main_sp, **main_kwargs)
+
+        # Reward gate.
+        score, is_correct = tb_opd.score_solution(
+            self.tokenizer, list(main_out.response_ids), main_kwargs, correct_threshold
+        )
+
+        # Consume (and strip) the rollout top-k so the large per-token distribution
+        # is never stored/dumped into TransferQueue. Present only under Scheme B.
+        out_lp = main_out.extra_fields.pop("output_logprobs", None)
+        out_id = main_out.extra_fields.pop("output_ids", None)
+
+        do_branch = (not only_fail) or (not is_correct)
+        fork = None
+        none_reason = "not_attempted"
+        used_scheme_b = False
+        if do_branch and n_slots > 1:
+            used_scheme_b = scheme_b and out_lp is not None and out_id is not None
+            if used_scheme_b:
+                # Scheme B: no server round-trip; synchronous selection.
+                fork = tb_opd.select_fork_from_topk(
+                    list(main_out.response_ids),
+                    out_lp,
+                    out_id,
+                    metric=fork_metric,
+                    min_tokens=branch_min_tokens,
+                    response_length=agent_loop.response_length,
+                    tokenizer=self.tokenizer,
+                    special_ids=special_ids,
+                    skip_first=fork_skip_first,
+                    min_token_strip_len=fork_min_token_strip_len,
+                    min_entropy=fork_min_entropy,
+                    select=fork_select,
+                    topk_positions=fork_topk_positions,
+                    dedup_main=fork_dedup_main,
+                    filter_mode=fork_token_filter,
+                )
+            else:
+                fork = await tb_opd.select_fork(
+                    self.llm_client,
+                    list(main_out.prompt_ids),
+                    list(main_out.response_ids),
+                    topk=topk_logprobs,
+                    metric=fork_metric,
+                    min_tokens=branch_min_tokens,
+                    response_length=agent_loop.response_length,
+                    tokenizer=self.tokenizer,
+                    special_ids=special_ids,
+                    skip_first=fork_skip_first,
+                    min_token_strip_len=fork_min_token_strip_len,
+                    min_entropy=fork_min_entropy,
+                    select=fork_select,
+                    topk_positions=fork_topk_positions,
+                    dedup_main=fork_dedup_main,
+                    filter_mode=fork_token_filter,
+                )
+            none_reason = "ok" if fork.get("pos") is not None else str(fork.get("none_reason", "unknown"))
+
+            # Validation-only: also run the legacy second-forward selector and record
+            # whether it agrees on the fork position. Guards the temperature /
+            # logprobs_mode consistency caveat before trusting Scheme B; off by default.
+            if used_scheme_b and scheme_b_validate:
+                ref = await tb_opd.select_fork(
+                    self.llm_client,
+                    list(main_out.prompt_ids),
+                    list(main_out.response_ids),
+                    topk=topk_logprobs,
+                    metric=fork_metric,
+                    min_tokens=branch_min_tokens,
+                    response_length=agent_loop.response_length,
+                    tokenizer=self.tokenizer,
+                    special_ids=special_ids,
+                    skip_first=fork_skip_first,
+                    min_token_strip_len=fork_min_token_strip_len,
+                    min_entropy=fork_min_entropy,
+                    select="argmax",  # deterministic for a meaningful comparison
+                    topk_positions=fork_topk_positions,
+                    dedup_main=fork_dedup_main,
+                    filter_mode=fork_token_filter,
+                )
+                main_out.extra_fields["tb_opd_schemeb_pos_match"] = float(
+                    ref.get("pos") is not None and ref.get("pos") == fork.get("pos")
+                )
+
+        # A usable fork needs a position; forced_topk also requires candidate tokens.
+        has_fork = fork is not None and fork.get("pos") is not None
+        if has_fork and branch_mode != "resample":
+            has_fork = bool(fork.get("cand_token_ids"))
+        # No valid fork -> degrade to plain rollouts for the extra slots.
+        mode = "branch" if has_fork else "plain"
+
+        # TB-OPD diagnostics recorded on the main slot's extra_fields.
+        main_out.extra_fields["tb_opd_slot"] = 0
+        main_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
+        main_out.extra_fields["tb_opd_score"] = float(score)
+        main_out.extra_fields["tb_opd_mode_branch"] = float(mode == "branch")
+        main_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+        main_out.extra_fields["tb_opd_fork_pos"] = float(fork["pos"]) if has_fork else -1.0
+        main_out.extra_fields["tb_opd_fork_score"] = float(fork["score"]) if has_fork else 0.0
+        main_out.extra_fields["tb_opd_num_branch"] = float((n_slots - 1) if mode == "branch" else 0.0)
+        # Fork-selection diagnostics (main slot only).
+        main_out.extra_fields["tb_opd_fork_attempted"] = float(do_branch and n_slots > 1)
+        main_out.extra_fields["tb_opd_fork_found"] = float(has_fork)
+        main_out.extra_fields["tb_opd_none_reason"] = none_reason
+        main_out.extra_fields["tb_opd_scheme_b"] = float(used_scheme_b)
+        if has_fork:
+            rl = max(1, int(agent_loop.response_length))
+            main_out.extra_fields["tb_opd_fork_pos_frac"] = float(fork["pos"]) / rl
+
+        raw_outputs: list[AgentLoopOutput] = [main_out]
+        for slot in range(1, n_slots):
+            if mode == "branch":
+                if branch_mode == "resample":
+                    branch_out = await self._tb_generate_branch_resample(
+                        agent_loop,
+                        main_out,
+                        fork["pos"],
+                        dict(sampling_params),
+                        resample_temperature,
+                    )
+                else:
+                    cands = fork["cand_token_ids"]
+                    cand_token = cands[(slot - 1) % len(cands)]
+                    branch_out = await self._tb_generate_branch(
+                        agent_loop, main_out, fork["pos"], int(cand_token), dict(sampling_params)
+                    )
+                branch_out.extra_fields["tb_opd_slot"] = slot
+                branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
+                branch_out.extra_fields["tb_opd_mode_branch"] = 1.0
+                branch_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+                raw_outputs.append(branch_out)
+            else:
+                _, _, slot_kwargs = rows[slot]
+                plain_out: AgentLoopOutput = await agent_loop.run(dict(sampling_params), **slot_kwargs)
+                plain_out.extra_fields["tb_opd_slot"] = slot
+                plain_out.extra_fields["tb_opd_mode_branch"] = 0.0
+                raw_outputs.append(plain_out)
+
+        results: list[_InternalAgentLoopOutput] = []
+        for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
+            results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
+        return results
+
+    async def _tb_generate_branch(
+        self,
+        agent_loop,
+        main_out: AgentLoopOutput,
+        fork_pos: int,
+        cand_token: int,
+        sampling_params: dict,
+    ) -> AgentLoopOutput:
+        """Force ``cand_token`` at ``fork_pos`` then continue-generate the branch."""
+        prompt_ids = list(main_out.prompt_ids)
+        resp_prefix = list(main_out.response_ids[:fork_pos]) + [cand_token]
+        response_length = agent_loop.response_length
+        remaining = max(1, response_length - len(resp_prefix))
+
+        sp = dict(sampling_params)
+        # logprobs flag is consumed by the server as a bool -> keep parity with main.
+        sp["max_tokens"] = remaining
+        out = await self.llm_client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids + resp_prefix,
+            sampling_params=sp,
+        )
+        continuation = list(out.token_ids)
+        response_ids = (resp_prefix + continuation)[:response_length]
+
+        response_logprobs = None
+        if main_out.response_logprobs is not None:
+            cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
+            response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
+
+        # Preserve weight-version tags for v1 off-policy metrics (TQ tags read these).
+        extra_fields: dict[str, Any] = {"turn_scores": [], "tool_rewards": []}
+        min_gs = main_out.extra_fields.get("min_global_steps")
+        max_gs = main_out.extra_fields.get("max_global_steps")
+        out_extra = getattr(out, "extra_fields", None) or {}
+        if out_extra.get("min_global_steps") is not None:
+            min_gs = out_extra["min_global_steps"] if min_gs is None else min(min_gs, out_extra["min_global_steps"])
+        if out_extra.get("max_global_steps") is not None:
+            max_gs = out_extra["max_global_steps"] if max_gs is None else max(max_gs, out_extra["max_global_steps"])
+        if min_gs is not None:
+            extra_fields["min_global_steps"] = min_gs
+        if max_gs is not None:
+            extra_fields["max_global_steps"] = max_gs
+
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_mask=[1] * len(response_ids),
+            response_logprobs=response_logprobs,
+            multi_modal_data=main_out.multi_modal_data,
+            mm_processor_kwargs=main_out.mm_processor_kwargs,
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields=extra_fields,
+        )
+
+    async def _tb_generate_branch_resample(
+        self,
+        agent_loop,
+        main_out: AgentLoopOutput,
+        fork_pos: int,
+        sampling_params: dict,
+        resample_temperature: float,
+    ) -> AgentLoopOutput:
+        """Continue-generate from the shared prefix at ``fork_pos`` (no forced token)."""
+        prompt_ids = list(main_out.prompt_ids)
+        resp_prefix = list(main_out.response_ids[:fork_pos])
+        response_length = agent_loop.response_length
+        remaining = max(1, response_length - len(resp_prefix))
+
+        sp = dict(sampling_params)
+        sp["max_tokens"] = remaining
+        if resample_temperature >= 0.0:
+            sp["temperature"] = resample_temperature
+
+        out = await self.llm_client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids + resp_prefix,
+            sampling_params=sp,
+        )
+        continuation = list(out.token_ids)
+        response_ids = (resp_prefix + continuation)[:response_length]
+
+        response_logprobs = None
+        if main_out.response_logprobs is not None:
+            cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
+            response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
+
+        extra_fields: dict[str, Any] = {"turn_scores": [], "tool_rewards": []}
+        min_gs = main_out.extra_fields.get("min_global_steps")
+        max_gs = main_out.extra_fields.get("max_global_steps")
+        out_extra = getattr(out, "extra_fields", None) or {}
+        if out_extra.get("min_global_steps") is not None:
+            min_gs = out_extra["min_global_steps"] if min_gs is None else min(min_gs, out_extra["min_global_steps"])
+        if out_extra.get("max_global_steps") is not None:
+            max_gs = out_extra["max_global_steps"] if max_gs is None else max(max_gs, out_extra["max_global_steps"])
+        if min_gs is not None:
+            extra_fields["min_global_steps"] = min_gs
+        if max_gs is not None:
+            extra_fields["max_global_steps"] = max_gs
+
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_mask=[1] * len(response_ids),
+            response_logprobs=response_logprobs,
+            multi_modal_data=main_out.multi_modal_data,
+            mm_processor_kwargs=main_out.mm_processor_kwargs,
+            num_turns=2,
+            metrics=AgentLoopMetrics(),
+            extra_fields=extra_fields,
+        )
 
     def _pad_token_ids(
         self,
@@ -1168,6 +1589,11 @@ class AgentLoopManager:
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
+        # TB-OPD: when enabled we must keep each prompt's n contiguous rows within
+        # a single worker chunk so the group can be coordinated (main + branches).
+        self.tb_opd_cfg = _get_tb_opd_cfg(config)
+        self.tb_opd_enabled = bool(self.tb_opd_cfg.get("enable", False))
+
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
@@ -1201,6 +1627,34 @@ class AgentLoopManager:
                 )
             )
 
+    def _chunk_group_aware(self, prompts: DataProto):
+        """Split into contiguous chunks whose boundaries align to ``rollout.n``.
+
+        With ``interleave=True`` repetition, a prompt's ``n`` rollouts are
+        contiguous. Aligning chunk boundaries to multiples of ``n`` guarantees a
+        prompt group is never split across workers. Returns ``(workers, chunks)``
+        with matching lengths (only as many workers as non-empty chunks).
+        """
+        n = int(self.rollout_config.n)
+        total = len(prompts)
+        num_workers = len(self.agent_loop_workers)
+        if n <= 0 or total % n != 0:
+            # Fall back to naive chunking; group coordination handles ragged groups.
+            return self.agent_loop_workers, prompts.chunk(num_workers)
+
+        num_groups = total // n
+        num_chunks = min(num_workers, num_groups)
+        base, rem = divmod(num_groups, num_chunks)
+        chunks = []
+        g0 = 0
+        for c in range(num_chunks):
+            gc = base + (1 if c < rem else 0)
+            start = g0 * n
+            end = (g0 + gc) * n
+            chunks.append(prompts.slice(start, end))
+            g0 += gc
+        return self.agent_loop_workers[:num_chunks], chunks
+
     @auto_await
     @SkipManager.annotate(role="rollout")
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -1218,11 +1672,16 @@ class AgentLoopManager:
         if "priority" not in prompts.non_tensor_batch:
             prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        validate = prompts.meta_info.get("validate", False)
+        if self.tb_opd_enabled and not validate:
+            workers, chunkes = self._chunk_group_aware(prompts)
+        else:
+            workers = self.agent_loop_workers
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                for worker, chunk in zip(workers, chunkes, strict=True)
             ]
         )
         output = DataProto.concat(outputs)

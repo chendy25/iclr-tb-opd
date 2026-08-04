@@ -551,6 +551,22 @@ class TestProcessValidationMetrics(unittest.TestCase):
         # Check the value of mean@2 for source1/score
         self.assertAlmostEqual(result["source1"]["score"]["mean@2"], 0.85)
 
+    def test_process_validation_metrics_skips_none(self):
+        """None val rewards should not crash metric aggregation."""
+        data_sources = ["math500", "math500", "aime2024"]
+        sample_inputs = ["uid1", "uid1", "uid2"]
+        infos_dict = {
+            "score": [1.0, None, 0.0],
+        }
+
+        result = process_validation_metrics(data_sources, sample_inputs, infos_dict, seed=42)
+
+        self.assertIn("math500", result)
+        self.assertIn("score", result["math500"])
+        self.assertAlmostEqual(result["math500"]["score"]["mean@1"], 1.0)
+        self.assertIn("aime2024", result)
+        self.assertAlmostEqual(result["aime2024"]["score"]["mean@1"], 0.0)
+
     def test_process_validation_metrics_with_pred(self):
         """Test process_validation_metrics with prediction data."""
         data_sources = ["source1", "source1", "source1"]
