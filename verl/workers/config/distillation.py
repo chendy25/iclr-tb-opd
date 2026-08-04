@@ -22,7 +22,7 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig", "TBOPDConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -219,6 +219,130 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 
 @dataclass
+class TBOPDConfig(BaseConfig):
+    """Configuration for token-level branching on-policy distillation (TB-OPD).
+
+    Default method M*: Only-fail + B=1 + k=2 full expand. Disabled by default so
+    that standard OPD (B1) is completely unaffected.
+
+    enable (bool):
+        Master switch. When False, rollout falls back to standard per-row generation.
+    k (int):
+        Number of alternative tokens expanded into full branch continuations at the
+        fork position. With rollout.n = 1 + k, slot 0 is the main trajectory and
+        slots 1..k are the branches.
+    only_fail (bool):
+        If True, only branch when the main trajectory is judged incorrect by the
+        rule-based reward; otherwise the extra slots are filled with plain rollouts.
+    fork_metric (str):
+        How to score fork uncertainty at each response position: "entropy"
+        (truncated top-k entropy) or "topk_gap" (top1-top2 logprob margin).
+    topk_logprobs (int):
+        Number of top-k prompt logprobs requested in the second student forward
+        used to locate the fork and read candidate tokens.
+    branch_min_tokens (int):
+        Minimum remaining response budget required at a fork position; positions
+        too close to the end are skipped.
+    correct_threshold (float):
+        Reward score >= threshold counts the main trajectory as correct.
+    fork_select (str):
+        Fork-position selection among filtered candidates: "argmax" (highest
+        uncertainty; deterministic) or "topk_uniform" (uniform-random within the
+        top-``fork_topk_positions`` most uncertain positions; CURE-aligned).
+    fork_topk_positions (int):
+        Number of highest-uncertainty positions kept before uniform sampling when
+        ``fork_select="topk_uniform"``. Ignored for "argmax".
+    fork_skip_first (int):
+        Number of leading response positions to exclude from forking (CURE skips
+        position 0; default 1). Guards against branching on opener boilerplate.
+    fork_min_token_strip_len (int):
+        A candidate position is skipped unless its decoded token, stripped of
+        whitespace, is strictly longer than this (CURE uses >1). Filters
+        punctuation / single-char / whitespace high-entropy noise.
+    fork_min_entropy (float):
+        Minimum fork uncertainty (only applied when ``fork_metric="entropy"``);
+        if the best filtered position scores below this, no fork is emitted and
+        the extra slots degrade to plain rollouts. 0.0 disables the gate.
+    fork_dedup_main (bool):
+        If True, exclude the token actually sampled by the main trajectory at the
+        fork position from the expanded candidate set, so every branch is a
+        genuine alternative rather than a copy of the main path.
+    fork_token_filter (str):
+        Eligibility filter for fork positions. "math_aware" (default) keeps
+        math-bearing single-char tokens (digits/operators) and reflection words,
+        dropping only special/whitespace/pure-punctuation tokens -- the entropy
+        metric then selects. "strip_len" is the legacy CURE-style filter that
+        drops tokens whose stripped text is not longer than
+        ``fork_min_token_strip_len`` (which discards single-char math tokens).
+    scheme_b (bool):
+        If True, read fork candidates from the main rollout's own per-token top-k
+        logprobs (requested via ``logprobs=topk_logprobs`` during generation)
+        instead of running a second student forward. Saves one full-sequence
+        prefill per branched prompt; the win grows with response length. Entropy
+        is then measured on the actual decoding distribution (temperature ``T``,
+        ``processed_logprobs``), matching the Beyond-80/20 forking-token
+        definition. Falls back to the second forward if top-k is unavailable.
+    scheme_b_validate (bool):
+        Validation-only. When ``scheme_b`` is on, also run the legacy second
+        forward and log ``tb_opd_schemeb_pos_match`` (fork-position agreement) so
+        the temperature / ``logprobs_mode`` consistency can be checked before
+        trusting Scheme B. Doubles the selection cost; keep off for real runs.
+    branch_mode (str):
+        How branch continuations are generated after fork selection.
+        ``forced_topk`` (default, M*): force each top-k candidate token at the
+        fork position then continue-generate. ``resample`` (B4 / CURE-style):
+        continue-generate from the shared prefix without forcing a token, using
+        stochastic sampling (``resample_temperature`` or rollout temperature).
+    resample_temperature (float):
+        Sampling temperature for ``branch_mode="resample"``. Values < 0 reuse the
+        rollout temperature from ``actor_rollout_ref.rollout``.
+    """
+
+    enable: bool = False
+    k: int = 2
+    only_fail: bool = True
+    fork_metric: str = "entropy"
+    topk_logprobs: int = 20
+    branch_min_tokens: int = 8
+    correct_threshold: float = 1.0
+    fork_select: str = "argmax"
+    fork_topk_positions: int = 20
+    fork_skip_first: int = 1
+    fork_min_token_strip_len: int = 1
+    fork_min_entropy: float = 0.0
+    fork_dedup_main: bool = True
+    fork_token_filter: str = "math_aware"
+    scheme_b: bool = False
+    scheme_b_validate: bool = False
+    branch_mode: str = "forced_topk"
+    resample_temperature: float = -1.0
+
+    def __post_init__(self):
+        if not self.enable:
+            return
+        if self.k < 1:
+            raise ValueError(f"tb_opd.k must be >= 1, got {self.k}")
+        if self.branch_mode not in ("forced_topk", "resample"):
+            raise ValueError(
+                f"tb_opd.branch_mode must be 'forced_topk' or 'resample', got {self.branch_mode}"
+            )
+        if self.fork_metric not in ("entropy", "topk_gap"):
+            raise ValueError(f"tb_opd.fork_metric must be 'entropy' or 'topk_gap', got {self.fork_metric}")
+        if self.topk_logprobs < 2:
+            raise ValueError(f"tb_opd.topk_logprobs must be >= 2, got {self.topk_logprobs}")
+        if self.fork_select not in ("argmax", "topk_uniform"):
+            raise ValueError(f"tb_opd.fork_select must be 'argmax' or 'topk_uniform', got {self.fork_select}")
+        if self.fork_token_filter not in ("math_aware", "strip_len"):
+            raise ValueError(
+                f"tb_opd.fork_token_filter must be 'math_aware' or 'strip_len', got {self.fork_token_filter}"
+            )
+        if self.fork_topk_positions < 1:
+            raise ValueError(f"tb_opd.fork_topk_positions must be >= 1, got {self.fork_topk_positions}")
+        if self.fork_skip_first < 0:
+            raise ValueError(f"tb_opd.fork_skip_first must be >= 0, got {self.fork_skip_first}")
+
+
+@dataclass
 class DistillationConfig(BaseConfig):
     """Configuration for on-policy distillation.
 
@@ -265,6 +389,7 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    tb_opd: TBOPDConfig = field(default_factory=TBOPDConfig)
 
     def __post_init__(self):
         if not self.enabled:

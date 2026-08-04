@@ -608,6 +608,76 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
+    """Aggregate TB-OPD branch diagnostics from per-sample ``tb_opd_*`` fields.
+
+    All diagnostic fields live on the main slot (slot 0) of each prompt group and
+    are ``None`` on branch/plain slots, so aggregating over non-``None`` entries
+    naturally restricts to one value per group. Returns an empty dict when TB-OPD
+    is disabled (no fields present).
+    """
+    ntb = batch.non_tensor_batch
+    if "tb_opd_mode_branch" not in ntb:
+        return {}
+
+    def _floats(key: str) -> list[float]:
+        if key not in ntb:
+            return []
+        return [float(v) for v in ntb[key] if v is not None]
+
+    metrics: dict[str, Any] = {}
+
+    # Per-group decision fields (main slot carries score / fork_pos etc.).
+    is_fail = _floats("tb_opd_is_fail")
+    score = _floats("tb_opd_score")
+    mode_main = [
+        float(m)
+        for m, s in zip(ntb.get("tb_opd_mode_branch", []), ntb.get("tb_opd_score", []))
+        if s is not None  # main slots have a non-None score
+    ]
+    attempted = _floats("tb_opd_fork_attempted")
+    found = _floats("tb_opd_fork_found")
+    fork_pos = [v for v in _floats("tb_opd_fork_pos") if v >= 0]
+    fork_pos_frac = _floats("tb_opd_fork_pos_frac")
+    fork_score = [
+        float(fs)
+        for fs, mb in zip(ntb.get("tb_opd_fork_score", []), ntb.get("tb_opd_mode_branch", []))
+        if fs is not None and mb is not None and float(mb) > 0.5
+    ]
+
+    if score:
+        metrics["tb_opd/num_groups"] = float(len(score))
+    if is_fail:
+        metrics["tb_opd/fail_rate"] = float(np.mean(is_fail))
+    if mode_main:
+        metrics["tb_opd/branch_rate"] = float(np.mean(mode_main))
+    if attempted:
+        metrics["tb_opd/attempt_rate"] = float(np.mean(attempted))
+    n_attempt = sum(1 for a in attempted if a > 0.5)
+    if n_attempt > 0:
+        n_found = sum(1 for f in found if f > 0.5)
+        metrics["tb_opd/fork_found_rate_given_attempt"] = float(n_found) / float(n_attempt)
+        metrics["tb_opd/select_none_rate_given_attempt"] = 1.0 - float(n_found) / float(n_attempt)
+    if fork_pos:
+        metrics["tb_opd/fork_pos/mean"] = float(np.mean(fork_pos))
+        metrics["tb_opd/fork_pos/min"] = float(np.min(fork_pos))
+        metrics["tb_opd/fork_pos/max"] = float(np.max(fork_pos))
+    if fork_pos_frac:
+        metrics["tb_opd/fork_pos_frac/mean"] = float(np.mean(fork_pos_frac))
+    if fork_score:
+        metrics["tb_opd/fork_score/mean"] = float(np.mean(fork_score))
+
+    # Distribution of None reasons among attempted forks.
+    if "tb_opd_none_reason" in ntb:
+        reasons = [str(r) for r in ntb["tb_opd_none_reason"] if r is not None and str(r) not in ("ok", "not_attempted")]
+        if reasons:
+            total = float(len(reasons))
+            for reason in set(reasons):
+                metrics[f"tb_opd/none_reason/{reason}"] = float(reasons.count(reason)) / total
+
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.
@@ -978,16 +1048,33 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
+                # skip empty or string-valued metrics (e.g. pred)
                 if not var_vals or isinstance(var_vals[0], str):
                     continue
 
+                # Drop missing/non-numeric entries (some val rewards return None).
+                if has_pred and pred_vals is not None:
+                    pairs = [
+                        (v, p)
+                        for v, p in zip(var_vals, pred_vals, strict=True)
+                        if v is not None and not isinstance(v, str)
+                    ]
+                    if not pairs:
+                        continue
+                    numeric_vals = [v for v, _ in pairs]
+                    pred_vals_aligned = [p for _, p in pairs]
+                else:
+                    numeric_vals = [v for v in var_vals if v is not None and not isinstance(v, str)]
+                    if not numeric_vals:
+                        continue
+                    pred_vals_aligned = None
+
                 # compute mean and std
-                n_resps = len(var_vals)
-                metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
+                n_resps = len(numeric_vals)
+                metric = {f"mean@{n_resps}": float(np_mean(numeric_vals))}
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = float(np_std(var_vals))
+                    metric[f"std@{n_resps}"] = float(np_std(numeric_vals))
 
                     # cache ns list
                     if n_resps not in ns_cache:
@@ -998,7 +1085,7 @@ def process_validation_metrics(
                     for n in ns:
                         # compute best/worst metrics
                         (bon_mean, bon_std), (won_mean, won_std) = bootstrap_metric(
-                            data=var_vals,
+                            data=numeric_vals,
                             subset_size=n,
                             reduce_fns=reduce_fns_best_worst,
                             n_bootstrap=n_bootstrap,
@@ -1010,10 +1097,11 @@ def process_validation_metrics(
                         metric[f"worst@{n}/std"] = won_std
 
                         # compute maj metrics
-                        if has_pred:
+                        if has_pred and pred_vals_aligned is not None:
                             # create vote_data
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, pred_vals, strict=True)
+                                {"val": val, "pred": pred}
+                                for val, pred in zip(numeric_vals, pred_vals_aligned, strict=True)
                             ]
                             # compute maj metrics
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(

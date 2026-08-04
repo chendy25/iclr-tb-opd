@@ -367,6 +367,8 @@ class vLLMColocateWorkerExtension:
             yield normalized_name, tensor
 
     def _maybe_reload_standard_weights_from_ipc(self, receiver) -> bool:
+        import inspect
+
         from vllm.config import set_current_vllm_config
 
         # vLLM's layerwise reload targets only the main model; the fallback also syncs the MTP drafter.
@@ -375,15 +377,32 @@ class vLLMColocateWorkerExtension:
 
         # Platform workers without the layerwise reload API (e.g. vllm-ascend's
         # NPUWorker) fall back to bucketed load_weights.
-        if not callable(getattr(self, "reload_weights", None)):
+        reload_weights = getattr(self, "reload_weights", None)
+        if not callable(reload_weights):
+            return False
+
+        # Older vLLM (≤0.13 stock) exposes reload_weights() with no kwargs; only
+        # newer layerwise builds accept weights_iterator / is_checkpoint_format.
+        try:
+            reload_params = inspect.signature(reload_weights).parameters
+        except (TypeError, ValueError):
+            reload_params = {}
+        if "weights_iterator" not in reload_params:
+            logger.info(
+                "vLLM reload_weights lacks weights_iterator; falling back to bucketed load_weights"
+            )
             return False
 
         logger.info("Loading standard weights via vLLM reload_weights (async)")
         with set_current_vllm_config(self.model_runner.vllm_config):
-            self.reload_weights(
-                weights_iterator=self._iter_normalized_base_sync_weights(receiver.iter_weights(), clone_tensors=True),
-                is_checkpoint_format=True,
-            )
+            reload_kwargs = {
+                "weights_iterator": self._iter_normalized_base_sync_weights(
+                    receiver.iter_weights(), clone_tensors=True
+                ),
+            }
+            if "is_checkpoint_format" in reload_params:
+                reload_kwargs["is_checkpoint_format"] = True
+            reload_weights(**reload_kwargs)
         return True
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
@@ -676,3 +695,37 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def extract_output_logprobs(output: RequestOutput, num_output_logprobs: Optional[int], result_dict: dict[str, list]):
+    """Extract per-position top-k logprobs/ids for the GENERATED tokens.
+
+    Unlike prompt logprobs, ``outputs[0].logprobs[p]`` is already the decoding
+    distribution that produced generated token ``p`` (no first-token offset), so
+    ``output_logprobs[p]`` / ``output_ids[p]`` align 1:1 with the response tokens.
+    Used by TB-OPD Scheme B to read fork candidates from the rollout itself.
+    """
+    if num_output_logprobs is None or num_output_logprobs < 1:
+        return
+
+    gen = output.outputs[0]
+    if gen.logprobs is None:
+        return
+
+    logprobs_ls, ids_ls = [], []
+    for logprobs_dict in gen.logprobs:
+        ids = [None] * num_output_logprobs
+        logprobs = [None] * num_output_logprobs
+        # Each dict holds top-k entries (plus the sampled token if it fell out of
+        # the top-k, which carries rank > k and is skipped here).
+        for token_id_str, token_logprob in logprobs_dict.items():
+            rank = token_logprob.rank
+            if rank is None or rank > num_output_logprobs:
+                continue
+            ids[rank - 1] = int(token_id_str)
+            logprobs[rank - 1] = token_logprob.logprob
+        ids_ls.append(ids)
+        logprobs_ls.append(logprobs)
+
+    result_dict["output_ids"] = ids_ls
+    result_dict["output_logprobs"] = logprobs_ls

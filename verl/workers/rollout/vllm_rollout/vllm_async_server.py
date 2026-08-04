@@ -58,6 +58,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     build_mtp_speculative_config,
+    extract_output_logprobs,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
@@ -592,7 +593,18 @@ class vLLMHttpServer:
         assert 1 <= max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} not in valid range [1, {max_possible_tokens}]"
         )
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        # ``logprobs`` may be a bool (True -> sampled-token logprob only) or an int
+        # ``k`` (top-k logprobs per generated token). The int form powers TB-OPD
+        # Scheme B: the rollout itself carries the per-token top-k so fork selection
+        # needs no extra student forward. vLLM wants None to disable, 0 for
+        # sampled-only, or a positive int for top-k.
+        _want_logprobs = sampling_params.pop("logprobs", False)
+        if _want_logprobs is True:
+            sampling_params["logprobs"] = 0
+        elif _want_logprobs:  # int k >= 1
+            sampling_params["logprobs"] = int(_want_logprobs)
+        else:
+            sampling_params["logprobs"] = None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params.setdefault("ignore_eos", self.config.get("ignore_eos", False))
         # Inject per-request seed for deterministic sampling when full_determinism is enabled.
@@ -669,6 +681,15 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            # TB-OPD Scheme B: when top-k (k>=1) output logprobs were requested,
+            # also surface the per-position top-k logprobs/ids so fork selection
+            # can read candidates straight from the rollout (no second forward).
+            if sampling_params.logprobs >= 1:
+                extract_output_logprobs(
+                    output=final_res,
+                    num_output_logprobs=sampling_params.logprobs,
+                    result_dict=extra_fields,
+                )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:

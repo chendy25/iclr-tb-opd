@@ -118,4 +118,22 @@ def get_ppo_ray_runtime_env(config=None):
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT", "VERL_RL_INSIGHT_ENABLE"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
+    # Forward CUDA toolchain paths so vLLM / torch.compile can find ptxas inside
+    # Ray actors (raylet children do not reliably inherit the driver shell PATH).
+    # Also forward PYTHONPATH / PYTHONUSERBASE so AFS user-site deps
+    # (TransferQueue, tensordict overlay) reach workers.
+    for key in (
+        "CUDA_HOME",
+        "TRITON_PTXAS_PATH",
+        "PATH",
+        "VLLM_USE_V1",
+        "PYTHONPATH",
+        "PYTHONUSERBASE",
+        "SWANLAB_API_KEY",
+        "SWANLAB_MODE",
+        "SWANLAB_LOG_DIR",
+        "MODELING_BACKEND",
+    ):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

@@ -111,3 +111,66 @@ teacher_models:
 
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
+
+# Token-level branching OPD (TB-OPD). Disabled by default -> standard OPD (B1) unaffected.
+tb_opd:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.TBOPDConfig
+
+  # Master switch for token-level branching.
+  enable: false
+
+  # Number of alternative tokens expanded into full branch continuations (rollout.n should be 1 + k).
+  k: 2
+
+  # Only branch when the main trajectory is judged incorrect; otherwise fill extra slots with plain rollouts.
+  only_fail: true
+
+  # Fork uncertainty metric: "entropy" (truncated top-k entropy) or "topk_gap" (top1-top2 margin).
+  fork_metric: entropy
+
+  # Number of top-k prompt logprobs requested in the second student forward.
+  topk_logprobs: 20
+
+  # Minimum remaining response budget required at a fork position.
+  branch_min_tokens: 8
+
+  # Reward score >= threshold counts the main trajectory as correct.
+  correct_threshold: 1.0
+
+  # Fork-position selection among filtered candidates: "argmax" or "topk_uniform".
+  fork_select: argmax
+
+  # Number of most-uncertain positions kept before uniform sampling (topk_uniform only).
+  fork_topk_positions: 20
+
+  # Number of leading response positions to exclude from forking (CURE skips position 0).
+  fork_skip_first: 1
+
+  # Skip a candidate unless its decoded token, stripped of whitespace, is longer than this.
+  fork_min_token_strip_len: 1
+
+  # Minimum fork uncertainty (entropy metric only); below this no fork is emitted. 0 disables.
+  fork_min_entropy: 0.0
+
+  # Exclude the main-sampled token from the expanded candidate set.
+  fork_dedup_main: true
+
+  # Fork-position eligibility filter: "math_aware" (keep digits/operators + words,
+  # drop only special/whitespace/pure-punctuation) or "strip_len" (legacy CURE).
+  fork_token_filter: math_aware
+
+  # Scheme B: read fork candidates from the main rollout's own top-k logprobs
+  # (logprobs=topk_logprobs) instead of a second student forward.
+  scheme_b: false
+
+  # Validation only: also run the legacy second forward and log fork-position
+  # agreement (tb_opd_schemeb_pos_match). Doubles selection cost; keep off.
+  scheme_b_validate: false
+
+  # Branch continuation mode: forced_topk (M*) or resample (B4 / CURE-style).
+  branch_mode: forced_topk
+
+  # Sampling temperature for resample branches; <0 reuses rollout.temperature.
+  resample_temperature: -1.0
