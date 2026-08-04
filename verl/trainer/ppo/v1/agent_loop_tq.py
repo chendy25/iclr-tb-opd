@@ -119,6 +119,13 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if not trajectory["validate"] and not do_sample:
                 apply_greedy_sampling_params(run_sampling_params)
 
+            # TB-OPD needs coordinated main→fork→branch slots; the plain parallel
+            # fan-out below would silently degrade to independent multi-sample.
+            if self.tb_opd_enabled and not trajectory["validate"]:
+                await self._run_prompt_tb_opd(prompt, run_sampling_params, trajectory, n)
+                await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+                return
+
             tasks = []
             for i in range(n):
                 task = asyncio.create_task(
@@ -146,6 +153,26 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             if tasks:
                 await _settle_session_tasks(tasks)
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
+    async def _run_prompt_tb_opd(
+        self, prompt: dict, sampling_params: dict, trajectory: dict, n: int
+    ) -> None:
+        """Coordinate one prompt's n slots via ``_run_tb_opd_group`` and put into TQ.
+
+        Keys remain ``{uid}_{session_id}_{index}`` with ``session_id ∈ [0, n)`` so
+        the v1 ReplayBuffer / GRPO grouping stays unchanged.
+        """
+        config = self.config.actor_rollout_ref.rollout
+        agent_name = prompt.get("agent_name", config.agent.default_agent_loop)
+        rows: list[tuple[int, dict, dict]] = []
+        for session_id in range(n):
+            kwargs = {k: v for k, v in prompt.items() if k != "agent_name"}
+            kwargs["session_id"] = session_id
+            traj = dict(trajectory)
+            traj["rollout_n"] = session_id
+            rows.append((session_id, traj, kwargs))
+        # TQ overrides ``_agent_loop_postprocess`` to write TransferQueue; return value unused.
+        await self._run_tb_opd_group(rows, agent_name, sampling_params)
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
@@ -202,6 +229,15 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["multi_modal_inputs"] = multi_modal_inputs
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            extra = field.get("extra_fields") or {}
+            # Fall back to dataloader global_steps when generate path omitted weight tags
+            # (e.g. TB-OPD branch outputs before they propagate min/max_global_steps).
+            min_gs = extra.get("min_global_steps")
+            max_gs = extra.get("max_global_steps")
+            if min_gs is None:
+                min_gs = kwargs.get("global_steps")
+            if max_gs is None:
+                max_gs = kwargs.get("global_steps")
             tags.append(
                 {
                     "status": "success",
@@ -213,9 +249,9 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
                     # global_steps: which global steps this sample is from dataloader
                     "global_steps": kwargs["global_steps"],
                     # min_global_steps: start generation model weights version of this trajectory
-                    "min_global_steps": field["extra_fields"].get("min_global_steps"),
+                    "min_global_steps": min_gs,
                     # max_global_steps: end generation model weights version of this trajectory
-                    "max_global_steps": field["extra_fields"].get("max_global_steps"),
+                    "max_global_steps": max_gs,
                 }
             )
 

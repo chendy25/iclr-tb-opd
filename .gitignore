@@ -131,3 +131,6 @@ logs
 log
 outputs
 .history
+
+# Local experiment outputs (do not upload)
+output/

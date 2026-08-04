@@ -54,6 +54,7 @@ from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
     compute_data_metrics,
     compute_moe_lb_metrics,
+    compute_tb_opd_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -1210,7 +1211,7 @@ class PPOTrainer(ABC):
     def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
         """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
@@ -1226,6 +1227,12 @@ class PPOTrainer(ABC):
             else:
                 gts = [None] * len(uids)
 
+            extra_fields = data.pop("extra_fields", None)
+            if extra_fields is not None:
+                extra_fields = extra_fields.tolist()
+            else:
+                extra_fields = [None] * len(uids)
+
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
             for key in batch.keys:
@@ -1240,8 +1247,18 @@ class PPOTrainer(ABC):
             outputs = [outputs[i] for i in sorted_indices]
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
+            extra_fields = [extra_fields[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            # TB-OPD diagnostics live in agent-loop extra_fields; expand into dump columns.
+            tb_keys: set[str] = set()
+            for ef in extra_fields:
+                if isinstance(ef, dict):
+                    tb_keys.update(k for k in ef if k.startswith("tb_opd_"))
+            for key in sorted(tb_keys):
+                reward_extra_infos_dict[key] = [
+                    ef.get(key) if isinstance(ef, dict) else None for ef in extra_fields
+                ]
 
             self._dump_generations(
                 inputs=inputs,
@@ -1743,13 +1760,29 @@ class PPOTrainer(ABC):
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
-        min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
-        max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+        def _tag_step(tag: dict, key: str) -> int:
+            val = tag.get(key)
+            if val is None:
+                val = tag.get("global_steps", 0)
+            return int(val if val is not None else 0)
 
-        # Only fetch speculative decoding stats when rollout writes them.
+        min_global_steps = np.array([_tag_step(tag, "min_global_steps") for tag in batch.tags], dtype=int)[
+            non_padding_mask
+        ]
+        max_global_steps = np.array([_tag_step(tag, "max_global_steps") for tag in batch.tags], dtype=int)[
+            non_padding_mask
+        ]
+
+        # Fetch extra_fields when speculative decoding or TB-OPD needs them.
         spec_drafts = spec_accepts = spec_verifies = None
         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
-        if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+        need_mtp_extra = mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout
+        tb_opd_cfg = None
+        if is_distillation_enabled(self.config.get("distillation")):
+            tb_opd_cfg = self.config.get("distillation", {}).get("tb_opd", None)
+        need_tb_opd_extra = bool(tb_opd_cfg is not None and tb_opd_cfg.get("enable", False))
+        extra_fields = None
+        if need_mtp_extra or need_tb_opd_extra:
             spec_data = tq.kv_batch_get(
                 keys=batch.keys,
                 partition_id=batch.partition_id,
@@ -1758,7 +1791,7 @@ class PPOTrainer(ABC):
             extra_fields = spec_data.pop("extra_fields").tolist()
             # The rollout omits the spec_* stats when the backend does not report
             # per-request spec-decode stats; leave all three as None in that case.
-            if extra_fields and all(
+            if need_mtp_extra and extra_fields and all(
                 isinstance(extra_field, dict) and "spec_num_draft_tokens" in extra_field for extra_field in extra_fields
             ):
                 spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
@@ -1805,6 +1838,25 @@ class PPOTrainer(ABC):
         # 4. per-request speculative-decoding aggregation (same metrics async PPO logs;
         # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
+
+        # 4b. TB-OPD branch diagnostics (no-op when fields absent).
+        if need_tb_opd_extra and extra_fields is not None:
+            ef_list = extra_fields
+            if non_padding_mask.any():
+                ef_list = [ef for ef, keep in zip(extra_fields, non_padding_mask, strict=True) if keep]
+            tb_keys: set[str] = set()
+            for ef in ef_list:
+                if isinstance(ef, dict):
+                    tb_keys.update(k for k in ef if k.startswith("tb_opd_"))
+            if tb_keys:
+                ntb = {
+                    key: np.array(
+                        [ef.get(key) if isinstance(ef, dict) else None for ef in ef_list],
+                        dtype=object,
+                    )
+                    for key in tb_keys
+                }
+                metrics.update(compute_tb_opd_metrics(batch=DataProto(non_tensor_batch=ntb)))
 
         # 5. off-policy staleness metrics
         #   global_steps is the model weight version (one update_weights per global_step), and

@@ -43,6 +43,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_tb_opd_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -535,6 +536,12 @@ class RayPPOTrainer:
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+            # TB-OPD per-sample diagnostics: dump alongside samples so branch
+            # behaviour (mode / fork position / fail gate) is inspectable offline.
+            for key in batch.non_tensor_batch:
+                if key.startswith("tb_opd_"):
+                    v = batch.non_tensor_batch[key]
+                    reward_extra_infos_to_dump.setdefault(key, v.tolist() if hasattr(v, "tolist") else list(v))
 
             self._dump_generations(
                 inputs=inputs,
@@ -1745,6 +1752,8 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # TB-OPD branch diagnostics (no-op when tb_opd disabled).
+                metrics.update(compute_tb_opd_metrics(batch=batch))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
