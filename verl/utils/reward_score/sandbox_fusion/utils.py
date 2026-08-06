@@ -90,6 +90,23 @@ def call_sandbox_api(
         If successful, response_json is the API's returned JSON object, error_message is None.
         If failed after retries, response_json is None, error_message contains the error information.
     """
+    # Backend switch: when no SandboxFusion service is available, run the *same*
+    # generated code on an E2B sandbox instead. The E2B adapter returns an
+    # identical api_response shape, so all downstream harness / output-comparison
+    # / status logic in _process_single_case is unchanged (SOD-equivalent scores).
+    if os.getenv("SANDBOX_EXEC_BACKEND", "").lower() == "e2b" or str(sandbox_fusion_url).startswith("e2b://"):
+        from verl.utils.reward_score.e2b_exec import e2b_call_sandbox_api
+
+        return e2b_call_sandbox_api(
+            sandbox_fusion_url=sandbox_fusion_url,
+            code=code,
+            stdin=stdin,
+            compile_timeout=compile_timeout,
+            run_timeout=run_timeout,
+            memory_limit_mb=memory_limit_mb,
+            language=language,
+        )
+
     request_id = str(uuid.uuid4())  # <-- Generate request_id internally
     log_prefix = f"[Request ID: {request_id}] "  # <-- Create log prefix
 

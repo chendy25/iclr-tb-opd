@@ -11,112 +11,111 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reward scoring for Gen-Verse/Open-AgentRL-30K's mixed data sources.
+"""SOD-homologous reward for Gen-Verse/Open-AgentRL (agentic TB-OPD).
 
-Open-AgentRL rows carry heterogeneous ``data_source`` values and two different
-code-test encodings inside ``reward_model.ground_truth``:
+This mirrors ``SOD/recipe/demystify/reward.py::compute_score`` so the agentic
+TB-OPD run is scored with the *same* rubric as the SOD teacher was trained
+with:
 
-- math (``math_dapo``, ``train-math-*``, ``test-math-*``) and science MCQ
-  (``mega-science``): a short boxed answer -> scored by ``math_dapo`` (boxed
-  extraction + normalized comparison).
-- code (``train-code-taco-*``, ``train-code-leetcode-*`` ...): ground_truth is a
-  JSON object in one of two shapes:
-    * TACO / APPS functional  : {"fn_name", "inputs", "outputs"}  -> prime_code
-    * LeetCode assert harness  : {"entry_point", "import_prefix", "test_code"}
-      -> executed locally (import_prefix + solution + test_code + check(entry)).
+- code (``'code' in data_source`` or a code-harness ground_truth): scored by
+  ``livecodebench.code_math.compute_score`` (LiveCodeBench, ported verbatim from
+  SOD). SOD executes the tests on a SandboxFusion HTTP service; we have none, so
+  ``code_math`` -> ``check_correctness`` -> ``call_sandbox_api`` transparently
+  runs the *identical* generated code on an **E2B** sandbox instead
+  (``SANDBOX_EXEC_BACKEND=e2b``). Same api_response shape => same scores.
+- math / science-MCQ: ``math_dapo.compute_score(strict_box_verify=True)`` -- the
+  final answer must be inside ``\\boxed{...}`` (SOD's strict rubric), not merely
+  present in free text.
 
-``compute_score`` returns a float in [0, 1] for code and the ``math_dapo`` dict
-(``{score, acc, pred}``) for math/science, both of which ``default_compute_score``
+Tool-call shaping (SOD): a *wrong* trajectory (``score < 0``) gets a small
+credit for having used the tool, so tool use is not discouraged on failures::
+
+    tool_call_reward = (num_turns - 2) / 2 * 0.1
+    score = min(-0.6, score + tool_call_reward)
+
+``num_turns`` is the rollout turn count threaded in via the reward manager
+(``extra_info["num_turns"]`` <- ``__num_turns__``). If it is unavailable (e.g.
+non-agentic caller), the shaping term is skipped so the score cannot dip below
+the raw ``code_math`` / ``math_dapo`` value.
+
+Returns the SOD dict ``{score, acc, pred}`` which ``default_compute_score``
 accepts.
 """
 
 import json
 import logging
-import subprocess
-import sys
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _extract_code(completion: str) -> str:
-    """Pull the last fenced python block from a completion, else return as-is."""
-    if not isinstance(completion, str):
-        completion = str(completion)
-    if "```python" in completion:
-        return completion.split("```python")[-1].split("```")[0]
-    if "```" in completion and completion.count("```") >= 2:
-        return completion.split("```")[-2]
-    return completion
+def _looks_like_code_harness(obj: Any) -> bool:
+    return isinstance(obj, dict) and (
+        "inputs" in obj or "fn_name" in obj or "test_code" in obj or "import_prefix" in obj
+    )
 
 
-def _parse_gt(ground_truth: Any) -> Optional[dict]:
-    obj: Any = None
-    if isinstance(ground_truth, dict):
-        obj = ground_truth
-    elif isinstance(ground_truth, str):
+def _unwrap_code_gt(ground_truth: Any) -> Optional[Any]:
+    """Return a ground_truth whose *top level* is the code test harness.
+
+    Open-AgentRL train-code rows store the harness directly, but some eval sets
+    (e.g. LiveCodeBench_v6) nest it under ``{"ground_truth": {...}}``. ``code_math``
+    keys off top-level ``import_prefix`` / ``inputs``, so unwrap before handing it
+    over. Returns the original value if it already looks like a harness, else the
+    inner harness, else None.
+    """
+    obj: Any = ground_truth
+    if isinstance(ground_truth, str):
         try:
             obj = json.loads(ground_truth)
         except (ValueError, TypeError):
-            return None
-    if not isinstance(obj, dict):
-        return None
-    # Some eval sets (e.g. LiveCodeBench_v6) nest the harness under "ground_truth".
-    inner = obj.get("ground_truth")
-    if isinstance(inner, dict) and ("inputs" in inner or "test_code" in inner or "fn_name" in inner):
-        return inner
+            return ground_truth  # leave as-is; code_math will str() it
+    if _looks_like_code_harness(obj):
+        return obj
+    if isinstance(obj, dict):
+        inner = obj.get("ground_truth")
+        if _looks_like_code_harness(inner):
+            return inner
     return obj
 
 
-def _score_leetcode(completion: str, gt: dict, timeout: int = 12) -> float:
-    """Run the LeetCode-style assert harness in a subprocess; 1.0 iff it exits 0."""
-    solution = _extract_code(completion)
-    prefix = gt.get("import_prefix", "") or ""
-    test_code = gt.get("test_code", "") or ""
-    entry = (gt.get("entry_point", "") or "").strip()
-    if not test_code or not entry:
-        return 0.0
-    program = f"{prefix}\n{solution}\n{test_code}\ncheck({entry})\n"
-    try:
-        r = subprocess.run(
-            [sys.executable, "-c", program],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return 1.0 if r.returncode == 0 else 0.0
-    except subprocess.TimeoutExpired:
-        return 0.0
-    except Exception as e:  # noqa: BLE001
-        logger.warning("open_agentrl leetcode exec error: %s", e)
-        return 0.0
+def _is_code(data_source: str, ground_truth: Any) -> bool:
+    if "code" in str(data_source or "").lower():
+        return True
+    # Fallback on ground_truth shape (covers odd/absent data_source labels).
+    probe = ground_truth
+    if isinstance(probe, str):
+        try:
+            probe = json.loads(probe)
+        except (ValueError, TypeError):
+            probe = None
+    if _looks_like_code_harness(probe):
+        return True
+    if isinstance(probe, dict) and _looks_like_code_harness(probe.get("ground_truth")):
+        return True
+    return False
 
 
-def _score_taco(completion: str, gt: dict) -> float:
-    """Score TACO/APPS functional tests via prime_code (handles fn_name).
+def _apply_tool_call_shaping(result: dict, extra_info: Optional[dict]) -> dict:
+    """SOD tool-call shaping on failed trajectories (in-place-safe)."""
+    if result.get("score", 0.0) >= 0:
+        if result.get("pred") is None:
+            result["pred"] = ""
+        return result
 
-    ``prime_code`` imports ``pyext`` at module load, which is not installable on
-    Python 3.11. Guard the import so a missing/broken dependency degrades to a 0
-    reward for this one sample instead of crashing the whole trajectory group's
-    reward postprocess.
-    """
-    try:
-        from . import prime_code
-    except Exception as e:  # noqa: BLE001  -- ModuleNotFoundError('pyext') etc.
-        logger.warning("open_agentrl taco scorer unavailable (%s); returning 0.0", e)
-        return 0.0
-
-    try:
-        success, _ = prime_code.compute_score(completion, gt, continuous=True)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("open_agentrl taco exec error: %s", e)
-        return 0.0
-    if isinstance(success, bool):
-        return 1.0 if success else 0.0
-    try:
-        return float(success)
-    except (TypeError, ValueError):
-        return 0.0
+    num_turns = None
+    if isinstance(extra_info, dict):
+        num_turns = extra_info.get("num_turns", None)
+    if num_turns is not None:
+        try:
+            nt = int(num_turns)
+            tool_call_reward = (nt - 2) / 2 * 0.1
+            result["score"] = float(min(-0.6, result["score"] + tool_call_reward))
+        except (TypeError, ValueError):
+            pass  # malformed num_turns -> leave the raw negative score untouched
+    if result.get("pred") is None:
+        result["pred"] = ""
+    return result
 
 
 def compute_score(
@@ -125,24 +124,26 @@ def compute_score(
     ground_truth: Any,
     extra_info: Optional[dict] = None,
     **kwargs,
-):
-    """Route an Open-AgentRL row to the right scorer based on source + gt shape."""
-    src = str(data_source or "")
-    is_code = src.startswith("train-code-") or src.startswith("test-code-") or "code" in src.split("-")[:2]
-
-    parsed = _parse_gt(ground_truth)
-    if is_code or (parsed is not None and ("test_code" in parsed or "inputs" in parsed or "fn_name" in parsed)):
-        if parsed is None:
-            return 0.0
-        if "test_code" in parsed or "entry_point" in parsed:
-            return _score_leetcode(solution_str, parsed)
-        if "inputs" in parsed or "fn_name" in parsed:
-            return _score_taco(solution_str, parsed)
-        return 0.0
-
-    # math / science MCQ (mega-science) -> boxed answer match.
-    if ground_truth is None or (isinstance(ground_truth, str) and ground_truth == ""):
-        return {"score": 0.0, "acc": False, "pred": None}
+) -> dict:
+    """Score one Open-AgentRL row, SOD-homologously. Returns {score, acc, pred}."""
     from . import math_dapo
+    from .livecodebench import code_math
 
-    return math_dapo.compute_score(solution_str, str(ground_truth))
+    if _is_code(data_source, ground_truth):
+        gt = _unwrap_code_gt(ground_truth)
+        try:
+            result = code_math.compute_score(solution_str, gt)
+        except Exception as e:  # noqa: BLE001 -- one bad sample must not sink the group
+            logger.warning("open_agentrl code_math error (%s); scoring 0.", e)
+            result = {"score": -1.0, "acc": False, "pred": None}
+    else:
+        # math / science MCQ: strict boxed answer (SOD rubric).
+        gt_str = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
+        result = math_dapo.compute_score(
+            solution_str=solution_str, ground_truth=gt_str, strict_box_verify=True
+        )
+
+    if not isinstance(result, dict):
+        result = {"score": float(result), "acc": bool(result and result > 0), "pred": None}
+
+    return _apply_tool_call_shaping(result, extra_info)

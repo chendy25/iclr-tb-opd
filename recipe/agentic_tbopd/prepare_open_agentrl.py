@@ -13,18 +13,29 @@
 # limitations under the License.
 """Convert Gen-Verse/Open-AgentRL parquet into tool-agent (code_interpreter) format.
 
-Open-AgentRL-30K is already in verl schema (``prompt`` chat list, ``reward_model``
-with ``ground_truth``). It mixes math (``math_dapo`` / ``train-math-*``), science
-MCQ (``mega-science``) and code (``train-code-taco-*`` / ``train-code-leetcode-*``)
-sources. For the agentic TB-OPD Phase 1' tool-integrated-reasoning (TIR) env we:
+SOD-aligned. We reproduce the prompt/reward rubric the SOD teacher was trained
+under (``SOD/recipe/demystify/reward.py::CustomRLHFDataset``) so the agentic
+TB-OPD student sees the same task framing:
 
-  1. tag each row with ``agent_name="tool_agent"`` so ``ToolAgentLoop`` runs it, and
-  2. prepend a system prompt that instructs the model to use the ``code_interpreter``
-     tool during reasoning.
+Prompt (per SOD ``map_fn* ``):
+  * No system prompt -- all instructions live in the user turn; the
+    ``code_interpreter`` tool is exposed via the chat template's tool section.
+  * math / science: ``math_prompt_1 + problem + math_prompt_2 + agent_prompt +
+    answer_format`` then a units clarifier -> forces a final ``\\boxed{...}``.
+  * code: ``... + agent_prompt`` then a "submit your code within ```python```"
+    clarifier.
+  Rows already carrying the SOD scaffolding (Open-AgentRL-30K's ``math_dapo`` /
+  ``mega-science`` / ``train-code-*`` were pre-wrapped upstream) only get the
+  small trailing clarifier appended (idempotent). Bare rows (``train-math-*``)
+  are wrapped in full -- without this they never get the ``\\boxed{}``
+  instruction and would score ~0 under ``strict_box_verify=True``.
 
-No source is filtered or remapped: every ``data_source`` keeps its original value and
-is scored by its own reward in ``verl.utils.reward_score.default_compute_score``
-(math/science -> ``math_dapo``; code -> ``open_agentrl`` -> prime_code / local exec).
+Reward routing:
+  Every row is tagged ``extra_info["agentic_reward"]=True`` (+ ``need_tools_kwargs``)
+  so ``verl.utils.reward_score.default_compute_score`` sends it to the
+  SOD-homologous ``open_agentrl.compute_score`` (strict boxed math + LiveCodeBench
+  code executed on E2B + num_turns tool-call shaping). ``data_source`` is kept
+  intact (no filtering / remapping).
 
 Usage:
     python -m recipe.agentic_tbopd.prepare_open_agentrl \
@@ -37,22 +48,59 @@ import os
 
 import pandas as pd
 
-TOOL_SYSTEM_PROMPT = (
-    "You are a math expert who solves problems with the help of a Python code "
-    "interpreter. Reason step by step. Whenever a calculation, verification, or "
-    "search over cases would help, call the `code_interpreter` tool with a short "
-    "Python snippet and read its stdout before continuing. You may call the tool "
-    "multiple times. When you are confident, put your final answer inside "
-    "\\boxed{...}."
+# --- SOD prompt fragments (verbatim from SOD/recipe/demystify/reward.py) ---
+ANSWER_FORMAT = (
+    "\nRemember once you make sure the current answer is your final answer, do not "
+    "call the tools again and directly output the final answer in the following text "
+    "format, the answer format must be: \\boxed{'The final answer goes here.'}."
+)
+MATH_PROMPT_1 = "Analyze and solve the following math problem step by step. \n\n"
+MATH_PROMPT_2 = (
+    "\n\nThe tool could be used for more precise and efficient calculation and could "
+    "help you to verify your result before you reach the final answer."
+)
+AGENT_PROMPT = (
+    "\n\n**Note: You should first analyze the problem and form a high-level solution "
+    "strategy, then utilize the tools to help you solve the problem.**"
+)
+UNITS_NOTE = (
+    "\nDo not put units of the final answer inside \\boxed{}. The content of \\boxed{} "
+    "should be the numerical value of the final answer only, without any units."
+)
+CODE_SUBMIT_NOTE = (
+    "\nBefore sumbit your code, you can utilize tools to check the correctness of your "
+    "code, once you make sure the current code is correct, do not call the tools again "
+    "and submit your code within ```python\n# YOUR CODE HERE\n```."
 )
 
 
-def _to_message_list(prompt_field):
-    """Normalize the ``prompt`` field into a list of {role, content} messages.
+def _is_code_source(data_source: str) -> bool:
+    return "code" in str(data_source or "").lower()
 
-    pandas reads a parquet list-of-struct column as a numpy object array, so accept
-    any sequence of mapping-like items (dict / numpy struct) as well as a raw string.
-    """
+
+def _sod_wrap(content: str, is_code: bool) -> str:
+    """Apply SOD's per-source prompt scaffolding, idempotently."""
+    content = content or ""
+    if is_code:
+        # Ensure the code-submission clarifier + agent note are present.
+        if "submit your code within" not in content:
+            already_agent = "high-level solution" in content
+            content = content + ("" if already_agent else AGENT_PROMPT) + CODE_SUBMIT_NOTE
+        return content
+
+    # math / science
+    has_box_instr = "\\boxed" in content or "answer format must be" in content
+    if not has_box_instr:
+        # Bare problem (e.g. train-math-*): full SOD scaffold.
+        content = MATH_PROMPT_1 + content + MATH_PROMPT_2 + AGENT_PROMPT + ANSWER_FORMAT + UNITS_NOTE
+    elif "without any units" not in content:
+        # Already SOD-framed upstream: only add the units clarifier.
+        content = content + UNITS_NOTE
+    return content
+
+
+def _to_message_list(prompt_field):
+    """Normalize the ``prompt`` field into a list of {role, content} messages."""
     if hasattr(prompt_field, "tolist"):  # numpy ndarray
         prompt_field = prompt_field.tolist()
     if isinstance(prompt_field, (list, tuple)):
@@ -79,14 +127,25 @@ def _to_dict(value) -> dict:
         return {}
 
 
-def _process_row(example: dict, idx: int, split: str, add_system: bool) -> dict:
+def _first_user_index(messages: list) -> int:
+    for i, m in enumerate(messages):
+        if m.get("role") == "user":
+            return i
+    return len(messages) - 1 if messages else -1
+
+
+def _process_row(example: dict, idx: int, split: str, wrap_prompt: bool) -> dict:
     messages = _to_message_list(example.get("prompt"))
-    if add_system:
-        has_system = messages and messages[0].get("role") == "system"
-        if has_system:
-            messages[0]["content"] = TOOL_SYSTEM_PROMPT + "\n\n" + messages[0].get("content", "")
-        else:
-            messages = [{"role": "system", "content": TOOL_SYSTEM_PROMPT}] + messages
+    data_source = example.get("data_source", "math_dapo")
+    is_code = _is_code_source(data_source)
+
+    # Drop any pre-existing system prompt (SOD uses none); apply SOD scaffolding to
+    # the user turn.
+    messages = [m for m in messages if m.get("role") != "system"]
+    if wrap_prompt and messages:
+        ui = _first_user_index(messages)
+        if ui >= 0:
+            messages[ui]["content"] = _sod_wrap(messages[ui].get("content", ""), is_code)
 
     extra_info = _to_dict(example.get("extra_info"))
     extra_info.setdefault("index", idx)
@@ -97,18 +156,14 @@ def _process_row(example: dict, idx: int, split: str, add_system: bool) -> dict:
     rm = _to_dict(example.get("reward_model"))
     gt = str(rm.get("ground_truth", "") or "")
 
-    # Route this sample to the code_interpreter tool.
+    # Route this sample to the code_interpreter tool + SOD-homologous reward.
     extra_info["need_tools_kwargs"] = True
+    extra_info["agentic_reward"] = True  # -> open_agentrl.compute_score (SOD rubric)
     extra_info["tools_kwargs"] = {"code_interpreter": {"create_kwargs": {"ground_truth": gt}}}
     extra_info["tool_selection"] = ["code_interpreter"]
 
-    # Keep the original data_source untouched. Open-AgentRL-30K mixes math
-    # (``math_dapo`` / ``train-math-*``), science-MCQ (``mega-science``) and code
-    # (``train-code-taco-*`` / ``train-code-leetcode-*``) rows; reward routing lives
-    # in ``verl.utils.reward_score.default_compute_score`` (+ ``open_agentrl``), so
-    # every source is scored with its own compute_score -- no filtering / remapping.
     return {
-        "data_source": example.get("data_source", "math_dapo"),
+        "data_source": data_source,  # kept intact (no filtering / remapping)
         "agent_name": "tool_agent",
         "prompt": messages,
         "ability": example.get("ability", "MATH"),
@@ -117,12 +172,12 @@ def _process_row(example: dict, idx: int, split: str, add_system: bool) -> dict:
     }
 
 
-def _convert(parquet_path: str, split: str, add_system: bool) -> pd.DataFrame:
+def _convert(parquet_path: str, split: str, wrap_prompt: bool) -> pd.DataFrame:
     # Read/write parquet directly with pandas/pyarrow to avoid the HF datasets
     # cache/filelock machinery (which is brittle on shared filesystems).
     df = pd.read_parquet(parquet_path)
     records = df.to_dict(orient="records")
-    rows = [_process_row(rec, i, split, add_system) for i, rec in enumerate(records)]
+    rows = [_process_row(rec, i, split, wrap_prompt) for i, rec in enumerate(records)]
     return pd.DataFrame(rows)
 
 
@@ -137,7 +192,11 @@ def main():
         "--out_dir",
         default="/mnt/afs_reason/chendongyang/code/data/preprocessed/open_agentrl_tir",
     )
-    ap.add_argument("--no_system", action="store_true", help="Do not inject the tool-use system prompt.")
+    ap.add_argument(
+        "--no_prompt_wrap",
+        action="store_true",
+        help="Do not apply SOD per-source prompt scaffolding (debug only).",
+    )
     ap.add_argument(
         "--eval_names",
         nargs="*",
@@ -145,14 +204,14 @@ def main():
         help="Subdirs of Open-AgentRL-Eval to convert as validation sets.",
     )
     args = ap.parse_args()
-    add_system = not args.no_system
+    wrap_prompt = not args.no_prompt_wrap
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Train: Open-AgentRL-30K.
     train_src = os.path.join(args.hf_root, "Gen-Verse__Open-AgentRL-30K", "Open-AgentRL-30K.parquet")
     if not os.path.exists(train_src):
         raise FileNotFoundError(f"train parquet not found: {train_src}")
-    train_ds = _convert(train_src, "train", add_system)
+    train_ds = _convert(train_src, "train", wrap_prompt)
     train_out = os.path.join(args.out_dir, "train.parquet")
     train_ds.to_parquet(train_out)
     print(f"[train] {len(train_ds)} rows -> {train_out}")
@@ -169,7 +228,7 @@ def main():
             print(f"[skip] no parquet in {subdir}")
             continue
         src = os.path.join(subdir, parquets[0])
-        ds = _convert(src, name, add_system)
+        ds = _convert(src, name, wrap_prompt)
         out = os.path.join(args.out_dir, f"test_{name.replace('-', '_')}.parquet")
         ds.to_parquet(out)
         print(f"[eval:{name}] {len(ds)} rows -> {out}")

@@ -41,6 +41,19 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
+    # Agentic TB-OPD (Open-AgentRL) rows are scored SOD-homologously: strict boxed
+    # math (math_dapo strict_box_verify=True) + LiveCodeBench code executed on E2B
+    # + tool-call shaping. Keyed off the marker our data prep injects
+    # (agentic_reward / need_tools_kwargs) so base (non-tool) runs that happen to
+    # share data_source="math_dapo" keep their original rubric.
+    if isinstance(extra_info, dict) and (extra_info.get("agentic_reward") or extra_info.get("need_tools_kwargs")):
+        from . import open_agentrl
+
+        res = open_agentrl.compute_score(data_source, solution_str, ground_truth, extra_info)
+        if isinstance(res, dict):
+            return res
+        return float(res)
+
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
@@ -66,20 +79,13 @@ def default_compute_score(
         or data_source.startswith("test-math-")
         or data_source.lower().startswith("aime")
         or "gpqa" in data_source.lower()
-    ):
-        # Open-AgentRL math + science-MCQ rows (train mega-science/train-math-* and
-        # AIME/GPQA evals): short boxed answer -> math_dapo.
-        from . import math_dapo
-
-        res = math_dapo.compute_score(solution_str, ground_truth)
-    elif (
-        data_source.startswith("train-code-")
+        or data_source.startswith("train-code-")
         or data_source.startswith("test-code-")
         or data_source.lower().startswith("livecodebench")
     ):
-        # Open-AgentRL code rows: ground_truth is a JSON test harness in TACO/APPS
-        # (fn_name/inputs/outputs) or LeetCode (entry_point/import_prefix/test_code)
-        # form. open_agentrl.compute_score detects the shape and executes locally.
+        # Open-AgentRL sources (math / science-MCQ / code) -> SOD-homologous rubric
+        # (strict boxed math + LiveCodeBench code on E2B + tool-call shaping). This
+        # is the fallback for rows missing the agentic marker handled above.
         from . import open_agentrl
 
         res = open_agentrl.compute_score(data_source, solution_str, ground_truth, extra_info)
