@@ -307,9 +307,15 @@ def compute_score(completion, test_cases, task=None, timeout=30, is_long_penalty
                     return  {"score": -1.0, "acc": False, "pred": None}
                 
             # Add Sandbox Fusion API
+            # NB: pass the *parsed* dict (input_output). The upstream SOD snippet
+            # used json.loads(json.dumps(test_cases)) here, but ``test_cases`` was
+            # coerced to a str at the top of compute_score, so that round-trip
+            # yields a str -> check_correctness then does in_outs["inputs"] and
+            # raises "string indices must be integers". Open-AgentRL TACO rows
+            # (ground_truth = JSON string) hit exactly this path.
             metrics = check_correctness(
                 sandbox_fusion_url = "<your_sandbox_fusion_url>",
-                in_outs=json.loads(json.dumps(test_cases)),
+                in_outs=input_output,
                 generation=solution,
                 timeout=timeout,
             )
