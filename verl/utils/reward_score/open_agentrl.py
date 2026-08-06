@@ -55,28 +55,34 @@ def _looks_like_code_harness(obj: Any) -> bool:
     )
 
 
-def _unwrap_code_gt(ground_truth: Any) -> Optional[Any]:
-    """Return a ground_truth whose *top level* is the code test harness.
+def _unwrap_code_gt(ground_truth: Any) -> Any:
+    """Return the code test harness as a JSON *string* for ``code_math``.
 
-    Open-AgentRL train-code rows store the harness directly, but some eval sets
-    (e.g. LiveCodeBench_v6) nest it under ``{"ground_truth": {...}}``. ``code_math``
-    keys off top-level ``import_prefix`` / ``inputs``, so unwrap before handing it
-    over. Returns the original value if it already looks like a harness, else the
-    inner harness, else None.
+    Open-AgentRL train-code rows store the harness as a JSON string, but some eval
+    sets (e.g. LiveCodeBench_v6) nest it under ``{"ground_truth": {...}}``.
+    ``code_math.compute_score`` does ``test_cases = str(test_cases)`` then
+    ``json.loads(test_cases)``: it therefore needs a *JSON string*, not a Python
+    dict. Passing a dict makes ``str(dict)`` emit single-quoted Python repr, which
+    ``json.loads`` cannot parse -> ``in_outs`` degrades to a str and
+    ``check_correctness`` raises "string indices must be integers". So always hand
+    back a canonical ``json.dumps`` of the top-level harness dict (unwrapping one
+    level of nesting if present).
     """
     obj: Any = ground_truth
     if isinstance(ground_truth, str):
         try:
             obj = json.loads(ground_truth)
         except (ValueError, TypeError):
-            return ground_truth  # leave as-is; code_math will str() it
+            return ground_truth  # not JSON; hand the raw string through
     if _looks_like_code_harness(obj):
-        return obj
+        return json.dumps(obj)
     if isinstance(obj, dict):
         inner = obj.get("ground_truth")
         if _looks_like_code_harness(inner):
-            return inner
-    return obj
+            return json.dumps(inner)
+        return json.dumps(obj)
+    # Non-dict (already a JSON string handled above, or something odd): pass through.
+    return ground_truth if isinstance(ground_truth, str) else json.dumps(obj)
 
 
 def _is_code(data_source: str, ground_truth: Any) -> bool:
