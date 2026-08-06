@@ -1154,6 +1154,10 @@ class AgentLoopWorker:
         the *remaining* multi-turn tool interaction to completion.
         """
         sp = dict(sampling_params)
+        # Request per-token logprobs like the main slot so the branch's
+        # response_logprobs cover the newly generated turns (not just the shared
+        # prefix); otherwise rollout_log_probs are 0 past the fork point.
+        sp["logprobs"] = True
         if forced_token is None and resample_temperature >= 0.0:
             sp["temperature"] = resample_temperature
 
