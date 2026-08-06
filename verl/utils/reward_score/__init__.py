@@ -60,6 +60,29 @@ def default_compute_score(
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
+    elif (
+        data_source == "mega-science"
+        or data_source.startswith("train-math-")
+        or data_source.startswith("test-math-")
+        or data_source.lower().startswith("aime")
+        or "gpqa" in data_source.lower()
+    ):
+        # Open-AgentRL math + science-MCQ rows (train mega-science/train-math-* and
+        # AIME/GPQA evals): short boxed answer -> math_dapo.
+        from . import math_dapo
+
+        res = math_dapo.compute_score(solution_str, ground_truth)
+    elif (
+        data_source.startswith("train-code-")
+        or data_source.startswith("test-code-")
+        or data_source.lower().startswith("livecodebench")
+    ):
+        # Open-AgentRL code rows: ground_truth is a JSON test harness in TACO/APPS
+        # (fn_name/inputs/outputs) or LeetCode (entry_point/import_prefix/test_code)
+        # form. open_agentrl.compute_score detects the shape and executes locally.
+        from . import open_agentrl
+
+        res = open_agentrl.compute_score(data_source, solution_str, ground_truth, extra_info)
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

@@ -21,6 +21,7 @@ import platform
 import signal
 import sys
 import traceback
+import types
 
 # used for debugging to time steps
 from datetime import datetime
@@ -33,7 +34,22 @@ from io import StringIO
 from unittest.mock import mock_open, patch
 
 import numpy as np
-from pyext import RuntimeModule
+
+
+class RuntimeModule:
+    """Stdlib drop-in for ``pyext.RuntimeModule`` (pyext is unbuildable on 3.11).
+
+    Only ``from_string(name, docstring, source)`` is used by the TACO/APPS
+    checker: it compiles ``source`` into a fresh in-memory module and returns it,
+    so attribute access (e.g. ``mod.Solution``) resolves against the exec'd
+    globals -- identical behaviour to the original pyext helper.
+    """
+
+    @staticmethod
+    def from_string(name: str, docstring: str, source: str) -> types.ModuleType:
+        module = types.ModuleType(name, docstring or "")
+        exec(compile(source, name, "exec"), module.__dict__)  # noqa: S102
+        return module
 
 
 def truncatefn(s, length=300):

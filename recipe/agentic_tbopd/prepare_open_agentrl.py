@@ -14,14 +14,17 @@
 """Convert Gen-Verse/Open-AgentRL parquet into tool-agent (code_interpreter) format.
 
 Open-AgentRL-30K is already in verl schema (``prompt`` chat list, ``reward_model``
-with ``ground_truth``, ``data_source=math_dapo``). For the agentic TB-OPD Phase 1'
-tool-integrated-reasoning (TIR) environment we only need to:
+with ``ground_truth``). It mixes math (``math_dapo`` / ``train-math-*``), science
+MCQ (``mega-science``) and code (``train-code-taco-*`` / ``train-code-leetcode-*``)
+sources. For the agentic TB-OPD Phase 1' tool-integrated-reasoning (TIR) env we:
 
   1. tag each row with ``agent_name="tool_agent"`` so ``ToolAgentLoop`` runs it, and
   2. prepend a system prompt that instructs the model to use the ``code_interpreter``
-     tool (SandboxFusion) during reasoning.
+     tool during reasoning.
 
-The math reward (``default_compute_score`` on ``data_source=math_dapo``) is unchanged.
+No source is filtered or remapped: every ``data_source`` keeps its original value and
+is scored by its own reward in ``verl.utils.reward_score.default_compute_score``
+(math/science -> ``math_dapo``; code -> ``open_agentrl`` -> prime_code / local exec).
 
 Usage:
     python -m recipe.agentic_tbopd.prepare_open_agentrl \
@@ -99,6 +102,11 @@ def _process_row(example: dict, idx: int, split: str, add_system: bool) -> dict:
     extra_info["tools_kwargs"] = {"code_interpreter": {"create_kwargs": {"ground_truth": gt}}}
     extra_info["tool_selection"] = ["code_interpreter"]
 
+    # Keep the original data_source untouched. Open-AgentRL-30K mixes math
+    # (``math_dapo`` / ``train-math-*``), science-MCQ (``mega-science``) and code
+    # (``train-code-taco-*`` / ``train-code-leetcode-*``) rows; reward routing lives
+    # in ``verl.utils.reward_score.default_compute_score`` (+ ``open_agentrl``), so
+    # every source is scored with its own compute_score -- no filtering / remapping.
     return {
         "data_source": example.get("data_source", "math_dapo"),
         "agent_name": "tool_agent",
