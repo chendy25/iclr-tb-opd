@@ -119,6 +119,16 @@ def construct_minimal_padding_template(
     else:
         template_sample.pop("routed_experts", None)
 
+    # Per-token distillation fields (present under OPD) are cloned full-length from the
+    # source sample; shrink them to the minimal 2-token sequence so their length stays
+    # consistent with input_ids/attention_mask. Otherwise no_padding_2_padding sees a
+    # teacher_logprobs total that exceeds prompt_len(1)+response_len(1) and asserts.
+    for tkey in ("teacher_logprobs", "teacher_ids"):
+        src = template_sample.get(tkey)
+        if isinstance(src, torch.Tensor):
+            new_shape = (input_ids.size(0), *tuple(src.shape[1:]))
+            template_sample[tkey] = torch.zeros(new_shape, dtype=src.dtype, device=src.device)
+
     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
     template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
     return template_sample, template_tag

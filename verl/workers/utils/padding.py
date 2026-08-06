@@ -128,7 +128,16 @@ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor
 
     sequence_lens = prompt_lens + response_lens
     sequence_offsets = sequence_lens.cumsum(dim=0)
-    assert sequence_offsets[-1].item() == values.shape[0]
+    if sequence_offsets[-1].item() != values.shape[0]:
+        # Rich diagnostic for TB-OPD turn-branch misalignment debugging.
+        raise AssertionError(
+            "no_padding_2_padding total mismatch: "
+            f"values.shape[0]={values.shape[0]} vs sequence_offsets[-1]={sequence_offsets[-1].item()}; "
+            f"tensor.is_nested={tensor.is_nested}, prompt_ids.is_nested={prompt_ids.is_nested}; "
+            f"bsz={len(sequence_lens)}, sum(prompt_lens)={int(prompt_lens.sum().item())}, "
+            f"sum(response_lens)={int(response_lens.sum().item())}; "
+            f"prompt_lens={prompt_lens.tolist()}; response_lens={response_lens.tolist()}"
+        )
     assert not prompt_lens.eq(0).any(), f"seq_offset - resp_len - 1 assumes prompt_len > 0. Got {prompt_lens}"
 
     response_list = []
