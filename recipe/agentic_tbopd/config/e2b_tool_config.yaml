@@ -11,9 +11,10 @@ tools:
   - class_name: "verl.tools.e2b_tool.E2BTool"
     config:
       type: native
-      # api_key: "${oc.env:E2B_API_KEY,}"      # or rely on the env var directly
-      # domain: "${oc.env:E2B_DOMAIN,}"          # self-hosted endpoint (optional)
-      # template: "base"                          # sandbox template (optional)
+      # api_key / domain: prefer env (E2B_API_KEY, E2B_DOMAIN). AGS self-hosted
+      # default domain is ap-beijing.tencentags.com (set in train script).
+      # template: AGS has no "base"; use the node-python template from opd_dev.
+      template: "node-python-openclaw"
       sandbox_timeout: 300
       default_timeout: 60
       max_concurrent_sandboxes: 64
