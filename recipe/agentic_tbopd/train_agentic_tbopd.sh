@@ -9,10 +9,16 @@
 #   M    : TB-OPD-Turn (this paper)  -> TB_ENABLE=True TB_FORK_UNIT=turn
 #
 # Teacher SOD-GRPO_teacher-4B -> Student Qwen3-1.7B (defaults), TIR math.
-# Requires a running SandboxFusion service; set SANDBOX_FUSION_URL.
+#
+# Sandbox backend for the code_interpreter tool (SANDBOX_BACKEND):
+#   e2b            (default) -> needs E2B_API_KEY (+ optional E2B_DOMAIN)
+#   sandbox_fusion           -> needs a running SandboxFusion svc (SANDBOX_FUSION_URL)
+# The turn-level branching logic is backend agnostic; only tool_config differs.
 #
 # Usage (on allocated nodes, RANK/MASTER_* set by cluster):
-#   SANDBOX_FUSION_URL=http://host:8080/run_code bash recipe/agentic_tbopd/train_agentic_tbopd.sh
+#   E2B_API_KEY=... bash recipe/agentic_tbopd/train_agentic_tbopd.sh
+#   SANDBOX_BACKEND=sandbox_fusion SANDBOX_FUSION_URL=http://host:8080/run_code \
+#       bash recipe/agentic_tbopd/train_agentic_tbopd.sh
 # =====================================================================
 
 set -xeuo pipefail
@@ -62,8 +68,17 @@ train_files="['${AGENTRL_TRAIN}']"
 val_files="['${AGENTRL_VAL}']"
 
 # ---- tool / multi-turn ----
-TOOL_CONFIG=${TOOL_CONFIG:-${CODE_DIR}/recipe/agentic_tbopd/config/sandbox_fusion_tool_config.yaml}
+SANDBOX_BACKEND=${SANDBOX_BACKEND:-e2b}   # e2b | sandbox_fusion
+if [[ -z "${TOOL_CONFIG:-}" ]]; then
+  if [[ "${SANDBOX_BACKEND}" == "sandbox_fusion" ]]; then
+    TOOL_CONFIG=${CODE_DIR}/recipe/agentic_tbopd/config/sandbox_fusion_tool_config.yaml
+  else
+    TOOL_CONFIG=${CODE_DIR}/recipe/agentic_tbopd/config/e2b_tool_config.yaml
+  fi
+fi
 export SANDBOX_FUSION_URL=${SANDBOX_FUSION_URL:-http://localhost:8080/run_code}
+export E2B_API_KEY=${E2B_API_KEY:-}
+export E2B_DOMAIN=${E2B_DOMAIN:-}
 max_assistant_turns=${MAX_ASSISTANT_TURNS:-8}
 max_user_turns=${MAX_USER_TURNS:-8}
 max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH:-2048}
@@ -139,7 +154,7 @@ max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 need_gpus=$(( TRAINER_NNODES * NGPUS_PER_NODE + DISTILL_NNODES * DISTILL_NGPUS_PER_NODE ))
 
 echo "AGENTIC TB-OPD: tb_enable=${tb_enable} fork_unit=${tb_fork_unit} metric=${tb_fork_metric} branch_mode=${tb_branch_mode} rollout_n=${rollout_n}"
-echo "tool_config=${TOOL_CONFIG} sandbox_url=${SANDBOX_FUSION_URL} max_turns=${max_assistant_turns}"
+echo "sandbox_backend=${SANDBOX_BACKEND} tool_config=${TOOL_CONFIG} max_turns=${max_assistant_turns}"
 echo "student=${STUDENT_MODEL} teacher=${TEACHER_MODEL}"
 echo "train=${train_files} val=${val_files}"
 
@@ -149,6 +164,9 @@ echo "train=${train_files} val=${val_files}"
 [[ -f "${AGENTRL_TRAIN}" ]] || { echo "Missing train parquet: ${AGENTRL_TRAIN} (run prepare_open_agentrl.py)"; exit 1; }
 [[ -f "${TOOL_CONFIG}" ]] || { echo "Missing tool config: ${TOOL_CONFIG}"; exit 1; }
 [[ -x "${OPYTHON}" ]] || { echo "Missing python: ${OPYTHON}"; exit 1; }
+if [[ "${SANDBOX_BACKEND}" == "e2b" ]]; then
+  [[ -n "${E2B_API_KEY}" || -n "${E2B_DOMAIN}" ]] || echo "WARN: SANDBOX_BACKEND=e2b but neither E2B_API_KEY nor E2B_DOMAIN is set"
+fi
 
 # ---- cleanup + Ray ----
 ray stop --force 2>/dev/null || true

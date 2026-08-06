@@ -10,8 +10,9 @@ proposal (§9 execution plan).
 
 | Piece | Location |
 |---|---|
-| Code tool (SandboxFusion `code_interpreter`, TIR) | `verl/tools/sandbox_fusion_tools.py` (`SandboxFusionTool`, `CustomSandboxFusionTool`) |
-| Tool config | `config/sandbox_fusion_tool_config.yaml` |
+| Code tool — E2B backend (`code_interpreter`, TIR) | `verl/tools/e2b_tool.py` (`E2BTool`) |
+| Code tool — SandboxFusion backend | `verl/tools/sandbox_fusion_tools.py` (`SandboxFusionTool`, `CustomSandboxFusionTool`) |
+| Tool configs | `config/e2b_tool_config.yaml`, `config/sandbox_fusion_tool_config.yaml` |
 | Turn config (`fork_unit=turn`, hybrid metric, budget B, AEPO penalty) | `verl/workers/config/distillation.py` (`TBOPDConfig`), `verl/trainer/config/distillation/distillation.yaml` |
 | Turn fork selection (ATOD Soft-OR + ARPO ΔH_post-tool, NLL proxy) | `verl/experimental/agent_loop/tb_opd.py` (`select_fork_turn`, `segment_assistant_turns`, `topk_candidates_at`) |
 | Breakpoint resume through the tool loop (E4) | `verl/experimental/agent_loop/tool_agent_loop.py` (`ToolAgentLoop.run_from_prefix`) |
@@ -32,15 +33,36 @@ proposal (§9 execution plan).
   measured against an initial-entropy baseline) and per-step branch rollout. We reuse the
   *selection timing* and the *branch-rollout pattern*, not ARPO's RL outcome objective.
 
+## Sandbox backend (decoupled from branching)
+
+The `code_interpreter` tool is a `BaseTool` on `ToolAgentLoop`; the turn-level
+branching (`select_fork_turn` + `run_from_prefix`) is **backend agnostic**. Two
+interchangeable backends ship here, selected by `SANDBOX_BACKEND` (which just
+picks the `tool_config_path` yaml):
+
+| `SANDBOX_BACKEND` | tool | needs |
+|---|---|---|
+| `e2b` (default) | `E2BTool` | `pip install e2b` + `E2B_API_KEY` (+ `E2B_DOMAIN` for self-hosted) |
+| `sandbox_fusion` | `CustomSandboxFusionTool` | a running SandboxFusion svc at `SANDBOX_FUSION_URL` |
+
+Why not opd_dev's E2B *runner*: that stack (`recipe_custom/agent/runners`) runs a
+whole-trajectory harness inside the sandbox and returns only a reward, hiding the
+per-turn token ids / logprobs / prefix-resume hooks turn-branching needs. `E2BTool`
+reuses only E2B's create/run/kill primitive (cf. `opd_dev .../sandbox.py::E2BSandbox`)
+as a per-turn tool, so branching stays inside verl's `ToolAgentLoop`.
+
 ## How to run (SOD stack)
 
 ```bash
 # 1. Build the tool-agent TIR parquet from Open-AgentRL-30K + Eval.
 python -m recipe.agentic_tbopd.prepare_open_agentrl
 
-# 2. Start a SandboxFusion service and point the tool at it.
-#    docker run -p 8080:8080 volcengine/sandbox-fusion:server-20250609
-export SANDBOX_FUSION_URL=http://localhost:8080/run_code
+# 2a. Default backend E2B: just export your key (self-hosted also sets E2B_DOMAIN).
+export E2B_API_KEY=...          # export E2B_DOMAIN=e2b.your.host  (optional)
+
+# 2b. Or use SandboxFusion instead:
+#     docker run -p 8080:8080 volcengine/sandbox-fusion:server-20250609
+#     export SANDBOX_BACKEND=sandbox_fusion SANDBOX_FUSION_URL=http://localhost:8080/run_code
 
 # 3. Launch an arm (RANK/MASTER_* set by the cluster; 1 node student + 1 node teacher).
 bash recipe/agentic_tbopd/run_phase1_B-A0.sh     # agent OPD baseline

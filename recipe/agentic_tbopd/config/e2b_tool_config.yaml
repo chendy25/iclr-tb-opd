@@ -1,0 +1,35 @@
+# E2B-backed code-execution tool for agentic TB-OPD (Phase 1', TIR env).
+#
+# Parallel to sandbox_fusion_tool_config.yaml -- same `code_interpreter` tool
+# schema, different sandbox backend. The turn-level branching logic is backend
+# agnostic; pick this file via:
+#   actor_rollout_ref.rollout.multi_turn.tool_config_path=recipe/agentic_tbopd/config/e2b_tool_config.yaml
+#
+# Auth: set E2B_API_KEY (and E2B_DOMAIN for a self-hosted endpoint) in the
+# environment, or fill in `api_key` / `domain` below. Requires `pip install e2b`.
+tools:
+  - class_name: "verl.tools.e2b_tool.E2BTool"
+    config:
+      type: native
+      # api_key: "${oc.env:E2B_API_KEY,}"      # or rely on the env var directly
+      # domain: "${oc.env:E2B_DOMAIN,}"          # self-hosted endpoint (optional)
+      # template: "base"                          # sandbox template (optional)
+      sandbox_timeout: 300
+      default_timeout: 60
+      max_concurrent_sandboxes: 64
+      create_max_retries: 3
+      strip_fences: true
+      auto_print: true
+      python_bin: "python3"
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_interpreter"
+        description: "Execute Python code in a sandbox and return stdout/stderr. Use it to run calculations, verify intermediate results, and check your reasoning before giving the final answer."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "The Python code to execute. Print the values you want to observe."
+          required: ["code"]
