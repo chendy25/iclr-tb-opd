@@ -154,15 +154,24 @@ TB-OPD-Turn 的「免费午餐」只能来自把预算花在更高信息的 turn
 
 ## 4. 实验设计
 
-### 4.0 环境与设定（为可对比性，靠拢 turn-aware OPD 家族）
+### 4.0 环境与设定（按阶段写死，对齐开源可复用栈）
 
 | 项 | 取值 | 理由 |
 |---|---|---|
-| **环境** | 先 **tool-integrated math / code interpreter**（与母方法 DAPO-Math 连续、环境稳）；再补 **ALFWorld / WebShop / Search-QA** | 后三个是 ATOD/TurnOPD/SAGE-OPD/Guided-OPD 的公共 benchmark，能直接软对照 |
-| **Teacher→Student** | 与母方法一致的族内蒸馏，如 **Qwen3-8B/30B-A3B → Qwen3-4B/1.7B/0.6B** | 对齐 ATOD/Guided-OPD 的 Qwen3 家族设定 |
+| **Phase 0'/1' 环境** | **SOD / Open-AgentRL**：tool-integrated math + code interpreter（SandboxFusion） | 有 HF 数据 + **已 release teacher ckpt**；与母方法 math 连续；veRL 底座 |
+| **Phase 2' 环境** | **ATOD 三环境栈**：ALFWorld / WebShop / Search-QA | TurnOPD/SAGE/Guided 公共 benchmark；环境安装与 teacher GRPO 脚本最完整 |
+| **Teacher→Student（0'/1'）** | Teacher = **SOD-GRPO_teacher-4B**（免训）；Student = Qwen3-0.6B/1.7B/4B base（或 SOD student 作对照） | 开源已成对，立刻可跑 Phase 0' |
+| **Teacher→Student（2'）** | 方案 A（快）：GiGPO/SPEAR 7B + Search-R1 7B 代理；方案 B（严）：按 ATOD 脚本自训 Qwen3 GRPO teacher ~150 step | **无**匹配 ATOD 的三环境 Qwen3 teacher/student 官方套件（见 §9.10） |
 | **公平轴** | matched generation tokens **且** matched tool calls | 见 §3.5 |
-| **评测** | 各环境 success rate / score（avg 多 seed） | 与 agentic 家族一致，不用 math avg@16 |
+| **评测** | SOD Eval（AIME/GPQA/LCB 等）；跨环境用各 env success rate / score | 与 agentic 家族一致 |
 | **默认方法 M** | Only-fail + B=1 + k=2 + `hybrid` 选点 + forced-topk 展开 + 整树 reverse KL | 先窄树 |
+
+**阶段资源一句话**：
+
+```
+Phase 0'/1'  →  SOD 栈（数据+teacher ckpt+code tool）
+Phase 2'     →  ATOD 栈（三环境）+ ARPO/AT²PO（树展开/B-A2）
+```
 
 ### 4.1 主表（Table A' — Agentic）
 
@@ -221,18 +230,6 @@ TB-OPD-Turn 的「免费午餐」只能来自把预算花在更高信息的 turn
 - 机制图（Phase 0'）显示 `recover.fork > recover.resample` 且 CI 排除 0；
 - 相对 AT²PO 能给出「无需可验证 reward / 稀疏 outcome 也能训」的额外卖点。
 
-### 5.3 与 math 主线的资源门控
-
-**math 的 `M* vs B1/B2/B4` 尚未定论，agentic 不得抢训练卡。**
-
-| 条件 | 允许推进 |
-|---|---|
-| math 主线仍在跑 / 未出主表 | **只做 Phase 0'**（推理诊断，不占训练池） |
-| math `M*` 未站稳 **且** Phase 0' 未过 | agentic 缩为 discussion / future work |
-| Phase 0' 通过 **且** math `M*` 有正向信号 | 开 Phase 1' 训练工程 |
-| Phase 1' M > B-A1 且 > B-A0 | Phase 2' 跨环境 + B-A2 |
-| Phase 2' 双环境稳定胜出 | 考虑 P2 独立成篇 |
-
 ---
 
 ## 6. 风险与缓解
@@ -258,219 +255,317 @@ TB-OPD-Turn 的「免费午餐」只能来自把预算花在更高信息的 turn
 
 ---
 
-## 8. 参考文献（新增，按用途）
+## 8. 参考文献（新增，按用途 + 可复现性）
 
-| 优先级 | 论文 | arXiv / 会议 | 用途 |
-|---|---|---|---|
-| P0 | **ARPO** | 2507.19849 (ICLR 2026) | 分叉时机来源（tool 后熵尖峰、ΔH 选点） |
-| P0 | **AT²PO** | 2601.04767 (ACL 2026) | 最近对手：熵引导 turn 树展开（RL）；必设对照 B-A2 |
-| P0 | **ATOD** | 2606.27814 | turn 级 OPD 重加权（T-DUR）；必设对照 B-A1；纯熵更差的教训 |
-| P0 | **TurnOPD** | 2607.05804 | turn 级 OPD 预算/归一化；对照与 benchmark |
-| P1 | **AEPO** | 2510.14545 | over-branching 惩罚（连续高熵 turn）；C2 依据 |
-| P1 | **SOD** | 2605.07725 | step 级 divergence 重加权；TIR tool 错误级联 |
-| P1 | **SAGE-OPD** | 2606.19659 | turn 级 skip/intervene；对照叙事 |
-| P1 | **Guided-OPD** | 2606.15912 | teacher/student turn 混合 + 递减 curriculum（稳早期漂移） |
-| P1 | **Tree-GRPO / Tree Search for Agent RL** | 2509.21240 | initialize-then-expand 树、同 tool 预算多 rollout |
-| P2 | **SmartAD / SAD / SCoRe / BRTS** | ACL2026 / 2505.13820 / 2509.14257 / 2605.09725 | 轨迹/段级选择与加权对照 |
-| P2 | agent-distillation (retrieval+code) | 2505.17612 | 小模型 agent 蒸馏底座 |
+| 优先级 | 论文 | arXiv / 会议 | 用途 | 代码 | 数据 | ckpt |
+|---|---|---|---|---|---|---|
+| P0 | **ARPO** | 2507.19849 (ICLR 2026) | ΔH 选点、tool 后熵、partial branch | ✅ [RUC-NLPIR/ARPO](https://github.com/RUC-NLPIR/ARPO) | ✅ HF | ✅ 多尺度 |
+| P0 | **AT²PO** | 2601.04767 (ACL 2026) | 熵引导 turn 树；B-A2 对照 | ✅ [zzfoutofspace/ATPO](https://github.com/zzfoutofspace/ATPO) | ✅ 脚本 | ❌ 需自训 |
+| P0 | **ATOD** | 2606.27814 | T-DUR / B-A1；三环境栈 | ✅ [TanQitai/ATOD](https://github.com/TanQitai/ATOD) | ⚠️ 需装 env | ❌ teacher 需自训 |
+| P0 | **SOD** | 2605.07725 | Phase 0'/1' TIR 环境与 teacher | ✅ [YoungZ365/SOD](https://github.com/YoungZ365/SOD) | ✅ Open-AgentRL | ✅ teacher+student |
+| P0 | **TurnOPD** | 2607.05804 | turn 预算/归一化（读论文） | ❌ | — | — |
+| P1 | **AEPO** | 2510.14545 | 连续高熵 turn 惩罚（C2） | ✅ 同 ARPO 仓 | ✅ | ✅ |
+| P1 | **SAGE-OPD** | 2606.19659 | skip/intervene 叙事 | ❌ (Meta) | — | — |
+| P1 | **Guided-OPD** | 2606.15912 | curriculum turn guidance | ⚠️ 论文链 404 | — | — |
+| P1 | **Tree-GRPO** | 2509.21240 | initialize-then-expand、tool 预算 | ✅ [AMAP-ML/Tree-GRPO](https://github.com/AMAP-ML/Tree-GRPO) | ✅ | ❌ |
+| P2 | **SmartAD / SAD / SCoRe / BRTS** | ACL2026 等 | 轨迹/段级选择对照 | 部分 | 部分 | 部分 |
+| P2 | agent-distillation | 2505.17612 | 离线 code/retrieval 蒸馏底座 | ✅ | ✅ | ✅ |
 
-> 母方法（TB-OPD-Token）的参考见 `branching_distillation_research.md` §8（GKD / Beyond 80/20 / CURE / Unmasking OPD / TIP 等）。
+> 母方法（TB-OPD-Token）的参考见 `branching_distillation_research.md` §8。  
+> **没有任何论文做了「turn 树展开 × 教师 dense KD」**——M 方法本身无可直接 fork 的 repo；可复用的是零件（环境、选点、分支 rollout、对照臂）。详细路径见 §9.10。
 
 ---
 
-## 9. 四阶段执行阶梯（由便宜到贵）
+## 9. 执行路线：四阶段阶梯 + 工程清单 + Kill 判据
 
-> **原则**：先验证「在高不确定 turn 展开分支是否真能救回失败轨迹」，再投断点续跑与训练工程。每一阶段都有明确 **Kill 判据**；不过闸门则停止或降级，避免在 AT²PO/ATOD 已占满的叙事里空烧算力。
+> **原则**：先验证「高不确定 turn 展开分支是否真能救回失败轨迹」（Phase 0'），再投断点续跑训练工程；math 主线 `M* vs B1/B2/B4` 仍优先，agentic 不抢训练卡。
 
 ### 9.0 现状盘点（决定改造量）
 
-| 模块 | 代码位置 | 现状 | Agentic 缺口 |
-|---|---|---|---|
-| 多轮 tool loop | `verl/experimental/agent_loop/tool_agent_loop.py` | `ToolAgentLoop` + `AgentData` 已有 `messages / response_ids / response_mask / turn_scores / user_turns / assistant_turns` | 需**记录 turn 边界** + 每 turn 的 post-tool top-k logprob |
-| Token 级 TB-OPD | `verl/experimental/agent_loop/tb_opd.py` | `select_fork` / `select_fork_from_topk`、entropy/gap、`forced_topk`、Only-fail | **无 turn/tool 概念**；只在扁平 `response_ids` 上选点 |
-| 固定槽位 fan-out | `agent_loop.py` → `_run_tb_opd_group` | `rollout.n=1+k`，Only-fail 退化 | 可复用；需改为 turn 级展开 |
-| OPD / KD | `distillation.yaml` + trainer | teacher logprob、reverse KL | 可复用；需 **tool 返回 token mask** |
-| 断点续跑 | — | **不存在** | **核心工程**：从选中 turn 前缀**重进 tool loop**，跑完剩余多轮（含真实 tool 调用） |
+| 模块 | 现状（`iclr/verl`，`agentic-tbopd` 分支） | Agentic 缺口 |
+|---|---|---|
+| 多轮 rollout | `ToolAgentLoop`（`tool_agent_loop.py`）已有；`AgentData` 带 `messages / response_ids / response_mask / turn_scores / user_turns / assistant_turns` | 需**记录 turn 边界** + 每 turn 的 post-tool top-k logprob（供选点） |
+| KD / OPD | teacher logprob、reverse KL、`AgentLoopWorker._run_tb_opd_group` 固定槽位 fan-out | 可直接复用 |
+| TB-OPD 选点 | `tb_opd.py`：扁平 `response_ids` 上 token 级 entropy / topk_gap | 需 `ForkUnit=turn` + `hybrid=SoftOR(ΔH, disagreement)` |
+| TB-OPD 展开 | `forced_topk`：从 fork 位置**续写 token 到 EOS** | 需**断点续跑**：从选中 turn 前缀重进 tool loop，跑完剩余多轮（**唯一真正难的工程点**） |
+| 预算 | token 预算（math） | 需加 **matched tool calls** 轴 |
+| over-branching | 无 | 借 AEPO：连续高熵 turn 分支惩罚 |
 
-**唯一真正难的点**：现有 `forced_topk` 只续写 token 到 EOS，不会重进 tool 循环。Phase 0' 可离线用「拼接 messages 前缀 + 重跑 ToolAgentLoop」绕过；Phase 1' 才需把断点续跑写进训练主循环。
+**结论**：除「从 turn 前缀续跑完剩余多轮 tool loop」外，其余均可复用或薄封装；Phase 0' 诊断可离线实现断点续跑，**不必先改训练主循环**。
+
+### 9.1 核心 go/no-go 问题（Phase 0' 必须回答）
+
+在多轮 agent 里，**在高不确定 turn 展开分支**，是否真能在**等预算**下比「不展开」救回更多失败轨迹？
+
+- 若 **否** → 不进 Phase 1'，agentic 缩为 math 论文 discussion / future work。
+- 若 **是** → 再开断点续跑 + 训练。
 
 ---
 
-### Phase 0'｜诊断（≈1 周，推理卡，**最先做**）
+### 9.2 Phase 0' — 诊断（≈1 周，几乎不花训练卡）
 
-**目的**：在不开训练的前提下，验证 go/no-go 前提——
+**目的**：验证 §9.1 前提；**不改训练代码**。
 
-> 在高信号 turn **强制展开分支**，是否比等预算 **不强制重采样 / 单轨迹续写** 更能救回**失败**主轨迹？
+**环境（写死）**：**SOD / Open-AgentRL**（code interpreter + SandboxFusion），不用先上 ALFWorld。
 
-**环境**：tool-integrated math / code interpreter（单 tool，复用 `math_dapo` reward，与母方法连续）。
+| 需求 | 推荐来源 | 说明 |
+|---|---|---|
+| 数据 / Eval | Open-AgentRL-SFT-3K / RL-30K / Eval | HF 可直接拉 |
+| Teacher | `youngzhong/SOD-GRPO_teacher-4B` | **免训** |
+| Student | Qwen3-0.6B/1.7B base | cold-start；SOD-0.6B/1.7B 可作对照 |
+| ΔH_post-tool | ARPO 仓库熵监测逻辑 | 抄实现 + 对照论文 Figure |
+| disagreement | ATOD T-DUR `d_k` 或 SOD step divergence | Soft-OR 公式直接抄 |
+| 脚本 | 自建 `phase0_agentic_recover.py`（E8） | 离线三臂；可不改训练主循环 |
 
 **流程**：
 
-1. 用 `ToolAgentLoop` 跑学生多轮轨迹（G 条/prompt 即可）；
-2. 对每条**失败**轨迹，逐 turn 算：
-   - `ΔH_post-tool` = Normalize(H_after_tool^{(1..k)} − H_init^{(1..k)})（ARPO 式）
-   - `disagreement` d_k = 该 turn 内 mean |log π_θ − log π_T|（ATOD 式）
-   - `fork_signal` = Soft-OR(ΔH, disagreement) = 1−(1−ã)(1−d̃)
-3. 取 `fork_signal` 最高的 turn（Only-fail，B=1）；
-4. 三臂**等预算**（matched tokens **且** matched tool calls）：
-   - **fork**：该 turn 强制 top-k 展开，各续跑到 done；
+1. 用 `ToolAgentLoop`（或 SOD 评测栈）跑学生多轮轨迹（G 条/prompt）；
+2. 对每条**失败**轨迹，逐 turn 计算：
+   - `ΔH_post-tool`：tool 返回后首 k token 熵 − 初始熵（ARPO 式，归一化）；
+   - `disagreement`：该 turn 内 teacher–student 平均 \|Δlog p\|（ATOD 式）；
+   - `fork_signal = SoftOR(ΔH, disagreement)`；
+3. 取 `fork_signal` 最高的 turn（或 hi 分位 turn），在同一前缀上做三臂**等预算**对比：
+   - **fork**：强制 top-k 展开，续跑到 done；
    - **resample**：同前缀不强制、等预算自然重采样；
-   - **continue**：同前缀贪心续跑 1 次。
+   - **continue**：单轨迹贪心续跑 1 次；
+4. 主指标：`recover.fork`、`recover.resample`、`recover.continue`；配对 bootstrap CI（prompt 聚类）。
 
-**主指标**（仅在 main-wrong 子集）：
+**工程**：诊断脚本可「拼接 messages 前缀 + 重新走 ToolAgentLoop」离线实现，无需 `_generate_sequences_tb_opd` 改造。
 
-| 指标 | 含义 |
+**Kill 判据（不进 Phase 1'）**：
+
+| 条件 | 动作 |
 |---|---|
-| `recover.fork` | P(≥1 分支成功 \| main wrong) |
-| `recover.fork − recover.resample` | 强制展开 vs 不强制重采样 |
-| `recover.fork − recover.continue` | 分支 vs 单轨迹贪心 |
-| `fork_turn_frac` | 分叉 turn 在整条轨迹中的相对位置（是否 post-tool） |
+| `recover.fork ≤ recover.resample` 且 CI 含 0 | **停止**；机制不成立 |
+| fork 点 90%+ 落在 turn 0–1（开场白） | 改选点/过滤后再诊断；仍失败则停止 |
+| 主轨迹 solve rate 异常低（环境/截断问题） | 先修环境/长度，再诊断 |
 
-统计：prompt 聚类 bootstrap 95% CI；`PASS_HINTS` = fork>resample / fork>continue / CI 排除 0。
+**通过标准（进 Phase 1'）**：
 
-**产出**：Figure 1'（ARPO 熵尖峰 + 实际 fork turn 分布）+ Phase 0' 表；**不挡 math 主线**。
-
-**Kill 判据（不过则停）**：
-
-| 结果 | 动作 |
-|---|---|
-| `recover.fork ≤ recover.resample` 且 CI 含 0 | **停止** agentic 训练线；缩为 math 论文 discussion |
-| `fork_turn` 集中在开场白 turn（非 post-tool） | 改选点信号或过滤；重跑 Phase 0' |
-| `main_solve_rate` 极低（环境/截断问题） | 对齐长度与 tool 配置后重跑 |
-
-**工程**：可用离线脚本（`iclr/scripts/phase0_agentic_recover.py`，待建）；**不必**改 `ray_trainer`。
+1. `recover.fork > recover.resample` 且 bootstrap CI 倾向排除 0；
+2. fork 分布集中在 **post-tool 决策 turn**（非纯开场噪声）；
+3. 可选：`recover.fork > recover.continue`。
 
 ---
 
-### Phase 1'｜最小训练验证（Phase 0' 通过才做，≈2–3 周）
+### 9.3 Phase 1' — 最小训练验证（Phase 0' 通过后，≈2–3 周）
 
-**前提**：Phase 0' 中 `recover.fork > recover.resample`（倾向显著）**且** math 主线 `M*` 未明确失败。
+**目的**：证「展开 + 教师 KD」相对底座与 turn 重加权有增益；**仍限 SOD 单环境**。
 
-**环境**：同上 tool-integrated math（短 horizon，单 code tool）。
+**默认方法 M**：Only-fail + B=1 + k=2 + `hybrid` 选点 + forced-topk + 整树 reverse KL + tool token mask。
 
-**方法 M（默认）**：Only-fail + B=1 + k=2 + `fork_metric=hybrid` + forced-topk + 整树 reverse KL + tool token mask。
+**主表（Table A' 子集，等 token 且等 tool-call）+ 开源对照实现**：
 
-**主表（Table A'，等 token & tool）**：
+| ID | 必跑 | 证明 | 最接近的开源实现 |
+|---|---|---|---|
+| B-A0 | ✓ | agent OPD 底座 | 现有 `distillation.yaml`（`tb_opd.enable=false`） |
+| B-A1 | ✓ | **展开** vs **只重加权** | **ATOD T-DUR**（去掉 RL 退火）或 SOD step weight |
+| **M** | ✓ | TB-OPD-Turn | **自研**；树展开参考 ARPO/AT²PO，KD 用现有 OPD loss |
 
-| ID | 方法 | 必跑 |
-|---|---|---|
-| B-A0 | Agent OPD（单轨迹） | ✓ |
-| B-A1 | Turn-Reweight OPD（hybrid 权重，**不展开**） | ✓ |
-| **M** | TB-OPD-Turn | ✓ |
+Teacher 继续用 **SOD-GRPO_teacher-4B**（勿在 1' 阶段自训 ATOD teacher）。
 
-（B-A2/B-A3 留 Phase 2'，先证「展开 > 重加权」。）
+**Kill 判据（不进 Phase 2'）**：
 
-**Kill 判据**：
-
-| 结果 | 动作 |
+| 条件 | 动作 |
 |---|---|
-| M ≤ B-A1（同 step / 同预算） | 收益只是 turn 重加权 → **停止**；叙事改为「ATOD 式门控已够」 |
-| M ≤ B-A0 | 查实现 / 阈值；仍否 → idea 在 agentic 不成立 |
-| tool mask 未开导致 KD 异常 | 先过 C6 再判 |
+| M ≤ B-A0（同预算） | 查实现/阈值；仍否 → idea 在 agentic 不成立 |
+| M ≤ B-A1 | 收益只是「重加权」，非「展开」；缩叙事或停 |
+| tool mask 消融显示 KD 被环境 token 严重污染 | 先修 mask 再比 |
+
+**通过标准（进 Phase 2'）**：M > B-A0 且 **M > B-A1**（同预算 success rate）。
 
 ---
 
-### Phase 2'｜正面对照 + 跨环境（Phase 1' M 站住才做）
+### 9.4 Phase 2' — 正面对比 + 跨环境（Phase 1' 通过后）
 
 **新增对照**：
 
-| ID | 目的 |
-|---|---|
-| B-A2 | 同样 turn 树展开 + **RL outcome/credit**（≈ AT²PO）→ 证「教师 dense KD > outcome credit」 |
-| B-A3 | OPD-Indep-N → 证「树展开 > 盲目多采样」 |
+| ID | 目的 | 开源参考 |
+|---|---|---|
+| B-A2 | 同样 turn 树展开但 **RL outcome/credit**（≈AT²PO）→ 证「教师 dense KD > outcome credit」 | **AT²PO** pipeline 或 ARPO branch rollout（需自训） |
+| B-A3 | OPD-Indep-N → 证「树展开 > 盲目多采样」 | 现有 veRL multi-rollout + 标准 OPD |
 
-**环境扩展**：ALFWorld / WebShop / Search-QA（对齐 ATOD/TurnOPD benchmark，软对照）。
+**跨环境**：直接 clone **[TanQitai/ATOD](https://github.com/TanQitai/ATOD)** 作为环境栈起点（ALFWorld / WebShop / Search-QA + GRPO teacher 脚本）。
+
+**Teacher ckpt 现实约束**（调研结论，务必遵守）：
+
+> **没有任何论文 release 过与 ATOD 对齐的三环境 × matched Qwen3 teacher/student 成对 ckpt。**
+
+| 方案 | Teacher | 何时用 |
+|---|---|---|
+| **A（快）** | ALFWorld/WebShop → GiGPO/SPEAR-7B；Search → Search-R1 Qwen2.5-7B（E5 对齐） | 先跑通 Phase 2' pipeline |
+| **B（严）** | 按 ATOD `examples/grpo_teacher_trainer/run_*_grpo_qwen3_*.sh` 自训 ~150 step | 论文级严格对比 ATOD |
+
+Student 仍从 `Qwen/Qwen3-1.7B`（或 0.6B/4B）cold-start；ALFWorld 可选 [OPID-ALFWorld-1.7B](https://huggingface.co/Jinyang23/OPID-ALFWorld-1.7B) 作 distillation baseline。注意方案 A 的 teacher 多为 **Qwen2.5**，与 Qwen3 student 有 tokenizer/chat template 差异，正文需声明。
 
 **消融**：§4.2 的 C0–C6（选点信号、展开方式、k/B、Only-fail、截断、KD 作用域、tool mask）。
 
-**Kill 判据**：
+**Kill 判据（不升 P2 独立成篇）**：
 
-| 结果 | 动作 |
+| 条件 | 动作 |
 |---|---|
-| M > B-A1 但 M ≤ B-A2 | 贡献缩成「OPD 版 turn 树」；难正面刚 AT²PO |
-| 仅 code-math 赢、跨环境不 replicate | 保留为 P1 transfer 一节，不升 P2 |
-| over-branching 导致 tool 预算暴涨无收益 | 开 AEPO 式连续高熵惩罚（C2） |
+| M ≤ B-A2 在主要环境 | 相对 AT²PO 无 KD 优势；agentic 仅作 math 论文 transfer 一节 |
+| 仅 1 个环境 M 胜出 | 保留 P1 编排，不拆第二篇 |
+| over-branching 导致 tool 预算翻倍但 success 不涨 | 加强 AEPO 式惩罚 / 降 B |
+
+**通过标准（升 P2 独立成篇）**：M 在 **≥2 环境**稳定 > B-A1 且 > B-A2；Phase 0' 机制图仍成立。
 
 ---
 
-### Phase 3'｜论文编排决策
+### 9.5 Phase 3' — 论文编排决策
 
 | 结果 | 编排 |
 |---|---|
-| Phase 1' 仅小幅赢 | **P3**：math 论文 discussion 一句 |
-| Phase 1' 稳赢 B-A1，Phase 2' 单环境 | **P1**：math 主文 + §Turn transfer（1 表 1 图） |
-| Phase 2'：≥2 环境 M > B-A1 且 > B-A2 | **P2**：独立成篇，正面 cite AT²PO/ATOD |
+| Phase 0' 失败 | **P3**：discussion + future work only |
+| Phase 1' 通过、Phase 2' 一般 | **P1**：math 主文 + § transfer（Table A' 一表 + Figure 1' 一图） |
+| Phase 2' 全面通过 | **P2**：Agentic TB-OPD 独立成文，正面 cite/对比 AT²PO、ATOD |
+
+与 §5.1–5.2 一致；此处以 **Phase 0'→1'→2' 实证** 驱动，而非先定 P2 再补实验。
 
 ---
 
-### 9.1 工程清单（Phase 1' 映射到 `iclr/verl`）
+### 9.6 工程清单（映射 `iclr/verl` + 开源参考实现）
 
-| # | 任务 | 落点 | 依赖 | 优先级 |
-|---|---|---|---|---|
-| E1 | `fork_unit: token \| turn` 配置项 | `distillation.yaml` + `_get_tb_opd_cfg` | 无 | P0 |
-| E2 | turn 边界 + post-tool 窗口 logprob 记录 | `tool_agent_loop.py` / `AgentData` | 无 | P0 |
-| E3 | turn 级 `fork_signal`（Soft-OR ΔH, disagreement） | `tb_opd.py` 新函数 `select_fork_turn` | E2 | P0 |
-| E4 | **断点续跑**：从 turn 前缀重进 `ToolAgentLoop` | `agent_loop.py` 新 `_run_tb_opd_turn_group` | E2,E3 | P0（最难） |
-| E5 | 固定槽位 fan-out（n=1+k）+ Only-fail | 复用 `_run_tb_opd_group` 逻辑 | E4 | P0 |
-| E6 | tool 返回 token **loss mask** | trainer / response_mask 扩展 | E4 | P0 |
-| E7 | matched tool-call 预算计数与截断 | rollout 预算控制器 | E4 | P1 |
-| E8 | 连续高熵 turn 分支惩罚（AEPO 式） | `select_fork_turn` | E3 | P1 |
-| E9 | Phase 0' 离线诊断脚本 | `iclr/scripts/phase0_agentic_recover.py` | E2（只读） | P0（先于 E4） |
-| E10 | B-A1 turn 重加权（不展开）对照 | loss 侧 turn weight，无 E4 | E3 | P1 |
-| E11 | 指标：`tb_opd/fork_turn_idx`, `fork_signal`, `tool_calls` | `metric_utils.py` | E4 | P1 |
-| E12 | 训练/诊断脚本 + srun launcher | `iclr/scripts/srun_*` | E4–E7 | P1 |
+| # | 任务 | 落点 | 优先级 | 依赖 | **参考实现（勿从零写）** |
+|---|---|---|---|---|---|
+| E1 | `distillation.tb_opd.fork_unit: token\|turn` | `distillation.yaml` + `_get_tb_opd_cfg` | P0 | — | 本地现有 tb_opd 配置形态 |
+| E2 | turn 边界 + post-tool top-k logprob 落盘 | `tool_agent_loop.py` / `AgentData.extra_fields` | P0 | — | ATOD turn 切分；ARPO tool 后熵窗口 |
+| E3 | `select_fork_turn()`：`hybrid=SoftOR(ΔH, disagree)` | `tb_opd.py` | P0 | E2 | **ATOD T-DUR** Soft-OR；SOD step divergence |
+| E4 | **断点续跑**：从 turn 前缀重进 tool loop，forced top-k × k | `agent_loop.py` | P0 | E2,E3 | **ARPO/AT²PO** branch rollout（只抄采样，不抄 RL loss） |
+| E5 | tool 返回 token **loss mask** | trainer / distillation loss | P0 | E4 | ATOD：observation 不计 loss |
+| E6 | 连续高熵 turn **branch penalty** | `tb_opd.py` | P1 | E3 | **AEPO** 开关式惩罚 |
+| E7 | matched **tool-call** 预算计数与对齐 | rollout 脚本 + metric | P1 | E4 | ARPO/AEPO/Tree-GRPO budget 逻辑 |
+| E8 | Phase 0' 诊断脚本（recover 三臂） | `iclr/scripts/phase0_agentic_recover.py` | P0 | E2 | **SOD** eval + Open-AgentRL 数据 |
+| E9 | 训练脚本 B-A0 / B-A1 / M | `iclr/scripts/srun_*` | P1 | E4,E5 | B-A1←ATOD；M←自研+ARPO 树 |
+| E10 | 共享前缀 packing（算力优化） | 可选，Phase 2' 后 | P2 | E4 | Tree-GRPO initialize-then-expand |
 
-**实现顺序建议**：`E9 → E2 → E3 → E6 → E4 → E5 → E7 → 开 Phase 1' 训练`。
+**配置约定**（默认关，不影响 math）：
 
-**默认不改**：`ray_trainer` 主循环、math 分支 `fork_unit=token`（`tb_opd.enable=False` 时零影响）。
-
----
-
-### 9.2 Kill 判据总表
-
-| 阶段 | 通过标准 | 失败 → 动作 |
-|---|---|---|
-| **Phase 0'** | `recover.fork > recover.resample`；可选 `> continue`；CI 倾向排除 0 | 停止 agentic 训练；写进 discussion |
-| **Phase 1'** | M > B-A1 **且** M > B-A0（等 token & tool） | 停止；或仅保留 B-A1 式重加权叙事 |
-| **Phase 2'** | M > B-A2；≥1 跨环境 replicate | 不升 P2；缩为 P1 transfer |
-| **Phase 3'** | ≥2 环境 + Phase 0' 机制成立 | P1 或 P3 |
-
-**与母方法 math 的联合门控**：
-
-```
-math M* vs B1/B2/B4 尚无结论？
-  → 只做 Phase 0'（推理）
-Phase 0' 不过？
-  → agentic 停；math 继续
-Phase 0' 过 且 math M* 有信号？
-  → Phase 1'
-Phase 1' 过？
-  → Phase 2' / 决定 P1 vs P2
+```yaml
+distillation:
+  tb_opd:
+    enable: false          # math 默认 false
+    fork_unit: turn        # agentic 实验显式开
+    fork_metric: hybrid    # 非纯 entropy
+    scheme_b: true
+    only_fail: true
+    branch_mode: forced_topk
+    k: 2
+    max_branches_per_traj: 1
+    consecutive_high_entropy_penalty: true  # AEPO 式
 ```
 
 ---
 
-### 9.3 执行 checklist（agentic-tbopd 分支）
+### 9.7 与 math 主线的资源关系
 
-**Phase 0'（当前应做）**
-- [ ] 选定 tool-integrated math 数据与 code tool 环境；
-- [ ] E2：turn 边界 + post-tool logprob 落盘；
-- [ ] E9：`phase0_agentic_recover.py`（fork / resample / continue 三臂）；
-- [ ] 跑 N=300 prompts 诊断；读 `recover.*` 与 `PASS_HINTS`；
-- [ ] Figure 1'：熵尖峰 + fork turn 分布。
+```
+math：M* vs B1/B2/B4 未闭合 ──→ 训练卡优先 math
+         │
+         ├─ 并行：Phase 0'（SOD 栈 + 推理卡，不抢训练）
+         │         资源：SOD-GRPO_teacher-4B + Open-AgentRL + ARPO ΔH + ATOD Soft-OR
+         │
+         ├─ math M* 站稳 ∧ Phase 0' 通过 ──→ Phase 1'（E1–E9，仍限 SOD）
+         │
+         └─ 任一不成立 ──→ agentic 仅文档/讨论，不硬上训练
+```
 
-**Phase 1'（Phase 0' 通过后）**
-- [ ] E1–E7：ForkUnit=turn + 断点续跑 + tool mask + 预算；
-- [ ] B-A0 + B-A1 + M 短训（1 epoch 可先）；
-- [ ] Table A' 初版。
+**现在应做**：Phase 0'（拉 SOD 数据/teacher + E8 诊断）+ 继续 math 主线。  
+**现在不应做**：Phase 1' 全量断点续跑；Phase 2' ATOD 三环境自训 teacher（除非 0'+1' 已过）。
 
-**Phase 2'（M 站住后）**
-- [ ] B-A2 / B-A3；ALFWorld / WebShop / Search-QA；
-- [ ] 消融 C0–C6；success–tool budget 曲线；
-- [ ] P1 vs P2 决策。
+---
+
+### 9.8 总决策树
+
+```
+Phase 0'（SOD）：recover.fork > recover.resample（CI）？
+  否 → P3（discussion）；停止 agentic 训练
+  是 → Phase 1'（SOD）：M > B-A0 且 M > B-A1？
+        否 → 查实现；仍否 → agentic 不成立
+        是 → Phase 2'（ATOD 栈）：M > B-A2？≥2 环境？
+              否 → P1（math 一节 transfer）
+              是 → P2（独立成篇 vs AT²PO/ATOD）
+```
+
+---
+
+### 9.9 执行 checklist（按阶段，含资源动作）
+
+**Phase 0'（当前优先）**
+
+- [ ] 拉 Open-AgentRL 数据 + `SOD-GRPO_teacher-4B`
+- [ ] 对照 ARPO 仓库实现 ΔH；对照 ATOD/SOD 实现 Soft-OR disagreement
+- [ ] E8：Phase 0' 脚本（recover fork / resample / continue + hi-turn 选点）
+- [ ] E2（只读）：dump turn 边界 + ΔH + disagreement
+- [ ] 300 prompt 子集跑完；读 `recover.*` + fork turn 分布图
+
+**Phase 1'（0' 通过后）**
+
+- [ ] E1–E5：ForkUnit=turn + 断点续跑（参考 ARPO/AT²PO）+ tool mask
+- [ ] B-A1：fork ATOD T-DUR（去掉 RL 退火）或 SOD step weight
+- [ ] E9：B-A0 / B-A1 / M 短训（仍限 SOD）；teacher 继续用 SOD-4B
+- [ ] 对照 §9.3 kill / pass 标准
+
+**Phase 2'（1' 通过后）**
+
+- [ ] clone ATOD 环境栈；先方案 A 代理 teacher（GiGPO / Search-R1）打通
+- [ ] B-A2（AT²PO/ARPO 树+RL）/ B-A3；ALFWorld 或 WebShop 其一
+- [ ] 若需严格论文对比：方案 B 自训 ATOD Qwen3 GRPO teacher
+- [ ] C0–C6 消融子集；success–tool budget 曲线
+- [ ] 决定 P1 vs P2（§9.5）
 
 **默认不做（除非 P2）**
-- GAIA / deep-search / 浏览器 agent；完整 AEPO 式 policy 侧改造。
+
+- GAIA / deep-search / 浏览器 agent；E10 共享前缀 packing 可后做。
+- 不要在 Phase 0'/1' 上 ALFWorld/WebShop 重安装（WebShop 独立 py3.10、Search 需常驻 E5，成本高）。
+
+---
+
+### 9.10 Resource / Repro 表（开源调研结论，2026-08）
+
+#### 9.10.1 可复现性总览
+
+| 论文 | 代码 | 数据 | 模型权重 | 对 TB-OPD-Turn 价值 |
+|---|---|---|---|---|
+| **ARPO** | ✅ | ✅ HF | ✅ | **P0**：ΔH、tool 后熵、分支 rollout |
+| **AEPO** | ✅ 同 ARPO | ✅ | ✅ | **P1**：连续高熵 turn 惩罚（C2） |
+| **AT²PO** | ✅ | ✅ 脚本 | ❌ 需自训 | **P0**：turn 树 + credit（B-A2） |
+| **Tree-GRPO** | ✅ | ✅ | ❌ | **P1**：tool 预算、initialize-then-expand |
+| **ATOD** | ✅ | ⚠️ 自装 env | ❌ teacher 自训 | **P0**：T-DUR/B-A1、三环境栈 |
+| **SOD** | ✅ | ✅ Open-AgentRL | ✅ teacher+student | **P0**：Phase 0'/1' 首选环境 |
+| **TurnOPD / SAGE-OPD** | ❌ | — | — | 只读论文 |
+| **Guided-OPD** | ⚠️ repo 404 | — | — | 只读论文 |
+| **SmartAD / SAD** | ❌ | — | — | 叙事对照 |
+
+#### 9.10.2 按阶段购物单
+
+| 阶段 | 环境栈 | Teacher | Student | 关键抄什么 |
+|---|---|---|---|---|
+| **0'** | SOD + Open-AgentRL | SOD-GRPO_teacher-4B | Qwen3-0.6B/1.7B base | ARPO ΔH；ATOD/SOD Soft-OR；自建 recover 三臂 |
+| **1'** | 同上 | 同上（免训） | 同上 | B-A0=本地 OPD；B-A1=ATOD T-DUR；M=自研+ARPO/AT²PO 树展开 |
+| **2'** | ATOD 三环境 | 方案 A：GiGPO/SPEAR/Search-R1；方案 B：自训 Qwen3 GRPO | Qwen3-1.7B；ALFWorld 可选 OPID-1.7B baseline | B-A2=AT²PO；budget=ARPO/Tree-GRPO |
+
+#### 9.10.3 关键链接（落地用）
+
+| 资源 | URL |
+|---|---|
+| SOD 代码 | https://github.com/YoungZ365/SOD |
+| SOD teacher | https://huggingface.co/youngzhong/SOD-GRPO_teacher-4B |
+| Open-AgentRL 数据 | https://huggingface.co/datasets/Gen-Verse/Open-AgentRL-30K |
+| ARPO / AEPO | https://github.com/RUC-NLPIR/ARPO |
+| AT²PO | https://github.com/zzfoutofspace/ATPO |
+| ATOD | https://github.com/TanQitai/ATOD |
+| Tree-GRPO | https://github.com/AMAP-ML/Tree-GRPO |
+| GiGPO ALFWorld/WebShop | https://huggingface.co/collections/langfeng01/verl-agent-684970e8f51babe2a6d98554 |
+| Search-R1 | https://huggingface.co/collections/PeterJinGo/search-r1-v03 |
+| OPID ALFWorld student | https://huggingface.co/Jinyang23/OPID-ALFWorld-1.7B |
+
+#### 9.10.4 不能指望的开源
+
+- TurnOPD / SAGE-OPD / SmartAD / SAD：**无代码**，不能当实现依赖。
+- Guided-OPD：论文 GitHub **404**。
+- AT²PO / ATOD：**有代码、无官方 matched ckpt**；严格对比需预留自训算力。
+- **没有任何一家** release「turn 树展开 × 教师 dense KD」——M 必须自研，零件从上面抄。
 
 ---
 
@@ -478,17 +573,16 @@ Phase 1' 过？
 
 ```
 定位：同一算子（不确定决策点树展开 + 教师 dense KD）从 token→turn
-缝隙：高熵/高分歧 turn「展开新分支」× 教师「dense KD 整树」
-      —— turn-aware OPD 不展开；ARPO/AEPO/AT²PO 不用教师
-选点：hybrid = Soft-OR(ΔH_post-tool, teacher–student disagreement)
-展开：forced-topk 子轨迹跑到 done；Only-fail；连续高熵惩罚(AEPO)
-监督：整棵 turn 树 reverse KL；tool 返回 token 必须 mask
-预算：matched generation tokens & matched tool calls
-阶段：Phase0'(诊断)→1'(M vs B-A0/A1)→2'(+B-A2/A3,跨环境)→3'(P1/P2)
-Kill：P0' recover.fork>resample 不过→停；P1' M≤B-A1→停
-工程难点：断点续跑（从 turn 前缀重进 ToolAgentLoop）；E9 先于 E4
-主表：M vs B-A0/B-A1/B-A2/B-A3（后两者 Phase2'）
-claim：M>B-A1(展开) ∧ M>B-A2(教师KD>RL) ∧ M>B-A0/B-A3
-资源：math 主线优先；Phase0' 只占推理卡
-代码：iclr/verl @ agentic-tbopd（ForkUnit=turn，默认关）
+缝隙：高熵/高分歧 turn「展开新分支」× 教师「dense KD 整树」——无现成 repo
+阶段：0'/1'=SOD 栈 → 2'=ATOD 三环境 → 3'=定 P1/P2/P3
+选点：hybrid=SoftOR(ΔH, disagreement)；抄 ATOD T-DUR / SOD
+展开：forced-topk + 断点续跑；抄 ARPO/AT²PO rollout，KD 用本地 OPD
+0'：SOD-GRPO_teacher-4B + Open-AgentRL；recover.fork>resample 才进 1'
+1'：B-A0=本地OPD；B-A1=ATOD T-DUR；M=自研；仍限 SOD
+2'：ATOD 栈；teacher 方案A=GiGPO/Search-R1，方案B=自训 Qwen3 GRPO
+预算：matched tokens & tool calls；惩罚抄 AEPO
+0' kill：recover.fork≤resample → 停
+1' kill：M≤B-A1 → 只是重加权
+2' pass：M>B-A2 且 ≥2 环境 → 升 P2
+代码：iclr/verl agentic-tbopd；先 E8 Phase0'（SOD），再 E1–E5
 ```

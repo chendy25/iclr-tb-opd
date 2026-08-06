@@ -296,6 +296,41 @@ class TBOPDConfig(BaseConfig):
     resample_temperature (float):
         Sampling temperature for ``branch_mode="resample"``. Values < 0 reuse the
         rollout temperature from ``actor_rollout_ref.rollout``.
+
+    -- Turn-level branching (TB-OPD-Turn, ``fork_unit="turn"``) --
+
+    fork_unit (str):
+        Granularity of the fork. ``token`` (default,母方法 TB-OPD-Token) forks at
+        a single response position on the flat token sequence and continues with a
+        single generate. ``turn`` (TB-OPD-Turn) forks at the *start of a
+        high-uncertainty assistant turn* in a multi-turn tool-use trajectory and
+        re-enters the full tool loop for the remaining turns (E4 breakpoint
+        resume). Turn forking requires ``agent_name=tool_agent`` and per-token
+        ``response_logprobs`` (set ``actor_rollout_ref.rollout.calculate_log_probs=True``).
+    turn_first_k (int):
+        Number of leading assistant tokens of a turn used to compute its
+        uncertainty signal (ARPO measures the entropy spike over the first tokens
+        after a tool response). <=0 uses the whole turn.
+    turn_only_post_tool (bool):
+        If True, only turns that immediately follow a tool response are eligible
+        fork points (ARPO's "post-tool decision turn"), excluding the opening
+        assistant turn.
+    turn_skip_first (int):
+        Number of leading assistant turns to exclude from forking (guards against
+        forking on the opening turn / boilerplate).
+    max_branches_per_traj (int):
+        Budget B: maximum number of turns forked per trajectory. Phase 1' uses 1.
+    min_fork_signal (float):
+        Absolute floor on the (min-max normalized within-trajectory) turn signal;
+        below this no fork is emitted and the extra slots degrade to plain
+        rollouts. Suppresses forking on uniformly low-uncertainty trajectories.
+    consecutive_high_entropy_penalty (bool):
+        AEPO-style guard: down-weight a turn's fork signal when the immediately
+        preceding turn was also high-signal, to avoid over-branching on a run of
+        consecutive high-entropy turns.
+    consecutive_penalty_weight (float):
+        Multiplicative penalty applied to a turn signal when the preceding turn is
+        also above the median signal (only when the penalty is enabled).
     """
 
     enable: bool = False
@@ -317,17 +352,49 @@ class TBOPDConfig(BaseConfig):
     branch_mode: str = "forced_topk"
     resample_temperature: float = -1.0
 
+    # Turn-level branching (TB-OPD-Turn).
+    fork_unit: str = "token"
+    turn_first_k: int = 16
+    turn_only_post_tool: bool = True
+    turn_skip_first: int = 1
+    max_branches_per_traj: int = 1
+    min_fork_signal: float = 0.0
+    consecutive_high_entropy_penalty: bool = False
+    consecutive_penalty_weight: float = 0.5
+
+    # Fork metrics valid per granularity.
+    _TOKEN_METRICS = ("entropy", "topk_gap")
+    _TURN_METRICS = ("ent", "dHtool", "disagree", "hybrid")
+
     def __post_init__(self):
         if not self.enable:
             return
         if self.k < 1:
             raise ValueError(f"tb_opd.k must be >= 1, got {self.k}")
+        if self.fork_unit not in ("token", "turn"):
+            raise ValueError(f"tb_opd.fork_unit must be 'token' or 'turn', got {self.fork_unit}")
         if self.branch_mode not in ("forced_topk", "resample"):
             raise ValueError(
                 f"tb_opd.branch_mode must be 'forced_topk' or 'resample', got {self.branch_mode}"
             )
-        if self.fork_metric not in ("entropy", "topk_gap"):
-            raise ValueError(f"tb_opd.fork_metric must be 'entropy' or 'topk_gap', got {self.fork_metric}")
+        if self.fork_unit == "turn":
+            if self.fork_metric not in self._TURN_METRICS:
+                raise ValueError(
+                    f"tb_opd.fork_metric for fork_unit='turn' must be one of {self._TURN_METRICS}, "
+                    f"got {self.fork_metric}"
+                )
+            if self.max_branches_per_traj < 1:
+                raise ValueError(
+                    f"tb_opd.max_branches_per_traj must be >= 1, got {self.max_branches_per_traj}"
+                )
+            if self.turn_skip_first < 0:
+                raise ValueError(f"tb_opd.turn_skip_first must be >= 0, got {self.turn_skip_first}")
+        else:
+            if self.fork_metric not in self._TOKEN_METRICS:
+                raise ValueError(
+                    f"tb_opd.fork_metric for fork_unit='token' must be one of {self._TOKEN_METRICS}, "
+                    f"got {self.fork_metric}"
+                )
         if self.topk_logprobs < 2:
             raise ValueError(f"tb_opd.topk_logprobs must be >= 2, got {self.topk_logprobs}")
         if self.fork_select not in ("argmax", "topk_uniform"):

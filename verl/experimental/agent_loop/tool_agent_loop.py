@@ -46,6 +46,17 @@ SPEC_DECODE_EXTRA_KEYS = (
 )
 
 
+def _count_assistant_turns(response_mask: list[int]) -> int:
+    """Number of maximal runs of 1s (assistant turns) in ``response_mask``."""
+    n = 0
+    prev = 0
+    for m in response_mask:
+        if m == 1 and prev != 1:
+            n += 1
+        prev = m
+    return n
+
+
 class AgentState(Enum):
     PENDING = "pending"
     GENERATING = "generating"
@@ -200,6 +211,136 @@ class ToolAgentLoop(AgentLoopBase):
                 if agent_data.routed_experts is not None
                 else None
             ),
+            extra_fields=agent_data.extra_fields,
+        )
+        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        return output
+
+    @rollout_trace_op
+    async def run_from_prefix(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        base_prompt_ids: list[int],
+        prefix_response_ids: list[int],
+        prefix_response_mask: list[int],
+        prefix_response_logprobs: Optional[list[float]] = None,
+        forced_first_token: Optional[int] = None,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        """Resume the multi-turn tool loop from a mid-trajectory turn boundary.
+
+        This is the E4 "breakpoint resume" used by TB-OPD-Turn: given the shared
+        prefix up to the start of a high-uncertainty assistant turn (which follows a
+        tool response), re-enter the generate -> tool -> generate state machine and
+        run the *remaining* turns to completion under the same tool loop as the main
+        trajectory. The resulting branch is a genuine new rollout (真实 tool 调用),
+        unlike turn-reweighting OPD which only reuses the single main trajectory.
+
+        Args:
+            base_prompt_ids: the trajectory's original prompt token ids.
+            prefix_response_ids: response tokens shared with the main trajectory up
+                to (excluding) the forked turn's first token.
+            prefix_response_mask: mask aligned to ``prefix_response_ids`` (1 for
+                assistant tokens, 0 for tool/observation tokens).
+            prefix_response_logprobs: optional per-token rollout logprobs for the
+                prefix (padded with 0.0 for tool tokens).
+            forced_first_token: if set (forced_topk mode), force this token as the
+                first token of the resumed assistant turn; the model then continues.
+        """
+        if self.enable_continuous_token:
+            raise NotImplementedError(
+                "TB-OPD-Turn breakpoint resume is not supported with continuous-token mode."
+            )
+
+        messages = list(kwargs["raw_prompt"])
+        multi_modal_data = await self.process_multi_modal_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+        audios = multi_modal_data.get("audios")
+        mm_processor_kwargs = self._get_mm_processor_kwargs(audios)
+
+        agent_data = AgentData(
+            messages=messages,
+            image_data=images,
+            video_data=videos,
+            audio_data=audios,
+            mm_processor_kwargs=mm_processor_kwargs,
+            metrics={},
+            request_id=uuid4().hex,
+            tools_kwargs=kwargs.get("tools_kwargs", {}),
+        )
+
+        # Per-sample tool selection (mirror run()).
+        extra_info = kwargs.get("extra_info", {}) or {}
+        tool_selection = extra_info.get("tool_selection")
+        if tool_selection and self.tools:
+            selected = {name: self.tools[name] for name in tool_selection if name in self.tools}
+            agent_data._active_tools = selected
+            agent_data._active_tool_schemas = [
+                t.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for t in selected.values()
+            ]
+        else:
+            agent_data._active_tools = self.tools
+            agent_data._active_tool_schemas = self.tool_schemas
+
+        # Seed the running sequence with prompt + shared prefix. The prefix ends at a
+        # tool boundary, so the context is ready for the next assistant turn.
+        agent_data.prompt_ids = list(base_prompt_ids) + list(prefix_response_ids)
+        agent_data.response_mask = list(prefix_response_mask)
+        agent_data.response_logprobs = list(prefix_response_logprobs) if prefix_response_logprobs else []
+        agent_data.response_ids = []
+
+        # Restore turn counters from the prefix so max-turn termination stays honest.
+        prefix_turns = _count_assistant_turns(prefix_response_mask)
+        agent_data.assistant_turns = prefix_turns
+        agent_data.user_turns = prefix_turns  # each assistant turn (after the first) followed a tool turn
+
+        # forced_topk: inject the alternative first token, then let the model continue.
+        # Note: tool-call parsing on the first resumed step sees only the model's own
+        # continuation (not the forced token); a forced token that is itself a tool
+        # trigger is not detected, which is acceptable for content-level alternatives.
+        if forced_first_token is not None:
+            agent_data.prompt_ids = agent_data.prompt_ids + [int(forced_first_token)]
+            agent_data.response_mask = agent_data.response_mask + [1]
+            if agent_data.response_logprobs:
+                agent_data.response_logprobs = agent_data.response_logprobs + [0.0]
+
+        # If the prefix already exhausts the budget, terminate immediately.
+        if len(agent_data.response_mask) >= self.response_length:
+            state = AgentState.TERMINATED
+        else:
+            state = AgentState.GENERATING
+        while state != AgentState.TERMINATED:
+            if state == AgentState.GENERATING:
+                state = await self._handle_generating_state(agent_data, sampling_params)
+            elif state == AgentState.PROCESSING_TOOLS:
+                state = await self._handle_processing_tools_state(agent_data)
+            else:
+                logger.error(f"Invalid state during resume: {state}")
+                state = AgentState.TERMINATED
+
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask):]
+        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        out_mm: dict[str, Any] = {}
+        if agent_data.image_data is not None:
+            out_mm["images"] = agent_data.image_data
+        if agent_data.video_data is not None:
+            out_mm["videos"] = agent_data.video_data
+        if agent_data.audio_data is not None:
+            out_mm["audios"] = agent_data.audio_data
+
+        output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=agent_data.response_mask[: self.response_length],
+            multi_modal_data=out_mm,
+            mm_processor_kwargs=agent_data.mm_processor_kwargs,
+            response_logprobs=agent_data.response_logprobs[: self.response_length]
+            if agent_data.response_logprobs
+            else None,
+            num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+            metrics=agent_data.metrics,
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})

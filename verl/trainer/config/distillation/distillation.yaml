@@ -174,3 +174,30 @@ tb_opd:
 
   # Sampling temperature for resample branches; <0 reuses rollout.temperature.
   resample_temperature: -1.0
+
+  # --- Turn-level branching (TB-OPD-Turn) ---
+
+  # Fork granularity: "token" (母方法) or "turn" (agentic multi-turn tool-use).
+  fork_unit: token
+
+  # Leading assistant tokens of a turn used to compute its uncertainty signal
+  # (ARPO's post-tool entropy spike window). <=0 uses the whole turn.
+  turn_first_k: 16
+
+  # Only turns immediately following a tool response are eligible fork points.
+  turn_only_post_tool: true
+
+  # Number of leading assistant turns to exclude from forking.
+  turn_skip_first: 1
+
+  # Budget B: max number of turns forked per trajectory (Phase 1' uses 1).
+  max_branches_per_traj: 1
+
+  # Absolute floor on the normalized turn signal; below this no fork is emitted.
+  min_fork_signal: 0.0
+
+  # AEPO-style penalty on consecutive high-signal turns to curb over-branching.
+  consecutive_high_entropy_penalty: false
+
+  # Penalty multiplier applied when the preceding turn is also high-signal.
+  consecutive_penalty_weight: 0.5

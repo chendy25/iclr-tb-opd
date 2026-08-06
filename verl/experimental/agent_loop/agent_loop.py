@@ -820,6 +820,10 @@ class AgentLoopWorker:
         self, rows: list[tuple[int, dict, dict]], agent_name: str, sampling_params: dict
     ) -> list[_InternalAgentLoopOutput]:
         """Coordinate one prompt's ``n`` slots into ``n`` post-processed outputs."""
+        # Turn-level branching (TB-OPD-Turn) uses a dedicated multi-turn path.
+        if str(self.tb_opd_cfg.get("fork_unit", "token")) == "turn":
+            return await self._run_tb_opd_group_turn(rows, agent_name, sampling_params)
+
         from verl.experimental.agent_loop import tb_opd
 
         cfg = self.tb_opd_cfg
@@ -1000,6 +1004,175 @@ class AgentLoopWorker:
         for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
             results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
         return results
+
+    async def _run_tb_opd_group_turn(
+        self, rows: list[tuple[int, dict, dict]], agent_name: str, sampling_params: dict
+    ) -> list[_InternalAgentLoopOutput]:
+        """TB-OPD-Turn: fork at a high-uncertainty assistant turn and re-run the
+        remaining tool loop for each branch (E4 breakpoint resume).
+
+        Mirrors ``_run_tb_opd_group`` (fixed-slot fan-out: slot 0 = main, slots
+        1..k = turn branches or plain rollouts) but operates on multi-turn tool-use
+        trajectories. Fork selection uses per-turn student uncertainty / teacher
+        disagreement (``tb_opd.select_fork_turn``); branches re-enter
+        ``ToolAgentLoop.run_from_prefix``.
+        """
+        from verl.experimental.agent_loop import tb_opd
+
+        cfg = self.tb_opd_cfg
+        only_fail = bool(cfg.get("only_fail", True))
+        fork_metric = str(cfg.get("fork_metric", "hybrid"))
+        correct_threshold = float(cfg.get("correct_threshold", 1.0))
+        branch_mode = str(cfg.get("branch_mode", "forced_topk"))
+        topk_logprobs = int(cfg.get("topk_logprobs", 20))
+        turn_first_k = int(cfg.get("turn_first_k", 16))
+        only_post_tool = bool(cfg.get("turn_only_post_tool", True))
+        turn_skip_first = int(cfg.get("turn_skip_first", 1))
+        min_fork_signal = float(cfg.get("min_fork_signal", 0.0))
+        consec_penalty = bool(cfg.get("consecutive_high_entropy_penalty", False))
+        consec_weight = float(cfg.get("consecutive_penalty_weight", 0.5))
+        resample_temperature = float(cfg.get("resample_temperature", -1.0))
+
+        n_slots = len(rows)
+        _, _, main_kwargs = rows[0]
+        agent_loop = self._make_agent_loop(agent_name)
+
+        # Slot 0: main multi-turn trajectory. Request per-token logprobs so the turn
+        # uncertainty signal (ARPO/ATOD NLL proxy) can be read from this pass alone.
+        main_sp = dict(sampling_params)
+        main_sp["logprobs"] = True
+        main_out: AgentLoopOutput = await agent_loop.run(main_sp, **main_kwargs)
+
+        score, is_correct = tb_opd.score_solution(
+            self.tokenizer, list(main_out.response_ids), main_kwargs, correct_threshold
+        )
+        do_branch = (not only_fail) or (not is_correct)
+
+        response_logprobs = list(main_out.response_logprobs) if main_out.response_logprobs else []
+        fork = {"pos": None, "none_reason": "not_attempted"}
+        if do_branch and n_slots > 1:
+            if not response_logprobs:
+                fork = {"pos": None, "none_reason": "no_response_logprobs"}
+            else:
+                fork = tb_opd.select_fork_turn(
+                    list(main_out.response_mask),
+                    response_logprobs,
+                    metric=fork_metric,
+                    teacher_logprobs=None,  # Phase 1': student-side signal (hybrid->ΔH_post-tool)
+                    turn_first_k=turn_first_k,
+                    only_post_tool=only_post_tool,
+                    skip_first_turns=turn_skip_first,
+                    min_fork_signal=min_fork_signal,
+                    consecutive_penalty=consec_penalty,
+                    consecutive_penalty_weight=consec_weight,
+                )
+
+        has_fork = fork.get("pos") is not None
+        mode = "branch" if has_fork else "plain"
+
+        # forced_topk: fetch alternative first tokens for the forked turn once.
+        cand_tokens: list[int] = []
+        if has_fork and branch_mode == "forced_topk":
+            pos = int(fork["pos"])
+            main_tok = int(main_out.response_ids[pos]) if pos < len(main_out.response_ids) else None
+            cand_tokens = await tb_opd.topk_candidates_at(
+                self.llm_client,
+                list(main_out.prompt_ids),
+                list(main_out.response_ids[:pos]),
+                topk=topk_logprobs,
+                dedup_token=main_tok,
+            )
+            if not cand_tokens:
+                # No usable alternative -> degrade to resample for the branches.
+                branch_mode = "resample"
+
+        # Diagnostics on the main slot.
+        main_out.extra_fields["tb_opd_slot"] = 0
+        main_out.extra_fields["tb_opd_fork_unit"] = "turn"
+        main_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
+        main_out.extra_fields["tb_opd_score"] = float(score)
+        main_out.extra_fields["tb_opd_mode_branch"] = float(mode == "branch")
+        main_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+        main_out.extra_fields["tb_opd_fork_attempted"] = float(do_branch and n_slots > 1)
+        main_out.extra_fields["tb_opd_fork_found"] = float(has_fork)
+        main_out.extra_fields["tb_opd_none_reason"] = str(fork.get("none_reason", "ok" if has_fork else "unknown"))
+        main_out.extra_fields["tb_opd_num_branch"] = float((n_slots - 1) if mode == "branch" else 0.0)
+        if has_fork:
+            main_out.extra_fields["tb_opd_fork_pos"] = float(fork["pos"])
+            main_out.extra_fields["tb_opd_fork_turn"] = float(fork.get("turn_index", -1))
+            main_out.extra_fields["tb_opd_fork_signal"] = float(fork.get("signal", 0.0))
+            main_out.extra_fields["tb_opd_num_turns"] = float(fork.get("num_turns", 0))
+
+        raw_outputs: list[AgentLoopOutput] = [main_out]
+        for slot in range(1, n_slots):
+            if mode == "branch":
+                forced_token = None
+                if branch_mode == "forced_topk" and cand_tokens:
+                    forced_token = int(cand_tokens[(slot - 1) % len(cand_tokens)])
+                branch_out = await self._tb_generate_branch_turn(
+                    agent_loop,
+                    main_out,
+                    int(fork["pos"]),
+                    forced_token,
+                    dict(sampling_params),
+                    main_kwargs,
+                    resample_temperature,
+                )
+                branch_out.extra_fields["tb_opd_slot"] = slot
+                branch_out.extra_fields["tb_opd_fork_unit"] = "turn"
+                branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
+                branch_out.extra_fields["tb_opd_mode_branch"] = 1.0
+                branch_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+                raw_outputs.append(branch_out)
+            else:
+                _, _, slot_kwargs = rows[slot]
+                plain_out: AgentLoopOutput = await agent_loop.run(dict(sampling_params), **slot_kwargs)
+                plain_out.extra_fields["tb_opd_slot"] = slot
+                plain_out.extra_fields["tb_opd_fork_unit"] = "turn"
+                plain_out.extra_fields["tb_opd_mode_branch"] = 0.0
+                raw_outputs.append(plain_out)
+
+        results: list[_InternalAgentLoopOutput] = []
+        for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
+            results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
+        return results
+
+    async def _tb_generate_branch_turn(
+        self,
+        agent_loop,
+        main_out: AgentLoopOutput,
+        fork_pos: int,
+        forced_token: Optional[int],
+        sampling_params: dict,
+        row_kwargs: dict,
+        resample_temperature: float,
+    ) -> AgentLoopOutput:
+        """Re-run the tool loop from the forked turn's shared prefix.
+
+        forced_topk forces ``forced_token`` as the turn's first token; resample
+        (``forced_token=None``) continues stochastically. Either way the branch runs
+        the *remaining* multi-turn tool interaction to completion.
+        """
+        sp = dict(sampling_params)
+        if forced_token is None and resample_temperature >= 0.0:
+            sp["temperature"] = resample_temperature
+
+        prefix_ids = list(main_out.response_ids[:fork_pos])
+        prefix_mask = list(main_out.response_mask[:fork_pos])
+        prefix_lp = (
+            list(main_out.response_logprobs[:fork_pos]) if main_out.response_logprobs else None
+        )
+
+        branch_out: AgentLoopOutput = await agent_loop.run_from_prefix(
+            sp,
+            base_prompt_ids=list(main_out.prompt_ids),
+            prefix_response_ids=prefix_ids,
+            prefix_response_mask=prefix_mask,
+            prefix_response_logprobs=prefix_lp,
+            forced_first_token=forced_token,
+            **row_kwargs,
+        )
+        return branch_out
 
     async def _tb_generate_branch(
         self,

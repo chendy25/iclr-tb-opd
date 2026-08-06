@@ -1,0 +1,33 @@
+# Code-execution tool for agentic TB-OPD (Phase 1', SOD / Open-AgentRL TIR env).
+#
+# Wire via:
+#   actor_rollout_ref.rollout.multi_turn.enable=True
+#   actor_rollout_ref.rollout.multi_turn.tool_config_path=recipe/agentic_tbopd/config/sandbox_fusion_tool_config.yaml
+#   actor_rollout_ref.rollout.multi_turn.format=hermes
+#
+# The SandboxFusion service must be reachable at ``sandbox_fusion_url``. Start one with:
+#   docker run -p 8080:8080 volcengine/sandbox-fusion:server-20250609
+# and set the URL below to ``http://<host>:8080/run_code``.
+tools:
+  - class_name: "verl.tools.sandbox_fusion_tools.CustomSandboxFusionTool"
+    config:
+      type: native
+      sandbox_fusion_url: "${oc.env:SANDBOX_FUSION_URL,http://localhost:8080/run_code}"
+      num_workers: 32
+      enable_global_rate_limit: true
+      rate_limit: 128
+      default_timeout: 60
+      default_language: "python"
+      memory_limit_mb: 2048
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_interpreter"
+        description: "Execute Python code in a sandbox and return stdout/stderr. Use it to run calculations, verify intermediate results, and check your reasoning before giving the final answer."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "The Python code to execute. Print the values you want to observe."
+          required: ["code"]

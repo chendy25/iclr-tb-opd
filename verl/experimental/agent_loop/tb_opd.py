@@ -327,6 +327,222 @@ async def select_fork(
     )
 
 
+# ---------------------------------------------------------------------------
+# Turn-level branching (TB-OPD-Turn). Fork at the start of a high-uncertainty
+# assistant turn in a multi-turn tool-use trajectory. Signals borrow from ARPO
+# (ΔH_post-tool: entropy spike after a tool response) and ATOD (T-DUR: Soft-OR of
+# teacher-student disagreement and student uncertainty, using the NLL proxy
+# mean(-logp) as the per-turn entropy估计). See docs/proposals/agentic_tb_opd_research.md.
+# ---------------------------------------------------------------------------
+
+
+def segment_assistant_turns(response_mask: list[int]) -> list[tuple[int, int, bool]]:
+    """Split a flat response into assistant turns from ``response_mask``.
+
+    ``response_mask[p] == 1`` marks an LLM-generated (assistant) token and ``0`` a
+    tool/observation (environment-injected) token. Each maximal run of 1s is one
+    assistant turn. Returns a list of ``(start, end, post_tool)`` in response
+    coordinates, where ``post_tool`` is True iff the run is immediately preceded by
+    at least one 0 (i.e. the turn follows a tool response), which is ARPO's natural
+    decision point.
+    """
+    turns: list[tuple[int, int, bool]] = []
+    n = len(response_mask)
+    p = 0
+    while p < n:
+        if response_mask[p] != 1:
+            p += 1
+            continue
+        start = p
+        while p < n and response_mask[p] == 1:
+            p += 1
+        end = p  # exclusive
+        post_tool = start > 0 and response_mask[start - 1] == 0
+        turns.append((start, end, post_tool))
+    return turns
+
+
+def _turn_nll_proxy(logprobs: list[float], start: int, end: int, first_k: int) -> float:
+    """Mean(-logp) over the first ``first_k`` tokens of ``[start, end)`` (ATOD h_k)."""
+    hi = end if first_k <= 0 else min(end, start + first_k)
+    vals = [logprobs[i] for i in range(start, hi) if i < len(logprobs)]
+    if not vals:
+        return 0.0
+    return sum(-lp for lp in vals) / len(vals)
+
+
+def _turn_disagreement(
+    student_lp: list[float], teacher_lp: list[float], start: int, end: int, first_k: int
+) -> float:
+    """Mean |teacher_logp - student_logp| over the first ``first_k`` turn tokens (ATOD d_k)."""
+    hi = end if first_k <= 0 else min(end, start + first_k)
+    vals = []
+    for i in range(start, hi):
+        if i < len(student_lp) and i < len(teacher_lp):
+            vals.append(abs(teacher_lp[i] - student_lp[i]))
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
+def _minmax(xs: list[float]) -> list[float]:
+    if not xs:
+        return xs
+    lo, hi = min(xs), max(xs)
+    if hi - lo <= 1e-8:
+        return [0.5 for _ in xs]
+    return [(x - lo) / (hi - lo) for x in xs]
+
+
+def select_fork_turn(
+    response_mask: list[int],
+    response_logprobs: list[float],
+    *,
+    metric: str = "hybrid",
+    teacher_logprobs: Optional[list[float]] = None,
+    turn_first_k: int = 16,
+    only_post_tool: bool = True,
+    skip_first_turns: int = 1,
+    min_fork_signal: float = 0.0,
+    consecutive_penalty: bool = False,
+    consecutive_penalty_weight: float = 0.5,
+) -> dict:
+    """Pick the highest-uncertainty assistant turn to fork.
+
+    Operates purely on the main trajectory's per-token student ``response_logprobs``
+    (and optionally aligned ``teacher_logprobs``); no extra generation. Returns a
+    dict with ``pos`` = the response-coordinate index of the chosen turn's first
+    token (the breakpoint from which E4 re-enters the tool loop), plus diagnostics.
+    On failure ``pos`` is ``None`` with a ``none_reason``.
+
+    metric:
+      - ``ent``     : student NLL proxy mean(-logp) over the turn (ARPO uncertainty).
+      - ``dHtool``  : ΔH_post-tool = turn entropy − first-turn (pre-tool) entropy.
+      - ``disagree``: teacher-student |Δlogp| over the turn (needs teacher_logprobs).
+      - ``hybrid``  : Soft-OR(norm(dHtool), norm(disagree)) (ATOD T-DUR; recommended).
+                      Falls back to norm(dHtool) when teacher_logprobs is None.
+    """
+    if not response_mask or not response_logprobs:
+        return {"pos": None, "none_reason": "empty_response"}
+
+    turns = segment_assistant_turns(response_mask)
+    if not turns:
+        return {"pos": None, "none_reason": "no_assistant_turns"}
+
+    # Baseline (initial) entropy = first assistant turn's NLL proxy (ARPO H_init).
+    base_ent = _turn_nll_proxy(response_logprobs, turns[0][0], turns[0][1], turn_first_k)
+
+    # Eligible turns: skip the first ``skip_first_turns`` and (optionally) require
+    # the turn to follow a tool response.
+    eligible: list[int] = []
+    for ti, (start, end, post_tool) in enumerate(turns):
+        if ti < skip_first_turns:
+            continue
+        if only_post_tool and not post_tool:
+            continue
+        eligible.append(ti)
+    if not eligible:
+        return {"pos": None, "none_reason": "no_eligible_turns", "num_turns": len(turns)}
+
+    ent_raw, dh_raw, dis_raw = [], [], []
+    for ti in eligible:
+        start, end, _ = turns[ti]
+        e = _turn_nll_proxy(response_logprobs, start, end, turn_first_k)
+        ent_raw.append(e)
+        dh_raw.append(max(0.0, e - base_ent))
+        if teacher_logprobs is not None:
+            dis_raw.append(_turn_disagreement(response_logprobs, teacher_logprobs, start, end, turn_first_k))
+        else:
+            dis_raw.append(0.0)
+
+    if metric == "ent":
+        signals = _minmax(ent_raw)
+    elif metric == "dHtool":
+        signals = _minmax(dh_raw)
+    elif metric == "disagree":
+        if teacher_logprobs is None:
+            return {"pos": None, "none_reason": "disagree_requires_teacher", "num_turns": len(turns)}
+        signals = _minmax(dis_raw)
+    else:  # hybrid = Soft-OR(norm(dHtool), norm(disagree))
+        a = _minmax(dh_raw)
+        if teacher_logprobs is not None:
+            b = _minmax(dis_raw)
+            signals = [1.0 - (1.0 - ai) * (1.0 - bi) for ai, bi in zip(a, b)]
+        else:
+            signals = a  # graceful degrade to ΔH_post-tool
+
+    # AEPO-style consecutive high-signal penalty: if a turn's predecessor (in the
+    # eligible list) is also above-median, down-weight to curb over-branching.
+    if consecutive_penalty and len(signals) > 1:
+        med = sorted(signals)[len(signals) // 2]
+        penalized = list(signals)
+        for i in range(1, len(signals)):
+            if signals[i - 1] >= med:
+                penalized[i] = signals[i] * float(consecutive_penalty_weight)
+        signals = penalized
+
+    best_local = max(range(len(signals)), key=lambda i: signals[i])
+    best_signal = signals[best_local]
+    if best_signal < min_fork_signal:
+        return {
+            "pos": None,
+            "none_reason": "below_min_fork_signal",
+            "signal": float(best_signal),
+            "num_turns": len(turns),
+        }
+
+    best_ti = eligible[best_local]
+    start, end, post_tool = turns[best_ti]
+    return {
+        "pos": int(start),
+        "turn_index": int(best_ti),
+        "turn_end": int(end),
+        "post_tool": bool(post_tool),
+        "signal": float(best_signal),
+        "num_turns": len(turns),
+        "num_eligible": len(eligible),
+    }
+
+
+async def topk_candidates_at(
+    server_manager,
+    prompt_ids: list[int],
+    response_prefix_ids: list[int],
+    *,
+    topk: int,
+    dedup_token: Optional[int] = None,
+) -> list[int]:
+    """Top-k candidate token ids for the next token after ``prompt+prefix``.
+
+    Used by forced-topk turn branching to obtain alternative first tokens for the
+    forked turn. Runs a single ``max_tokens=1`` generation with
+    ``prompt_logprobs=topk`` and reads the distribution for the position that would
+    produce the next token (the last extracted prompt-logprob row).
+    """
+    seq = list(prompt_ids) + list(response_prefix_ids)
+    sampling_params = {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "logprobs": False,
+        "prompt_logprobs": int(topk),
+        "max_tokens": 1,
+    }
+    out = await server_manager.generate(
+        request_id=uuid4().hex,
+        prompt_ids=seq,
+        sampling_params=sampling_params,
+    )
+    pid = out.extra_fields.get("prompt_ids")
+    if not pid:
+        # Fall back to the single greedily-generated next token.
+        return list(out.token_ids)[:1]
+    cand = [int(x) for x in pid[-1] if x is not None]
+    if dedup_token is not None:
+        cand = [t for t in cand if t != int(dedup_token)]
+    return cand
+
+
 def select_fork_from_topk(
     response_ids: list[int],
     out_logprobs: list,
