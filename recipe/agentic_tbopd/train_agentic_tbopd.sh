@@ -77,8 +77,15 @@ if [[ -z "${TOOL_CONFIG:-}" ]]; then
   fi
 fi
 export SANDBOX_FUSION_URL=${SANDBOX_FUSION_URL:-http://localhost:8080/run_code}
+# E2B: self-hosted Tencent AGS endpoint (see opd_dev .../e2b_agent scripts).
+# API key is a secret -> inject via env at run time (never committed):
+#   export E2B_API_KEY=...   (value lives in the opd_dev launch scripts)
 export E2B_API_KEY=${E2B_API_KEY:-}
-export E2B_DOMAIN=${E2B_DOMAIN:-}
+export E2B_DOMAIN=${E2B_DOMAIN:-ap-beijing.tencentags.com}
+export E2B_VALIDATE_API_KEY=${E2B_VALIDATE_API_KEY:-false}
+# Sandbox egress proxy (contains creds -> set via env, not committed):
+#   export SANDBOX_HTTP_PROXY=http://user:pass@host:port
+export SANDBOX_HTTP_PROXY=${SANDBOX_HTTP_PROXY:-}
 max_assistant_turns=${MAX_ASSISTANT_TURNS:-8}
 max_user_turns=${MAX_USER_TURNS:-8}
 max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH:-2048}
