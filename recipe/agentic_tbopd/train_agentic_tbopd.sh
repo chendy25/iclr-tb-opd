@@ -107,6 +107,11 @@ tb_min_fork_signal=${TB_MIN_FORK_SIGNAL:-0.0}
 tb_consec_penalty=${TB_CONSEC_PENALTY:-False}
 tb_consec_weight=${TB_CONSEC_WEIGHT:-0.5}
 
+# ---- B-A1 turn-level loss reweighting (reweight-only; independent of TB_ENABLE) ----
+tb_turn_reweight=${TB_TURN_REWEIGHT:-False}
+tb_reweight_alpha=${TB_REWEIGHT_ALPHA:-1.0}
+tb_reweight_metric=${TB_REWEIGHT_METRIC:-ent}     # ent | dHtool
+
 # rollout.n: TB-OPD-Turn uses 1 (main) + k (branches); baseline uses GRPO group size.
 if [[ "${tb_enable}" == "True" ]]; then
   rollout_n=${ROLLOUT_N:-$((1 + tb_k))}
@@ -153,7 +158,7 @@ mkdir -p "${ckpt_dir}" "${rollout_dir}"
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 need_gpus=$(( TRAINER_NNODES * NGPUS_PER_NODE + DISTILL_NNODES * DISTILL_NGPUS_PER_NODE ))
 
-echo "AGENTIC TB-OPD: tb_enable=${tb_enable} fork_unit=${tb_fork_unit} metric=${tb_fork_metric} branch_mode=${tb_branch_mode} rollout_n=${rollout_n}"
+echo "AGENTIC TB-OPD: tb_enable=${tb_enable} fork_unit=${tb_fork_unit} metric=${tb_fork_metric} branch_mode=${tb_branch_mode} rollout_n=${rollout_n} turn_reweight=${tb_turn_reweight}(${tb_reweight_metric},a=${tb_reweight_alpha})"
 echo "sandbox_backend=${SANDBOX_BACKEND} tool_config=${TOOL_CONFIG} max_turns=${max_assistant_turns}"
 echo "student=${STUDENT_MODEL} teacher=${TEACHER_MODEL}"
 echo "train=${train_files} val=${val_files}"
@@ -207,10 +212,19 @@ if [[ -n "${total_training_steps}" ]]; then
   TRAIN_STEP_ARG=(trainer.total_training_steps="${total_training_steps}")
 fi
 
-# TB-OPD block only when enabled (B-A0 leaves standard agent OPD untouched).
-TB_ARGS=()
+# Shared turn params + B-A1 reweight (always passed; reweight is independent of
+# the rollout fork switch so B-A1 runs with TB_ENABLE=False).
+TB_ARGS=(
+  distillation.tb_opd.turn_first_k=${tb_turn_first_k}
+  distillation.tb_opd.turn_only_post_tool=${tb_turn_only_post_tool}
+  distillation.tb_opd.turn_skip_first=${tb_turn_skip_first}
+  distillation.tb_opd.turn_reweight=${tb_turn_reweight}
+  distillation.tb_opd.reweight_alpha=${tb_reweight_alpha}
+  distillation.tb_opd.reweight_metric=${tb_reweight_metric}
+)
+# Rollout fork block only when enabled (B-A0/B-A1 leave the fork path untouched).
 if [[ "${tb_enable}" == "True" ]]; then
-  TB_ARGS=(
+  TB_ARGS+=(
     distillation.tb_opd.enable=True
     distillation.tb_opd.fork_unit=${tb_fork_unit}
     distillation.tb_opd.k=${tb_k}
@@ -220,16 +234,13 @@ if [[ "${tb_enable}" == "True" ]]; then
     distillation.tb_opd.branch_mode=${tb_branch_mode}
     distillation.tb_opd.resample_temperature=${tb_resample_temperature}
     distillation.tb_opd.topk_logprobs=${tb_topk_logprobs}
-    distillation.tb_opd.turn_first_k=${tb_turn_first_k}
-    distillation.tb_opd.turn_only_post_tool=${tb_turn_only_post_tool}
-    distillation.tb_opd.turn_skip_first=${tb_turn_skip_first}
     distillation.tb_opd.max_branches_per_traj=${tb_max_branches}
     distillation.tb_opd.min_fork_signal=${tb_min_fork_signal}
     distillation.tb_opd.consecutive_high_entropy_penalty=${tb_consec_penalty}
     distillation.tb_opd.consecutive_penalty_weight=${tb_consec_weight}
   )
 else
-  TB_ARGS=(distillation.tb_opd.enable=False)
+  TB_ARGS+=(distillation.tb_opd.enable=False)
 fi
 
 ${OPYTHON} -m verl.trainer.main_ppo \

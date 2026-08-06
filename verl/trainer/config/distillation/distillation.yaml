@@ -201,3 +201,15 @@ tb_opd:
 
   # Penalty multiplier applied when the preceding turn is also high-signal.
   consecutive_penalty_weight: 0.5
+
+  # --- Turn-level loss reweighting (B-A1, reweight-only; no branch expansion) ---
+
+  # Emphasize KD loss on high-uncertainty assistant turns without forking.
+  # Independent of `enable`; entropy-only (no teacher-at-rollout disagreement).
+  turn_reweight: false
+
+  # Emphasis strength: per-token weight = 1 + reweight_alpha * normalized_signal.
+  reweight_alpha: 1.0
+
+  # Per-turn signal for reweighting: "ent" (mean -logp) or "dHtool" (post-tool increase).
+  reweight_metric: ent

@@ -362,11 +362,32 @@ class TBOPDConfig(BaseConfig):
     consecutive_high_entropy_penalty: bool = False
     consecutive_penalty_weight: float = 0.5
 
+    # -- Turn-level loss reweighting (B-A1, ATOD T-DUR style; no branch expansion) --
+    # Independent of ``enable``: emphasize the KD token loss on high-uncertainty
+    # assistant turns *without* forking new sub-trajectories. This is the loss-side
+    # "reweight-only" ablation opposite the "expand" method M. It reuses the same
+    # per-turn signal (entropy proxy) computed at loss time from ``old_log_probs``
+    # and ``response_mask``, so it needs neither the rollout branch path nor
+    # teacher-at-rollout disagreement.
+    turn_reweight: bool = False
+    reweight_alpha: float = 1.0
+    reweight_metric: str = "ent"  # ent | dHtool  (entropy-only; no disagreement)
+
     # Fork metrics valid per granularity.
     _TOKEN_METRICS = ("entropy", "topk_gap")
     _TURN_METRICS = ("ent", "dHtool", "disagree", "hybrid")
+    _REWEIGHT_METRICS = ("ent", "dHtool")
 
     def __post_init__(self):
+        # Loss-side reweighting is validated independently of the rollout switch
+        # (B-A1 runs with enable=False).
+        if self.turn_reweight:
+            if self.reweight_metric not in self._REWEIGHT_METRICS:
+                raise ValueError(
+                    f"tb_opd.reweight_metric must be one of {self._REWEIGHT_METRICS}, got {self.reweight_metric}"
+                )
+            if self.turn_skip_first < 0:
+                raise ValueError(f"tb_opd.turn_skip_first must be >= 0, got {self.turn_skip_first}")
         if not self.enable:
             return
         if self.k < 1:

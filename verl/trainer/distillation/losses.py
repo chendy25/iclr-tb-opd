@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -24,6 +26,9 @@ from verl.utils.metric import AggregationType, Metric
 from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import no_padding_2_padding
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DistillationLossFn = Callable[
     [
@@ -258,6 +263,37 @@ def distillation_loss(
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+
+    # B-A1: turn-level loss reweighting (emphasize high-uncertainty assistant turns
+    # without expanding branches). Independent of tb_opd.enable / method M's rollout
+    # path; entropy-only, so no teacher-at-rollout disagreement is needed.
+    tb_cfg = getattr(distillation_config, "tb_opd", None)
+    if tb_cfg is not None and getattr(tb_cfg, "turn_reweight", False):
+        old_log_prob_rw = data.get("old_log_probs", None)
+        if old_log_prob_rw is None:
+            logger.warning("tb_opd.turn_reweight=True but data has no 'old_log_probs'; skipping reweight.")
+        else:
+            from verl.trainer.distillation.turn_reweight import compute_turn_reweight
+
+            rm_rw = data["response_mask"]
+            if rm_rw.is_nested:
+                rm_rw = rm_rw.to_padded_tensor(False)
+            if old_log_prob_rw.is_nested:
+                old_log_prob_rw = old_log_prob_rw.to_padded_tensor(0.0)
+            turn_w = compute_turn_reweight(
+                response_mask=rm_rw.bool(),
+                logprobs=old_log_prob_rw,
+                alpha=float(tb_cfg.reweight_alpha),
+                metric=str(tb_cfg.reweight_metric),
+                turn_first_k=int(tb_cfg.turn_first_k),
+                only_post_tool=bool(tb_cfg.turn_only_post_tool),
+                skip_first=int(tb_cfg.turn_skip_first),
+            ).to(distillation_losses.dtype)
+            distillation_losses = distillation_losses * turn_w
+            with torch.no_grad():
+                rmb = rm_rw.bool()
+                if rmb.any():
+                    distillation_metrics["distillation/turn_reweight_mean"] = turn_w[rmb].mean().item()
 
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.

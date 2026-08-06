@@ -18,8 +18,9 @@ proposal (§9 execution plan).
 | Breakpoint resume through the tool loop (E4) | `verl/experimental/agent_loop/tool_agent_loop.py` (`ToolAgentLoop.run_from_prefix`) |
 | Worker fan-out for turn branches | `verl/experimental/agent_loop/agent_loop.py` (`_run_tb_opd_group_turn`, `_tb_generate_branch_turn`) |
 | Tool-token loss mask (E5) | inherited: tool tokens have `response_mask=0`; `verl/trainer/distillation/losses.py` masks by `response_mask` |
+| Turn-reweight OPD (B-A1, reweight-only) | `verl/trainer/distillation/turn_reweight.py` (`compute_turn_reweight`), injected in `losses.py::distillation_loss` |
 | Data prep | `prepare_open_agentrl.py` |
-| Training arms | `run_phase1_B-A0.sh`, `run_phase1_M.sh`, `train_agentic_tbopd.sh` |
+| Training arms | `run_phase1_B-A0.sh`, `run_phase1_B-A1.sh`, `run_phase1_M.sh`, `train_agentic_tbopd.sh` |
 
 ## Provenance (borrowed, verified)
 
@@ -65,23 +66,29 @@ export E2B_API_KEY=...          # export E2B_DOMAIN=e2b.your.host  (optional)
 #     export SANDBOX_BACKEND=sandbox_fusion SANDBOX_FUSION_URL=http://localhost:8080/run_code
 
 # 3. Launch an arm (RANK/MASTER_* set by the cluster; 1 node student + 1 node teacher).
-bash recipe/agentic_tbopd/run_phase1_B-A0.sh     # agent OPD baseline
-bash recipe/agentic_tbopd/run_phase1_M.sh        # TB-OPD-Turn (this paper)
+bash recipe/agentic_tbopd/run_phase1_B-A0.sh     # agent OPD baseline (no fork, no reweight)
+bash recipe/agentic_tbopd/run_phase1_B-A1.sh     # turn-reweight OPD (reweight-only, no fork)
+bash recipe/agentic_tbopd/run_phase1_M.sh        # TB-OPD-Turn: turn expansion (this paper)
 ```
+
+The three arms are the **"展开 vs 只重加权"** ablation: B-A0 (neither), B-A1
+(reweight the KD loss on uncertain turns, no expansion), M (expand branches at the
+uncertain turn). B-A1 is a pure loss-side flag (`tb_opd.turn_reweight=True`,
+`enable=False`) and shares no code with M's rollout path.
 
 Defaults: Teacher `data/models/SOD-GRPO_teacher-4B`, Student `data/models/Qwen3-1.7B`.
 
 ## Known limitations / remaining work
 
-- **B-A1 (turn-reweight OPD, ≈ ATOD T-DUR)** is not yet a runnable arm: it needs the
-  loss-side per-turn reweighting (multiply the KD token loss by the Soft-OR turn weight)
-  in `verl/trainer/distillation/losses.py`. The selection math already exists in
-  `tb_opd.select_fork_turn` and can be lifted into the loss. This is the "展开 vs 只重加权"
-  ablation and is the next step before the main-table comparison is complete.
-- **Teacher-at-rollout disagreement**: `fork_metric=hybrid`/`disagree` currently receive
-  `teacher_logprobs=None` at rollout time, so `hybrid` gracefully degrades to
-  `ΔH_post-tool` (student-side). Wiring `AgentLoopWorker.teacher_server_manager` to score
-  the main trajectory's turns would enable the full ATOD-style two-signal selection.
+- **Teacher-at-rollout disagreement is intentionally off for now.** Both selection
+  (M) and reweighting (B-A1) use the **entropy-only** signal (`ΔH_post-tool` /
+  `mean(-logp)`); `fork_metric`/`reweight_metric` are set to `dHtool`/`ent`. Scoring
+  the main trajectory's turns with the teacher at rollout time is not yet available,
+  so the two-signal Soft-OR (`disagree`/`hybrid`) is deferred. The code paths for
+  `disagree`/`hybrid` exist and degrade gracefully, but are not used in the arms.
+- **End-to-end training not yet run.** Needs `pip install e2b` + `E2B_API_KEY`
+  (default backend) or a SandboxFusion service, plus the teacher/student checkpoints
+  under `data/models/`.
 - **forced_topk at a turn** forces only the turn's first token as an alternative; a forced
   token that is itself a tool-trigger is not re-parsed on the first resumed step (content-
   level alternatives are unaffected). `branch_mode=resample` avoids this entirely.
