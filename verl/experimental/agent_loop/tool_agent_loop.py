@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -132,6 +133,12 @@ class ToolAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
 
+        # Per-trajectory wall-clock cap (see MultiTurnConfig.trajectory_timeout).
+        # Guards the synchronous rollout batch from a single slow/hung tool
+        # trajectory: on deadline we stop the state machine and finalize the
+        # partial trajectory instead of blocking the whole step.
+        self.trajectory_timeout = getattr(self.rollout_config.multi_turn, "trajectory_timeout", None)
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -171,18 +178,8 @@ class ToolAgentLoop(AgentLoopBase):
             agent_data._active_tools = self.tools
             agent_data._active_tool_schemas = self.tool_schemas
 
-        # State machine loop
-        state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
+        # State machine loop (bounded by an optional per-trajectory deadline).
+        await self._drive_state_machine(agent_data, sampling_params, AgentState.PENDING)
 
         # Finalize output
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
@@ -311,14 +308,8 @@ class ToolAgentLoop(AgentLoopBase):
             state = AgentState.TERMINATED
         else:
             state = AgentState.GENERATING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            else:
-                logger.error(f"Invalid state during resume: {state}")
-                state = AgentState.TERMINATED
+        # Resume the state machine (bounded by the same per-trajectory deadline).
+        await self._drive_state_machine(agent_data, sampling_params, state)
 
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask):]
         prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
@@ -345,6 +336,59 @@ class ToolAgentLoop(AgentLoopBase):
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         return output
+
+    async def _drive_state_machine(
+        self, agent_data: AgentData, sampling_params: dict[str, Any], state: AgentState
+    ) -> None:
+        """Run the generate -> tool state machine until TERMINATED or deadline.
+
+        A per-trajectory wall-clock deadline (``self.trajectory_timeout``) bounds
+        the *whole* trajectory: each state handler is additionally wrapped in
+        ``asyncio.wait_for`` with the remaining budget so even a single hung
+        ``tool.execute`` / generation await is cut off. On deadline we stop
+        gracefully (the caller finalizes ``agent_data`` as-is) rather than raising,
+        so one straggler cannot stall the synchronous rollout batch.
+        """
+        deadline: Optional[float] = None
+        if self.trajectory_timeout and self.trajectory_timeout > 0:
+            deadline = time.monotonic() + float(self.trajectory_timeout)
+
+        while state != AgentState.TERMINATED:
+            remaining: Optional[float] = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "ToolAgentLoop trajectory timeout (%.0fs) hit at state=%s; finalizing partial trajectory",
+                        self.trajectory_timeout,
+                        state,
+                    )
+                    agent_data.metrics["trajectory_timeout"] = 1.0
+                    break
+
+            if state == AgentState.PENDING:
+                coro = self._handle_pending_state(agent_data, sampling_params)
+            elif state == AgentState.GENERATING:
+                coro = self._handle_generating_state(agent_data, sampling_params)
+            elif state == AgentState.PROCESSING_TOOLS:
+                coro = self._handle_processing_tools_state(agent_data)
+            else:
+                logger.error(f"Invalid state: {state}")
+                break
+
+            try:
+                if remaining is not None:
+                    state = await asyncio.wait_for(coro, timeout=max(0.1, remaining))
+                else:
+                    state = await coro
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "ToolAgentLoop trajectory timeout (%.0fs) during state=%s; finalizing partial trajectory",
+                    self.trajectory_timeout,
+                    state,
+                )
+                agent_data.metrics["trajectory_timeout"] = 1.0
+                break
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         """Handle the pending state: prepare the prompt and start generation."""

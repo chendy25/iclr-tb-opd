@@ -15,16 +15,23 @@ tools:
       # default domain is ap-beijing.tencentags.com (set in train script).
       # template: AGS has no "base"; use the node-python template from opd_dev.
       template: "node-python-openclaw"
-      sandbox_timeout: 300
-      default_timeout: 60
-      max_concurrent_sandboxes: 64
-      create_max_retries: 3
+      # Layered timeouts (mirrors ClawGym: trajectory > sandbox lifetime > single
+      # exec). trajectory_timeout (rollout.multi_turn, default 300s) is the outer
+      # cap; keep the VM lifetime just above it so a sandbox outlives its
+      # trajectory, and fail a single python exec fast so a straggler burns its
+      # budget on retries elsewhere rather than one 60s call.
+      sandbox_timeout: 360
+      default_timeout: 30
+      # Cap concurrent remote VMs to ease AGS quota/queueing (was 64). One step
+      # has <=64 trajectories; 32 in flight keeps E2B pressure down.
+      max_concurrent_sandboxes: 32
+      create_max_retries: 2
       # Wall-clock caps so a hung E2B endpoint/proxy cannot stall a rollout step
       # forever (create/write/run are otherwise unbounded on the network layer).
-      create_timeout: 90
-      write_timeout: 30
-      exec_timeout_pad: 30
-      kill_timeout: 30
+      create_timeout: 60
+      write_timeout: 20
+      exec_timeout_pad: 20
+      kill_timeout: 20
       strip_fences: true
       auto_print: true
       python_bin: "python3"

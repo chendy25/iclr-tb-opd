@@ -90,6 +90,9 @@ max_assistant_turns=${MAX_ASSISTANT_TURNS:-8}
 max_user_turns=${MAX_USER_TURNS:-8}
 max_tool_response_length=${MAX_TOOL_RESPONSE_LENGTH:-2048}
 multiturn_format=${MULTITURN_FORMAT:-hermes}
+# Per-trajectory wall-clock cap (s). Keeps one slow/hung tool trajectory from
+# stalling the synchronous rollout batch (mirrors ClawGym session_timeout).
+trajectory_timeout=${TRAJECTORY_TIMEOUT:-300}
 
 # ---- OPD hyperparams ----
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
@@ -287,6 +290,7 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_assistant_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_user_turns} \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${max_tool_response_length} \
+    actor_rollout_ref.rollout.multi_turn.trajectory_timeout=${trajectory_timeout} \
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n} \
     trainer.balance_batch=True \

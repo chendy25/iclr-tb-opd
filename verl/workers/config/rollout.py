@@ -60,6 +60,12 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    # Wall-clock cap (seconds) on a single multi-turn trajectory. When set (>0),
+    # ToolAgentLoop stops the generate->tool state machine once the deadline is
+    # hit and finalizes whatever tokens were produced so far, so one slow/hung
+    # tool trajectory cannot stall the whole synchronous rollout batch. None/<=0
+    # disables it. Mirrors the ClawGym remote-agent ``session_timeout``.
+    trajectory_timeout: Optional[float] = None
 
 
 @dataclass
