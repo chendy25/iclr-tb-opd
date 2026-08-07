@@ -290,7 +290,7 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_assistant_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_user_turns} \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=${max_tool_response_length} \
-    actor_rollout_ref.rollout.multi_turn.trajectory_timeout=${trajectory_timeout} \
+    +actor_rollout_ref.rollout.multi_turn.trajectory_timeout=${trajectory_timeout} \
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n} \
     trainer.balance_batch=True \
