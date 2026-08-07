@@ -19,6 +19,12 @@ tools:
       default_timeout: 60
       max_concurrent_sandboxes: 64
       create_max_retries: 3
+      # Wall-clock caps so a hung E2B endpoint/proxy cannot stall a rollout step
+      # forever (create/write/run are otherwise unbounded on the network layer).
+      create_timeout: 90
+      write_timeout: 30
+      exec_timeout_pad: 30
+      kill_timeout: 30
       strip_fences: true
       auto_print: true
       python_bin: "python3"

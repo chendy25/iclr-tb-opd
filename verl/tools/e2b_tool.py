@@ -123,6 +123,16 @@ class E2BTool(BaseTool):
         self.sandbox_timeout = int(config.get("sandbox_timeout", 300))
         self.default_timeout = int(config.get("default_timeout", 60))
         self.create_max_retries = max(1, int(config.get("create_max_retries", 3)))
+        # Wall-clock caps on the E2B network calls. Without these a hung endpoint
+        # / proxy makes ``AsyncSandbox.create`` / ``files.write`` / ``commands.run``
+        # block a trajectory *forever* (the retry loop only fires on exceptions,
+        # not on a silent hang), which stalls the whole rollout step. asyncio
+        # cancels the underlying HTTP coroutine on timeout regardless of whether
+        # the SDK version supports request_timeout.
+        self.create_timeout = int(config.get("create_timeout", 90))
+        self.write_timeout = int(config.get("write_timeout", 30))
+        self.exec_timeout_pad = int(config.get("exec_timeout_pad", 30))
+        self.kill_timeout = int(config.get("kill_timeout", 30))
         self.strip_fences = bool(config.get("strip_fences", True))
         self.auto_print = bool(config.get("auto_print", True))
         self.python_bin = config.get("python_bin", "python3")
@@ -186,9 +196,13 @@ class E2BTool(BaseTool):
             try:
                 if self._create_sem is not None:
                     async with self._create_sem:
-                        sandbox = await AsyncSandbox.create(**create_kwargs)
+                        sandbox = await asyncio.wait_for(
+                            AsyncSandbox.create(**create_kwargs), timeout=self.create_timeout
+                        )
                 else:
-                    sandbox = await AsyncSandbox.create(**create_kwargs)
+                    sandbox = await asyncio.wait_for(
+                        AsyncSandbox.create(**create_kwargs), timeout=self.create_timeout
+                    )
                 entry["sandbox"] = sandbox
                 logger.debug("E2B sandbox created id=%s instance=%s", getattr(sandbox, "sandbox_id", "?"), instance_id)
                 return sandbox
@@ -220,19 +234,39 @@ class E2BTool(BaseTool):
             output = await self._run_in_sandbox(instance_id, code, timeout)
         except Exception as error:  # noqa: BLE001
             logger.warning("E2B execute error instance=%s: %s", instance_id, error)
+            # A hung/broken sandbox must not be reused: drop the cached handle so
+            # the next tool call in this trajectory recreates a fresh one instead
+            # of re-hanging on the same dead connection.
+            self._evict_sandbox(instance_id)
             output = f"[e2b tool error] {type(error).__name__}: {str(error)[:500]}"
         # No per-step score / metrics from the sandbox.
         return ToolResponse(text=output), None, None
 
+    def _evict_sandbox(self, instance_id: str) -> None:
+        # Just drop the cached handle so the next tool call recreates a fresh
+        # sandbox. We deliberately do NOT try to kill the (possibly hung) handle
+        # here -- a synchronous kill could itself hang, and the server reclaims
+        # the sandbox on its own after ``sandbox_timeout``. ``release`` still
+        # kills healthy sandboxes at end-of-trajectory.
+        entry = self._instance_dict.get(instance_id)
+        if entry is not None:
+            entry["sandbox"] = None
+
     async def _run_in_sandbox(self, instance_id: str, code: str, timeout: int) -> str:
         sandbox = await self._ensure_sandbox(instance_id)
         path = f"/tmp/_e2b_{uuid4().hex}.py"
-        await sandbox.files.write(path, code)
+        await asyncio.wait_for(sandbox.files.write(path, code), timeout=self.write_timeout)
         cmd = f"{self.python_bin} {path}"
+        # Bound the *whole* run on the wall clock (command timeout + pad). This
+        # guards against a network-layer hang where the command timeout inside
+        # the sandbox never gets a chance to fire.
+        run_wall = timeout + self.exec_timeout_pad
         try:
-            result = await sandbox.commands.run(cmd, timeout=timeout)
+            result = await asyncio.wait_for(sandbox.commands.run(cmd, timeout=timeout), timeout=run_wall)
             stdout = getattr(result, "stdout", "") or ""
             stderr = getattr(result, "stderr", "") or ""
+        except asyncio.TimeoutError:
+            raise  # hard hang -> bubble up so execute() evicts the sandbox
         except Exception as error:  # e2b raises on non-zero exit; salvage its streams
             stdout = getattr(error, "stdout", "") or ""
             stderr = getattr(error, "stderr", "") or ""
@@ -251,6 +285,8 @@ class E2BTool(BaseTool):
         sandbox = entry.get("sandbox")
         if sandbox is not None:
             try:
-                await sandbox.kill(request_timeout=30)
+                await asyncio.wait_for(
+                    sandbox.kill(request_timeout=self.kill_timeout), timeout=self.kill_timeout
+                )
             except Exception as error:  # noqa: BLE001
                 logger.warning("E2B kill failed instance=%s: %s", instance_id, error)
