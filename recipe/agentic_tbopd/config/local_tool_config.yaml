@@ -1,0 +1,41 @@
+# Local-subprocess code-execution tool for agentic TB-OPD (Phase 1', TIR env).
+#
+# Same `code_interpreter` tool schema as e2b_tool_config.yaml /
+# sandbox_fusion_tool_config.yaml, but the backend is a plain local subprocess:
+# no remote VM, no proxy, no AGS quota, and a hard wall-clock timeout that
+# actually fires. The turn-level branching logic is backend-agnostic; select this
+# file via:
+#   actor_rollout_ref.rollout.multi_turn.tool_config_path=recipe/agentic_tbopd/config/local_tool_config.yaml
+#
+# Execution is stateless per call (a fresh `python3` process), identical to the
+# E2B tool's semantics, so forked branches stay independent.
+tools:
+  - class_name: "verl.tools.local_python_tool.LocalPythonTool"
+    config:
+      type: native
+      # Per-exec wall-clock cap. A single snippet is killed (whole process group)
+      # after this many seconds, so a runaway loop cannot stall the rollout step.
+      default_timeout: 30
+      # Address-space cap per exec (MB); guards against OOMing the rollout node.
+      memory_limit_mb: 1024
+      # Bound concurrent subprocesses per worker. One step has <=64 trajectories;
+      # keep CPU pressure sane on the rollout node. 0 = unlimited.
+      max_concurrent: 32
+      # Fork-bomb guard (RLIMIT_NPROC). 0 disables (safer on shared UID setups).
+      nproc_limit: 0
+      max_output_chars: 200000
+      strip_fences: true
+      auto_print: true
+      python_bin: "python3"
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_interpreter"
+        description: "Execute Python code in a sandbox and return stdout/stderr. Use it to run calculations, verify intermediate results, and check your reasoning before giving the final answer."
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "The Python code to execute. Print the values you want to observe."
+          required: ["code"]

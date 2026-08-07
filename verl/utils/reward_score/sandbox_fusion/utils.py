@@ -90,11 +90,42 @@ def call_sandbox_api(
         If successful, response_json is the API's returned JSON object, error_message is None.
         If failed after retries, response_json is None, error_message contains the error information.
     """
-    # Backend switch: when no SandboxFusion service is available, run the *same*
-    # generated code on an E2B sandbox instead. The E2B adapter returns an
+    # Backend switch: when no SandboxFusion HTTP service is available, run the
+    # *same* generated code through a different executor. Every backend returns an
     # identical api_response shape, so all downstream harness / output-comparison
     # / status logic in _process_single_case is unchanged (SOD-equivalent scores).
-    if os.getenv("SANDBOX_EXEC_BACKEND", "").lower() == "e2b" or str(sandbox_fusion_url).startswith("e2b://"):
+    #
+    #   local  -> subprocess on this host  (default; no network, hard timeout)
+    #   e2b    -> remote E2B sandbox       (opt-in; kept for parity/debugging)
+    #   http   -> real SandboxFusion URL   (original path, below)
+    #
+    # Resolution: explicit SANDBOX_EXEC_BACKEND wins; else an ``e2b://`` URL picks
+    # e2b, a real http(s) URL picks the SandboxFusion service, and anything else
+    # (e.g. the ``<your_sandbox_fusion_url>`` placeholder from code_math) falls
+    # back to the local subprocess executor.
+    _backend = os.getenv("SANDBOX_EXEC_BACKEND", "").lower()
+    if not _backend:
+        if str(sandbox_fusion_url).startswith("e2b://"):
+            _backend = "e2b"
+        elif str(sandbox_fusion_url).startswith(("http://", "https://")):
+            _backend = "http"
+        else:
+            _backend = "local"
+
+    if _backend in ("local", "subprocess"):
+        from verl.utils.reward_score.local_exec import local_call_sandbox_api
+
+        return local_call_sandbox_api(
+            sandbox_fusion_url=sandbox_fusion_url,
+            code=code,
+            stdin=stdin,
+            compile_timeout=compile_timeout,
+            run_timeout=run_timeout,
+            memory_limit_mb=memory_limit_mb,
+            language=language,
+        )
+
+    if _backend == "e2b" or str(sandbox_fusion_url).startswith("e2b://"):
         from verl.utils.reward_score.e2b_exec import e2b_call_sandbox_api
 
         return e2b_call_sandbox_api(
@@ -543,32 +574,64 @@ def check_correctness(
             for i, stdin_data in enumerate(inputs)
         }
 
+        # Overall wall-clock cap on the *whole* correctness check. Cases run
+        # concurrently, so this is a fixed ceiling (not per-case*num_cases). It is
+        # the last line of defence: even if a backend primitive hangs forever
+        # (a dead E2B sandbox, a wedged HTTP socket), the reward call returns
+        # instead of blocking the RewardLoopWorker -- and thus the prompt group --
+        # indefinitely. Overridable via CODE_REWARD_TOTAL_TIMEOUT.
+        overall_timeout = float(os.getenv("CODE_REWARD_TOTAL_TIMEOUT", str(max(60, timeout * 6))))
+
         # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_index):
-            index = future_to_index[future]
-            try:
-                result_status, metadata = future.result()
-                results[index] = result_status
-                metadata_list[index] = metadata
+        try:
+            for future in concurrent.futures.as_completed(future_to_index, timeout=overall_timeout):
+                index = future_to_index[future]
+                try:
+                    result_status, metadata = future.result()
+                    results[index] = result_status
+                    metadata_list[index] = metadata
 
-                # Check for compile error (-4)
-                if result_status == -4:
-                    if first_compile_error_index == -1 or index < first_compile_error_index:
-                        first_compile_error_index = index
-                    # Optimization: could potentially cancel futures for index > first_compile_error_index
-                    # However, cancellation is not guaranteed. Post-processing is safer.
+                    # Check for compile error (-4)
+                    if result_status == -4:
+                        if first_compile_error_index == -1 or index < first_compile_error_index:
+                            first_compile_error_index = index
+                        # Optimization: could potentially cancel futures for index > first_compile_error_index
+                        # However, cancellation is not guaranteed. Post-processing is safer.
 
-            except Exception as exc:
-                logger.error(f"Test case {index} generated an exception: {exc}")
-                traceback.print_exc()
-                results[index] = -1  # Mark as API/internal error
-                metadata_list[index] = {
-                    "case_index": index,
-                    "input": str(inputs[index]),
-                    "expected_output": str(expected_outputs[index]) if expected_outputs[index] else None,
-                    "api_request_error": f"Internal execution error: {exc}",
-                    "status": "internal_error",
-                }
+                except Exception as exc:
+                    logger.error(f"Test case {index} generated an exception: {exc}")
+                    traceback.print_exc()
+                    results[index] = -1  # Mark as API/internal error
+                    metadata_list[index] = {
+                        "case_index": index,
+                        "input": str(inputs[index]),
+                        "expected_output": str(expected_outputs[index]) if expected_outputs[index] else None,
+                        "api_request_error": f"Internal execution error: {exc}",
+                        "status": "internal_error",
+                    }
+        except concurrent.futures.TimeoutError:
+            # Some case futures never completed within the overall budget. Cancel
+            # what we can and score the stragglers as -1 so the check returns now.
+            stuck = [i for i in range(num_cases) if results[i] is None]
+            logger.error(
+                f"check_correctness overall timeout ({overall_timeout:.0f}s); "
+                f"{len(stuck)}/{num_cases} case(s) unfinished -> scored -1."
+            )
+            for future, index in future_to_index.items():
+                if results[index] is None:
+                    future.cancel()
+                    results[index] = -1
+                    metadata_list[index] = {
+                        "case_index": index,
+                        "input": str(inputs[index]),
+                        "expected_output": str(expected_outputs[index]) if expected_outputs[index] else None,
+                        "api_request_error": f"check_correctness overall timeout after {overall_timeout:.0f}s",
+                        "status": "overall_timeout",
+                    }
+            # Cancel queued-but-unstarted futures so the ThreadPoolExecutor's
+            # blocking shutdown (on `with` exit) does not re-wait for the whole
+            # backlog. Already-running tasks are bounded by the per-case timeout.
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # Post-processing for compile errors
     if first_compile_error_index != -1:

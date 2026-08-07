@@ -68,12 +68,15 @@ train_files="['${AGENTRL_TRAIN}']"
 val_files="['${AGENTRL_VAL}']"
 
 # ---- tool / multi-turn ----
-SANDBOX_BACKEND=${SANDBOX_BACKEND:-e2b}   # e2b | sandbox_fusion
+SANDBOX_BACKEND=${SANDBOX_BACKEND:-local}   # local | e2b | sandbox_fusion
 if [[ -z "${TOOL_CONFIG:-}" ]]; then
   if [[ "${SANDBOX_BACKEND}" == "sandbox_fusion" ]]; then
     TOOL_CONFIG=${CODE_DIR}/recipe/agentic_tbopd/config/sandbox_fusion_tool_config.yaml
-  else
+  elif [[ "${SANDBOX_BACKEND}" == "e2b" ]]; then
     TOOL_CONFIG=${CODE_DIR}/recipe/agentic_tbopd/config/e2b_tool_config.yaml
+  else
+    # local subprocess code_interpreter (no remote VM / proxy / AGS quota).
+    TOOL_CONFIG=${CODE_DIR}/recipe/agentic_tbopd/config/local_tool_config.yaml
   fi
 fi
 export SANDBOX_FUSION_URL=${SANDBOX_FUSION_URL:-http://localhost:8080/run_code}
