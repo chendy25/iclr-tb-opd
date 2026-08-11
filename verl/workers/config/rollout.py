@@ -173,6 +173,11 @@ class RolloutConfig(BaseConfig):
     n: int = 1
     repetition_penalty: float = 1.0
 
+    # Mask out response tokens after the first complete final answer
+    # (``\boxed{...}`` or an ``Answer:`` line) so post-answer repetition does not
+    # contribute to the loss. Only affects the loss mask; generation is unchanged.
+    mask_after_answer: bool = False
+
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False
 

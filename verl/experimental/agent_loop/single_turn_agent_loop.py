@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.utils import keep_len_after_final_answer
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -91,6 +92,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_ids = output.token_ids
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
+
+        # Drop post-answer repetition from the loss: zero the response mask beyond
+        # the first complete final answer. Generation is unchanged; only the mask
+        # (and therefore the distillation / policy-gradient loss) is affected.
+        if getattr(self.rollout_config, "mask_after_answer", False) and response_mask:
+            keep = keep_len_after_final_answer(self.tokenizer, response_ids)
+            if keep is not None and 0 < keep < len(response_mask):
+                response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
