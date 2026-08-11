@@ -13,7 +13,80 @@
 # limitations under the License.
 
 import os
-from typing import Any
+import re
+from typing import Any, Optional
+
+# First complete final answer marker: a balanced ``\boxed{...}`` or an
+# ``Answer:`` line. ``_ANSWER_LINE_RE`` matches the value that follows so we can
+# cut at the end of that line.
+_ANSWER_LINE_RE = re.compile(r"(?im)^[ \t]*Answer[ \t]*:[ \t]*\S[^\n]*")
+
+
+def _first_boxed_end(text: str) -> Optional[int]:
+    """Return the char offset just past the first balanced ``\\boxed{...}``.
+
+    Returns ``None`` if there is no complete (brace-balanced) boxed expression.
+    """
+    start = text.find("\\boxed{")
+    if start < 0:
+        return None
+    i = start + len("\\boxed{")
+    depth = 1
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None  # unterminated boxed -> treat as no complete answer
+
+
+def _first_answer_end_char(text: str) -> Optional[int]:
+    """Char offset of the end of the first complete final answer in ``text``.
+
+    Prefers whichever of ``\\boxed{...}`` / ``Answer:`` line ends earlier. Returns
+    ``None`` when neither a balanced boxed nor an ``Answer:`` line is present.
+    """
+    ends: list[int] = []
+    boxed_end = _first_boxed_end(text)
+    if boxed_end is not None:
+        ends.append(boxed_end)
+    m = _ANSWER_LINE_RE.search(text)
+    if m is not None:
+        ends.append(m.end())
+    if not ends:
+        return None
+    return min(ends)
+
+
+def keep_len_after_final_answer(tokenizer, response_ids: list[int]) -> Optional[int]:
+    """Number of leading response tokens to keep so the loss ignores post-answer text.
+
+    Decodes ``response_ids`` and locates the first complete final answer
+    (``\\boxed{...}`` or an ``Answer:`` line). Returns the smallest token count
+    ``k`` whose decoded prefix already contains that answer, so callers can zero
+    the response mask beyond ``k`` and drop trailing repetition. Returns ``None``
+    when no complete answer is found (leave the mask untouched).
+    """
+    if not response_ids:
+        return None
+    text = tokenizer.decode(response_ids)
+    char_end = _first_answer_end_char(text)
+    if char_end is None:
+        return None
+    # Monotone: len(decode(ids[:k])) is non-decreasing in k, so binary-search the
+    # smallest k whose decoded prefix already covers ``char_end``.
+    lo, hi = 1, len(response_ids)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if len(tokenizer.decode(response_ids[:mid])) >= char_end:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 def resolve_config_path(config_path: str) -> str:
