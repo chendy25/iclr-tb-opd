@@ -167,9 +167,12 @@ def main() -> None:
         src = Path(path_str).resolve()
         if not src.exists():
             raise FileNotFoundError(src)
-        out = Path(args.out_dir).resolve() / src.name if args.out_dir else src
+        # Mirror the dataset subdir (e.g. dapo_math_17k, aime2024) so files that
+        # share a basename (test.parquet) do not collide under a shared directory.
+        sub = src.parent.name
+        out = Path(args.out_dir).resolve() / sub / src.name if args.out_dir else src
         backup_dir = (
-            Path(args.backup_dir).resolve()
+            Path(args.backup_dir).resolve() / sub
             if args.backup_dir
             else src.parent / f"_prompt_backup_answer_{ts}"
         )
