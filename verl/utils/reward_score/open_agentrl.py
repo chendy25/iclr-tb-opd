@@ -132,10 +132,10 @@ def compute_score(
     **kwargs,
 ) -> dict:
     """Score one Open-AgentRL row, SOD-homologously. Returns {score, acc, pred}."""
-    from . import math_dapo
-    from .livecodebench import code_math
-
     if _is_code(data_source, ground_truth):
+        # Lazy: livecodebench/code_math pulls sandbox + heavy deps; skip on math rows.
+        from .livecodebench import code_math
+
         gt = _unwrap_code_gt(ground_truth)
         try:
             result = code_math.compute_score(solution_str, gt)
@@ -144,6 +144,8 @@ def compute_score(
             result = {"score": -1.0, "acc": False, "pred": None}
     else:
         # math / science MCQ: strict boxed answer (SOD rubric).
+        from . import math_dapo
+
         gt_str = ground_truth if isinstance(ground_truth, str) else str(ground_truth)
         result = math_dapo.compute_score(
             solution_str=solution_str, ground_truth=gt_str, strict_box_verify=True

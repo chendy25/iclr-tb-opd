@@ -31,11 +31,11 @@ tools:
       type: "function"
       function:
         name: "code_interpreter"
-        description: "Execute Python code in a sandbox and return stdout/stderr. Use it to run calculations, verify intermediate results, and check your reasoning before giving the final answer."
+        description: "A tool for executing code."
         parameters:
           type: "object"
           properties:
             code:
               type: "string"
-              description: "The Python code to execute. Print the values you want to observe."
+              description: "The code to execute."
           required: ["code"]

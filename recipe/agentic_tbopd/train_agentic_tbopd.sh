@@ -306,6 +306,7 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     trainer.save_freq=${save_freq} \
     trainer.test_freq=${test_freq} \
     trainer.total_epochs=${total_epochs} \
+    trainer.resume_mode=${RESUME_MODE:-disable} \
     trainer.default_local_dir=${ckpt_dir} \
     trainer.rollout_data_dir=${rollout_dir} \
     distillation.enabled=True \

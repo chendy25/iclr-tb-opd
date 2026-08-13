@@ -44,6 +44,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 
 import pandas as pd
@@ -109,16 +110,28 @@ def _to_message_list(prompt_field):
 
 
 def _to_dict(value) -> dict:
-    """Coerce a possibly-numpy / None parquet cell into a plain dict."""
+    """Coerce a possibly-numpy / None / JSON-string parquet cell into a plain dict."""
     if value is None:
         return {}
     if isinstance(value, dict):
         return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                obj = json.loads(text)
+                if isinstance(obj, dict):
+                    return dict(obj)
+            except (ValueError, TypeError):
+                pass
+        return {}
     if hasattr(value, "item"):  # numpy scalar wrapping a python object
         try:
             inner = value.item()
             if isinstance(inner, dict):
                 return dict(inner)
+            if isinstance(inner, str):
+                return _to_dict(inner)
         except (ValueError, AttributeError):
             pass
     try:
@@ -134,40 +147,145 @@ def _first_user_index(messages: list) -> int:
     return len(messages) - 1 if messages else -1
 
 
-def _process_row(example: dict, idx: int, split: str, wrap_prompt: bool) -> dict:
-    messages = _to_message_list(example.get("prompt"))
-    data_source = example.get("data_source", "math_dapo")
-    is_code = _is_code_source(data_source)
+def _extract_problem_text(example: dict) -> str:
+    """Pull the raw problem text from train (``prompt``) or Eval (``Problem``/``problem``)."""
+    prompt = example.get("prompt")
+    if prompt is not None:
+        # Train rows already have chat messages; keep them.
+        if isinstance(prompt, (list, tuple)) or hasattr(prompt, "tolist"):
+            messages = _to_message_list(prompt)
+            for m in messages:
+                if m.get("role") == "user" and m.get("content"):
+                    return str(m["content"])
+            if messages:
+                return str(messages[0].get("content", "") or "")
+        text = str(prompt).strip()
+        if text and text.lower() != "none":
+            return text
 
-    # Drop any pre-existing system prompt (SOD uses none); apply SOD scaffolding to
-    # the user turn.
-    messages = [m for m in messages if m.get("role") != "system"]
+    for key in ("Problem", "problem", "question", "Question"):
+        if key in example and example[key] is not None:
+            text = str(example[key]).strip()
+            if text and text.lower() != "none":
+                return text
+    return ""
+
+
+def _jsonable(obj):
+    """Recursively convert numpy scalars/arrays so ``json.dumps`` succeeds."""
+    if hasattr(obj, "tolist"):
+        return _jsonable(obj.tolist())
+    if isinstance(obj, dict):
+        return {str(k): _jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonable(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
+def _extract_reward_model(example: dict, is_code: bool) -> dict:
+    """Build a verl ``reward_model`` dict with a usable ``ground_truth``.
+
+    Open-AgentRL-Eval raw schemas differ from the 30K train parquet:
+      * AIME24: ``Answer`` (int/str)
+      * AIME25: ``answer``
+      * GPQA:   ``solution`` (letter)
+      * LCB:    ``reward_model`` JSON string ``{"ground_truth": {...harness...}}``
+
+    Code harnesses are stored as a JSON *string* (not a nested dict) so parquet
+    round-trips do not turn lists into numpy arrays that break ``json.dumps``
+    inside ``open_agentrl._unwrap_code_gt``.
+    """
+    rm = _to_dict(example.get("reward_model"))
+    gt = rm.get("ground_truth")
+    if gt not in (None, ""):
+        if is_code or isinstance(gt, (dict, list)):
+            return {"ground_truth": json.dumps(_jsonable(gt)), "style": rm.get("style", "rule")}
+        return {"ground_truth": str(gt).strip(), "style": rm.get("style", "rule")}
+
+    for key in ("Answer", "answer", "solution", "final_answer", "label"):
+        if key in example and example[key] is not None:
+            val = example[key]
+            # Prefer short MCQ / numeric answers over long free-text "solution".
+            if key == "solution" and is_code:
+                continue
+            if key == "solution" and isinstance(val, str) and len(val) > 8 and "\\boxed" not in val:
+                # Long AIME "Solution" prose — skip; wait for Answer/answer.
+                if any(k in example and example[k] is not None for k in ("Answer", "answer")):
+                    continue
+            return {"ground_truth": str(val).strip(), "style": "rule"}
+
+    return {"ground_truth": "", "style": "rule"}
+
+
+def _normalize_example(example: dict) -> dict:
+    """Unify train / Eval row schemas before SOD wrapping."""
+    data_source = example.get("data_source") or "math_dapo"
+    is_code = _is_code_source(data_source) or (
+        "livecodebench" in str(data_source).lower()
+    )
+    # LCB rows also count as code even if ability says so.
+    if str(example.get("ability", "")).lower() == "code":
+        is_code = True
+
+    problem = _extract_problem_text(example)
+    # Rebuild a single-user chat prompt from the bare problem when needed.
+    if example.get("prompt") is not None and isinstance(example.get("prompt"), (list, tuple)):
+        messages = _to_message_list(example.get("prompt"))
+        # Repair rows whose user content collapsed to the literal "None".
+        ui = _first_user_index(messages)
+        if ui >= 0:
+            content = str(messages[ui].get("content", "") or "")
+            if (not content) or content.strip().lower() == "none" or content.lstrip().startswith("None\n"):
+                messages = [{"role": "user", "content": problem}]
+    else:
+        messages = [{"role": "user", "content": problem}]
+
+    reward_model = _extract_reward_model(example, is_code=is_code)
+    ability = example.get("ability") or ("code" if is_code else "MATH")
+    extra_info = _to_dict(example.get("extra_info"))
+
+    return {
+        "data_source": data_source,
+        "prompt": messages,
+        "ability": ability,
+        "reward_model": reward_model,
+        "extra_info": extra_info,
+        "_is_code": is_code,
+    }
+
+
+def _process_row(example: dict, idx: int, split: str, wrap_prompt: bool) -> dict:
+    norm = _normalize_example(example)
+    messages = [m for m in norm["prompt"] if m.get("role") != "system"]
+    is_code = bool(norm["_is_code"])
+
     if wrap_prompt and messages:
         ui = _first_user_index(messages)
         if ui >= 0:
             messages[ui]["content"] = _sod_wrap(messages[ui].get("content", ""), is_code)
 
-    extra_info = _to_dict(example.get("extra_info"))
+    extra_info = dict(norm["extra_info"])
     extra_info.setdefault("index", idx)
     extra_info["split"] = split
 
-    # Ground truth for the tool's create() (also keeps the parquet struct non-empty,
-    # since pyarrow cannot serialize a struct with no child fields).
-    rm = _to_dict(example.get("reward_model"))
-    gt = str(rm.get("ground_truth", "") or "")
+    rm = norm["reward_model"]
+    gt = rm.get("ground_truth", "")
+    # tools_kwargs create() only needs a string marker; keep code harness out of it.
+    gt_for_tool = gt if isinstance(gt, str) else ""
 
-    # Route this sample to the code_interpreter tool + SOD-homologous reward.
     extra_info["need_tools_kwargs"] = True
     extra_info["agentic_reward"] = True  # -> open_agentrl.compute_score (SOD rubric)
-    extra_info["tools_kwargs"] = {"code_interpreter": {"create_kwargs": {"ground_truth": gt}}}
+    extra_info["tools_kwargs"] = {"code_interpreter": {"create_kwargs": {"ground_truth": gt_for_tool}}}
     extra_info["tool_selection"] = ["code_interpreter"]
 
     return {
-        "data_source": data_source,  # kept intact (no filtering / remapping)
+        "data_source": norm["data_source"],
         "agent_name": "tool_agent",
         "prompt": messages,
-        "ability": example.get("ability", "MATH"),
-        "reward_model": example.get("reward_model"),
+        "ability": norm["ability"],
+        "reward_model": rm,
         "extra_info": extra_info,
     }
 
@@ -203,18 +321,26 @@ def main():
         default=["aime2024", "aime2025", "gpqa-diamond", "livecodebench-v6"],
         help="Subdirs of Open-AgentRL-Eval to convert as validation sets.",
     )
+    ap.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Only rebuild test_*.parquet (skip the 30K train conversion).",
+    )
     args = ap.parse_args()
     wrap_prompt = not args.no_prompt_wrap
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Train: Open-AgentRL-30K.
-    train_src = os.path.join(args.hf_root, "Gen-Verse__Open-AgentRL-30K", "Open-AgentRL-30K.parquet")
-    if not os.path.exists(train_src):
-        raise FileNotFoundError(f"train parquet not found: {train_src}")
-    train_ds = _convert(train_src, "train", wrap_prompt)
-    train_out = os.path.join(args.out_dir, "train.parquet")
-    train_ds.to_parquet(train_out)
-    print(f"[train] {len(train_ds)} rows -> {train_out}")
+    if not args.eval_only:
+        train_src = os.path.join(args.hf_root, "Gen-Verse__Open-AgentRL-30K", "Open-AgentRL-30K.parquet")
+        if not os.path.exists(train_src):
+            raise FileNotFoundError(f"train parquet not found: {train_src}")
+        train_ds = _convert(train_src, "train", wrap_prompt)
+        train_out = os.path.join(args.out_dir, "train.parquet")
+        train_ds.to_parquet(train_out)
+        print(f"[train] {len(train_ds)} rows -> {train_out}")
+    else:
+        print("[train] skipped (--eval_only)")
 
     # Eval: each subdir under Open-AgentRL-Eval that has a parquet.
     eval_root = os.path.join(args.hf_root, "Gen-Verse__Open-AgentRL-Eval")

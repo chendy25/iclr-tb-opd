@@ -432,4 +432,36 @@ def compute_distillation_loss_reverse_kl_estimator(
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
+
+    # KD alignment self-check (audit): teacher_logprobs[i] must be the teacher's
+    # logprob of the *same* response token that student_log_probs[i] scores. Both
+    # tensors go through the identical left-shift slice in no_padding_2_padding, so
+    # correctness hinges on the teacher's prompt_logprobs indexing convention. We
+    # verify it directly by pushing teacher_ids through the same path and comparing
+    # to the student's response token ids under response_mask: a correct alignment
+    # gives frac==1.0; an off-by-one convention mismatch gives a low fraction.
+    # Gated by env (default on) and fully guarded so it can never break training.
+    if os.getenv("KD_ALIGN_AUDIT", "1") == "1" and "teacher_ids" in data.keys():
+        try:
+            teacher_ids_pad = no_padding_2_padding(data["teacher_ids"], data).squeeze(-1)
+            responses = data["responses"]
+            if responses.is_nested:
+                responses = responses.to_padded_tensor(0)
+            width = min(teacher_ids_pad.shape[1], responses.shape[1], response_mask_bool.shape[1])
+            t_ids = teacher_ids_pad[:, :width].round().long()
+            r_ids = responses[:, :width].long()
+            mask = response_mask_bool[:, :width]
+            denom = mask.sum().clamp(min=1)
+            align_frac = ((t_ids == r_ids) & mask).sum().float() / denom
+            metrics["distillation/teacher_align_frac"] = Metric(AggregationType.MEAN, align_frac)
+            if float(align_frac) < 0.99:
+                logger.warning(
+                    "KD ALIGN AUDIT: teacher_align_frac=%.4f (<0.99). teacher_logprobs are likely "
+                    "misaligned with the student's response tokens (off-by-one convention mismatch "
+                    "between teacher prompt_logprobs and no_padding_2_padding's left-shift).",
+                    float(align_frac),
+                )
+        except Exception as audit_err:  # noqa: BLE001
+            logger.warning("KD align audit skipped: %s", audit_err)
+
     return distillation_losses, metrics
