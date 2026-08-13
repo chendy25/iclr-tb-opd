@@ -98,6 +98,8 @@ class AgentLoopOutput(BaseModel):
     """Response mask, 1 for LLM generated token, 0 for tool response token."""
     response_logprobs: Optional[list[float]] = None
     """Log probabilities for the response tokens."""
+    rep_penalty: Optional[list[float]] = None
+    """Per-token repetition penalty weights (advantage shaping); None if unused."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -124,6 +126,10 @@ class AgentLoopOutput(BaseModel):
         response_logprobs = output.pop("response_logprobs", None)
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
+
+        rep_penalty = output.pop("rep_penalty", None)
+        if rep_penalty is not None:
+            output["rep_penalty"] = torch.tensor(rep_penalty, dtype=torch.float32)
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
@@ -166,6 +172,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
+    rep_penalty: Optional[torch.Tensor] = None
+    """Padded per-token repetition penalty weights (advantage shaping)."""
     teacher_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
@@ -1196,6 +1204,11 @@ class AgentLoopWorker:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+        rep_penalty = None
+        if output.rep_penalty is not None:
+            pad_size = self.rollout_config.response_length - len(output.rep_penalty)
+            rep_penalty = torch.tensor(output.rep_penalty + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -1272,6 +1285,7 @@ class AgentLoopWorker:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
+            rep_penalty=rep_penalty,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -1466,6 +1480,8 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        if inputs[0].rep_penalty is not None:
+            optional_outputs["rep_penalty"] = torch.cat([input.rep_penalty for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

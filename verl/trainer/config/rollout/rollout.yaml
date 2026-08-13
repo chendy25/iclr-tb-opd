@@ -135,6 +135,19 @@ repetition_penalty: 1.0
 # Only affects the loss mask; generation is unchanged. See single_turn_agent_loop.
 mask_after_answer: False
 
+# Advantage-shaping repetition penalty. Detects degenerate repetition (consecutive
+# n-gram runs / line stutter) on rollout token ids and subtracts a per-token penalty
+# from the token-level distillation advantage (see trainer/distillation/losses.py).
+# Generation is unchanged; only the training signal is shaped.
+rep_penalty_enable: False
+rep_penalty_ngram_ns: [1, 3, 5, 8]
+rep_penalty_min_repeat: 8
+rep_penalty_line_enable: True
+rep_penalty_min_line_repeat: 20
+rep_penalty_lambda_body: 0.5
+rep_penalty_lambda_entry: 3.0
+rep_penalty_mode: wall  # "wall" (entry gets extra lambda_entry) | "penalize"
+
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,
 # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.
 over_sample_rate: 0

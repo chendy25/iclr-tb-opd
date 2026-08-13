@@ -17,7 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
-from verl.experimental.agent_loop.utils import keep_len_after_final_answer
+from verl.experimental.agent_loop.utils import compute_repetition_penalty, keep_len_after_final_answer
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -34,6 +34,40 @@ class SingleTurnAgentLoop(AgentLoopBase):
         super().__init__(*args, **kwargs)
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        self._rep_newline_ids: set[int] | None = None
+
+    def _newline_token_ids(self) -> set[int]:
+        """Single-token ids that decode to a bare newline run (for line stutter split)."""
+        if self._rep_newline_ids is None:
+            ids: set[int] = set()
+            for s in ("\n", "\n\n", "\n\n\n"):
+                try:
+                    enc = self.tokenizer.encode(s, add_special_tokens=False)
+                except Exception:
+                    enc = []
+                if len(enc) == 1:
+                    ids.add(enc[0])
+            self._rep_newline_ids = ids
+        return self._rep_newline_ids
+
+    def _maybe_rep_penalty(self, response_ids: list[int]) -> list[float] | None:
+        """Per-token repetition penalty for advantage shaping, or None if disabled/clean."""
+        cfg = self.rollout_config
+        if not getattr(cfg, "rep_penalty_enable", False) or not response_ids:
+            return None
+        newline_ids = self._newline_token_ids() if getattr(cfg, "rep_penalty_line_enable", True) else None
+        return compute_repetition_penalty(
+            response_ids,
+            ngram_ns=tuple(getattr(cfg, "rep_penalty_ngram_ns", (1, 3, 5, 8))),
+            min_repeat=int(getattr(cfg, "rep_penalty_min_repeat", 8)),
+            min_line_repeat=int(getattr(cfg, "rep_penalty_min_line_repeat", 20)),
+            newline_ids=newline_ids,
+            lambda_body=float(getattr(cfg, "rep_penalty_lambda_body", 0.5)),
+            lambda_entry=float(getattr(cfg, "rep_penalty_lambda_entry", 3.0)),
+            mode=str(getattr(cfg, "rep_penalty_mode", "wall")),
+            eos_id=self.tokenizer.eos_token_id,
+            protect_tail_eos=True,
+        )
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
@@ -101,11 +135,15 @@ class SingleTurnAgentLoop(AgentLoopBase):
             if keep is not None and 0 < keep < len(response_mask):
                 response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
 
+        response_ids = response_ids[: self.response_length]
+        rep_penalty = self._maybe_rep_penalty(response_ids)
+
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=response_ids[: self.response_length],
+            response_ids=response_ids,
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
+            rep_penalty=rep_penalty,
             routed_experts=(
                 output.routed_experts[: len(prompt_ids) + self.response_length]
                 if output.routed_experts is not None

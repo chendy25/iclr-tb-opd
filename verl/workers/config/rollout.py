@@ -172,6 +172,23 @@ class RolloutConfig(BaseConfig):
     # contribute to the loss. Only affects the loss mask; generation is unchanged.
     mask_after_answer: bool = False
 
+    # Advantage-shaping repetition penalty. When enabled, degenerate repetition
+    # (consecutive n-gram runs / line stutter) is detected on the rollout token ids
+    # and a per-token penalty is subtracted from the token-level distillation
+    # advantage (see verl/trainer/distillation/losses.py). Generation is unchanged.
+    rep_penalty_enable: bool = False
+    # Consecutive n-gram periods to scan and the min back-to-back repeats to flag.
+    rep_penalty_ngram_ns: list = field(default_factory=lambda: [1, 3, 5, 8])
+    rep_penalty_min_repeat: int = 8
+    # Newline-delimited line stutter (min identical consecutive lines). 0 disables.
+    rep_penalty_min_line_repeat: int = 20
+    rep_penalty_line_enable: bool = True
+    # Penalty magnitudes (subtracted from advantage): body over the whole repeated
+    # span, plus an extra "wall" at the entry token when mode == "wall".
+    rep_penalty_lambda_body: float = 0.5
+    rep_penalty_lambda_entry: float = 3.0
+    rep_penalty_mode: str = "wall"  # "wall" | "penalize"
+
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False
 

@@ -89,6 +89,163 @@ def keep_len_after_final_answer(tokenizer, response_ids: list[int]) -> Optional[
     return lo
 
 
+def _mark_ngram_runs(
+    ids: list[int],
+    covered: list[float],
+    *,
+    ngram_ns: tuple[int, ...],
+    min_repeat: int,
+    lambda_body: float,
+    lambda_entry: float,
+    mode: str,
+) -> None:
+    """Mark consecutive (period-``p``) n-gram runs in ``ids`` into ``covered``.
+
+    A run is a maximal region where the ``p``-token block starting at ``i`` repeats
+    ``>= min_repeat`` times back-to-back (period-``p`` repetition). This catches the
+    observed stutter units: single-token spam, ``$$`` / ``\\[`` markers, repeated
+    ``\\boxed{x}`` lines, ``Answer: 1`` loops -- all short repeating token n-grams,
+    detected on ids without any decoding.
+    """
+    t = len(ids)
+    for p in ngram_ns:
+        if p <= 0 or p > t:
+            continue
+        i = 0
+        while i + p <= t:
+            block = ids[i : i + p]
+            reps = 1
+            j = i + p
+            while j + p <= t and ids[j : j + p] == block:
+                reps += 1
+                j += p
+            if reps >= min_repeat:
+                # body of the repeated region gets lambda_body ...
+                for k in range(i, j):
+                    if lambda_body > covered[k]:
+                        covered[k] = lambda_body
+                # ... and the entry token an extra wall (mode="wall").
+                if mode == "wall":
+                    entry_w = lambda_body + lambda_entry
+                    if entry_w > covered[i]:
+                        covered[i] = entry_w
+                i = j  # skip past the run we just consumed
+            else:
+                i += 1
+
+
+def _mark_line_runs(
+    ids: list[int],
+    covered: list[float],
+    newline_ids: set[int],
+    *,
+    min_line_repeat: int,
+    lambda_body: float,
+    lambda_entry: float,
+    mode: str,
+) -> None:
+    """Mark newline-delimited *line* stutter (consecutive identical lines).
+
+    Lines are delimited by ``newline_ids`` on the token stream -- no text decoding.
+    A run of ``>= min_line_repeat`` identical consecutive line-id sequences is marked.
+    """
+    t = len(ids)
+    # Build (start, end) spans for each line; the trailing newline stays with its line.
+    lines: list[tuple[int, int, tuple[int, ...]]] = []
+    start = 0
+    for idx, tok in enumerate(ids):
+        if tok in newline_ids:
+            lines.append((start, idx + 1, tuple(ids[start : idx + 1])))
+            start = idx + 1
+    if start < t:
+        lines.append((start, t, tuple(ids[start:t])))
+
+    n = len(lines)
+    li = 0
+    while li < n:
+        key = lines[li][2]
+        # skip trivial empty/bare-newline lines (avoid flagging normal blank spacing)
+        if len(key) <= 1:
+            li += 1
+            continue
+        lj = li + 1
+        while lj < n and lines[lj][2] == key:
+            lj += 1
+        if lj - li >= min_line_repeat:
+            span_start = lines[li][0]
+            span_end = lines[lj - 1][1]
+            for k in range(span_start, span_end):
+                if lambda_body > covered[k]:
+                    covered[k] = lambda_body
+            if mode == "wall":
+                entry_w = lambda_body + lambda_entry
+                if entry_w > covered[span_start]:
+                    covered[span_start] = entry_w
+            li = lj
+        else:
+            li += 1
+
+
+def compute_repetition_penalty(
+    response_ids: list[int],
+    *,
+    ngram_ns: tuple[int, ...] = (1, 3, 5, 8),
+    min_repeat: int = 8,
+    min_line_repeat: int = 20,
+    newline_ids: Optional[set[int]] = None,
+    lambda_body: float = 0.5,
+    lambda_entry: float = 3.0,
+    mode: str = "wall",
+    eos_id: Optional[int] = None,
+    protect_tail_eos: bool = True,
+) -> Optional[list[float]]:
+    """Per-token repetition penalty weights for advantage shaping (no decoding).
+
+    Detects pathological repetition directly on ``response_ids`` and returns a list
+    of non-negative weights (same length as ``response_ids``) to be *subtracted* from
+    the token-level advantage in the distillation policy loss. ``0.0`` means no
+    penalty. The entry token of each repeated span additionally receives
+    ``lambda_entry`` when ``mode="wall"`` (a gradient "wall" at the decision to start
+    repeating); ``mode="penalize"`` applies only ``lambda_body`` uniformly.
+
+    Only long, clearly-degenerate repetition is flagged (``>= min_repeat`` back-to-back
+    n-gram blocks, ``>= min_line_repeat`` identical lines) so ordinary repeated math
+    (aligned equations, a couple of ``$$``) is left untouched. The terminal EOS/stop
+    token is never penalized so the model keeps learning to stop.
+
+    Returns ``None`` when nothing is flagged (caller may skip attaching the tensor).
+    """
+    t = len(response_ids)
+    if t == 0:
+        return None
+    covered = [0.0] * t
+    _mark_ngram_runs(
+        response_ids,
+        covered,
+        ngram_ns=tuple(ngram_ns),
+        min_repeat=min_repeat,
+        lambda_body=lambda_body,
+        lambda_entry=lambda_entry,
+        mode=mode,
+    )
+    if newline_ids:
+        _mark_line_runs(
+            response_ids,
+            covered,
+            set(newline_ids),
+            min_line_repeat=min_line_repeat,
+            lambda_body=lambda_body,
+            lambda_entry=lambda_entry,
+            mode=mode,
+        )
+    # Never penalize a clean terminal stop signal.
+    if protect_tail_eos and eos_id is not None and response_ids[-1] == eos_id:
+        covered[-1] = 0.0
+    if not any(covered):
+        return None
+    return covered
+
+
 def resolve_config_path(config_path: str) -> str:
     """Resolve agent loop configuration file path.
 

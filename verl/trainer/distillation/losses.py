@@ -271,10 +271,31 @@ def distillation_loss(
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        # Token-level advantage in OPD is the negative distillation loss. Optionally
+        # subtract a per-token repetition penalty (computed on rollout token ids, see
+        # single_turn_agent_loop / utils.compute_repetition_penalty) so degenerate
+        # repetition spans get a negative advantage (a gradient "wall" at the entry
+        # token) instead of being reinforced.
+        advantages = -distillation_losses.detach()
+        rep_penalty = data.get("rep_penalty", None)
+        if rep_penalty is not None:
+            if rep_penalty.is_nested:
+                rep_penalty = rep_penalty.to_padded_tensor(0.0)
+            rep_penalty = rep_penalty.to(device=advantages.device, dtype=advantages.dtype)
+            if rep_penalty.shape == advantages.shape:
+                advantages = advantages - rep_penalty
+                pen_mask = (rep_penalty > 0) & response_mask.bool()
+                num_resp = response_mask.bool().sum().clamp(min=1)
+                distillation_metrics["distillation/rep_penalty_token_frac"] = (
+                    pen_mask.sum().float() / num_resp
+                ).item()
+                distillation_metrics["distillation/rep_penalty_mean"] = (
+                    rep_penalty[pen_mask].mean().item() if pen_mask.any() else 0.0
+                )
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
-            advantages=-distillation_losses.detach(),
+            advantages=advantages,
             response_mask=response_mask,
             loss_agg_mode=loss_agg_mode,
             config=loss_config,
