@@ -1480,8 +1480,14 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
-        if inputs[0].rep_penalty is not None:
-            optional_outputs["rep_penalty"] = torch.cat([input.rep_penalty for input in inputs], dim=0)
+        if any(input.rep_penalty is not None for input in inputs):
+            # Fill zeros for any sample without a penalty vector so cat stays uniform.
+            resp_len = self.rollout_config.response_length
+            rep_parts = [
+                input.rep_penalty if input.rep_penalty is not None else torch.zeros(1, resp_len, dtype=torch.float32)
+                for input in inputs
+            ]
+            optional_outputs["rep_penalty"] = torch.cat(rep_parts, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

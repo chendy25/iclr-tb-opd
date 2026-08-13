@@ -56,7 +56,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         if not getattr(cfg, "rep_penalty_enable", False) or not response_ids:
             return None
         newline_ids = self._newline_token_ids() if getattr(cfg, "rep_penalty_line_enable", True) else None
-        return compute_repetition_penalty(
+        penalty = compute_repetition_penalty(
             response_ids,
             ngram_ns=tuple(getattr(cfg, "rep_penalty_ngram_ns", (1, 3, 5, 8))),
             min_repeat=int(getattr(cfg, "rep_penalty_min_repeat", 8)),
@@ -68,6 +68,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
             eos_id=self.tokenizer.eos_token_id,
             protect_tail_eos=True,
         )
+        # When enabled, always attach a fixed-length vector (zeros if clean) so the
+        # batch collation and the TransferQueue column stay uniform across samples
+        # (mixing None and tensors would break torch.cat / the TQ schema).
+        if penalty is None:
+            return [0.0] * len(response_ids)
+        return penalty
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
