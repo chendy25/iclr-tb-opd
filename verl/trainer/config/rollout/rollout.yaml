@@ -144,6 +144,13 @@ mask_after_answer_post_cap: 512
 # (\boxed{}/Answer:) has its whole response mask zeroed. Only affects the loss mask.
 mask_truncated_no_answer: False
 
+# Generation early-stop: generate in chunks and stop once a complete \boxed{}/Answer:
+# appears, truncating right after it (kills post-answer refrain at generation time).
+# single_turn_agent_loop only. Chunk size and kept tail are configurable.
+early_stop_after_answer: False
+early_stop_chunk_tokens: 2048
+early_stop_tail_tokens: 4
+
 # Advantage-shaping repetition penalty. Detects degenerate repetition (consecutive
 # n-gram runs / line stutter) on rollout token ids and subtracts a per-token penalty
 # from the token-level distillation advantage (see trainer/distillation/losses.py).

@@ -80,6 +80,75 @@ class SingleTurnAgentLoop(AgentLoopBase):
             return [0.0] * len(response_ids)
         return penalty
 
+    async def _generate_early_stop(
+        self,
+        *,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        images,
+        audios,
+        videos,
+        mm_processor_kwargs,
+        priority: int,
+    ) -> tuple["TokenOutput", list[int], list[float] | None]:
+        """Generate in chunks, stopping once a complete final answer appears.
+
+        Continues generation ``early_stop_chunk_tokens`` at a time (feeding
+        prompt + response-so-far, like the multi-turn tool loop), and after each chunk
+        checks for a brace-balanced ``\\boxed{...}`` / ``Answer:`` line. When one is
+        found the response is truncated just past it (plus ``early_stop_tail_tokens`` to
+        keep the closing ``\\]`` / ``$``) and generation stops -- killing the post-answer
+        refrain at the source. Also stops on a natural EOS / short chunk, or when the
+        ``response_length`` budget is exhausted (a no-answer wall-hit, handled by
+        ``mask_truncated_no_answer`` downstream). Returns the last chunk's ``TokenOutput``
+        (for metadata) plus the accumulated response ids and logprobs.
+        """
+        eos_id = self.tokenizer.eos_token_id
+        chunk = max(int(getattr(self.rollout_config, "early_stop_chunk_tokens", 2048)), 1)
+        tail = max(int(getattr(self.rollout_config, "early_stop_tail_tokens", 4)), 0)
+        total = self.response_length
+        resp_ids: list[int] = []
+        resp_logprobs: list[float] = []
+        have_lp = False
+        last_output = None
+        while len(resp_ids) < total:
+            budget = min(chunk, total - len(resp_ids))
+            # One continuation sequence per chunk; cap this chunk's new tokens.
+            sp = {**sampling_params, "max_tokens": budget, "n": 1}
+            out: TokenOutput = await self.server_manager.generate(
+                request_id=request_id,
+                prompt_ids=prompt_ids + resp_ids,
+                sampling_params=sp,
+                image_data=images,
+                audio_data=audios,
+                video_data=videos,
+                mm_processor_kwargs=mm_processor_kwargs,
+                priority=priority,
+            )
+            last_output = out
+            new_ids = out.token_ids or []
+            if not new_ids:
+                break
+            if out.log_probs:
+                have_lp = True
+                resp_logprobs += out.log_probs
+            elif have_lp:
+                resp_logprobs += [0.0] * len(new_ids)
+            resp_ids += new_ids
+            # Stop just past the first complete final answer (drop post-answer refrain).
+            keep = keep_len_after_final_answer(self.tokenizer, resp_ids, eos_id=None)
+            if keep is not None:
+                keep = min(len(resp_ids), keep + tail)
+                resp_ids = resp_ids[:keep]
+                if have_lp:
+                    resp_logprobs = resp_logprobs[:keep]
+                break
+            # Natural stop: EOS, or vLLM returned fewer tokens than requested.
+            if len(new_ids) < budget or (eos_id is not None and new_ids[-1] == eos_id):
+                break
+        return last_output, resp_ids, (resp_logprobs if have_lp else None)
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
@@ -108,18 +177,33 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         metrics = {}
+        early_stop = getattr(self.rollout_config, "early_stop_after_answer", False) and not use_continuous_token
+        es_response_ids: list[int] | None = None
+        es_response_logprobs: list[float] | None = None
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
-            output: TokenOutput = await self.server_manager.generate(
-                request_id=request_id,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=images,
-                audio_data=audios,
-                video_data=videos,
-                mm_processor_kwargs=mm_processor_kwargs,
-                priority=priority,
-            )
+            if early_stop:
+                output, es_response_ids, es_response_logprobs = await self._generate_early_stop(
+                    request_id=request_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    images=images,
+                    audios=audios,
+                    videos=videos,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    priority=priority,
+                )
+            else:
+                output: TokenOutput = await self.server_manager.generate(
+                    request_id=request_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=images,
+                    audio_data=audios,
+                    video_data=videos,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                    priority=priority,
+                )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
 
@@ -133,6 +217,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
             )
             response_ids = merge_result.token_ids[-len(response_mask) :] if response_mask else []
             prompt_ids = merge_result.token_ids[: len(merge_result.token_ids) - len(response_mask)]
+        elif early_stop:
+            response_ids = es_response_ids
+            response_mask = [1] * len(response_ids)
+            response_logprobs = es_response_logprobs
         else:
             response_ids = output.token_ids
             response_mask = [1] * len(output.token_ids)
@@ -145,7 +233,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # pollute the token-mean gradient. Generation is unchanged.
         if getattr(self.rollout_config, "mask_truncated_no_answer", False) and response_mask:
             eos_id = self.tokenizer.eos_token_id
-            hit_cap = len(output.token_ids) >= self.response_length
+            hit_cap = len(response_ids) >= self.response_length
             no_eos = eos_id is None or not response_ids or response_ids[-1] != eos_id
             if hit_cap and no_eos and _first_answer_end_char(self.tokenizer.decode(response_ids)) is None:
                 response_mask = [0] * len(response_mask)

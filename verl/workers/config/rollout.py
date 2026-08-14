@@ -190,6 +190,19 @@ class RolloutConfig(BaseConfig):
     # it contributes nothing to the token-mean gradient. Only affects the loss mask.
     mask_truncated_no_answer: bool = False
 
+    # Generation early-stop: generate in chunks and stop once a complete final answer
+    # (\boxed{}/Answer:) appears, truncating the response right after it. Kills the
+    # post-answer refrain at the *generation* level (not just the loss mask), so the
+    # model stops rambling and each step is cheaper. Needs brace-balanced detection so
+    # it is done by chunked continuation, not vLLM stop strings (which would cut mid-
+    # reasoning on \] / $). single_turn_agent_loop only.
+    early_stop_after_answer: bool = False
+    # Tokens generated per chunk before checking for a complete answer. Larger = fewer
+    # round-trips but more post-answer tokens generated before the stop is detected.
+    early_stop_chunk_tokens: int = 2048
+    # Extra tokens kept past the answer end (to include the closing \] / $ delimiter).
+    early_stop_tail_tokens: int = 4
+
     # Advantage-shaping repetition penalty. When enabled, degenerate repetition
     # (consecutive n-gram runs / line stutter) is detected on the rollout token ids
     # and a per-token penalty is subtracted from the token-level distillation
