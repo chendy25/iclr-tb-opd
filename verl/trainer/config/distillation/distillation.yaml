@@ -54,6 +54,19 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # DAPO-style soft overlong punishment applied to the token-level advantage
+  # (reward-free OPD has no reward channel). Disabled by default.
+  overlong_enable: false
+
+  # Length (response tokens) of the soft ramp before the hard cap.
+  overlong_buffer_len: 4096
+
+  # Peak penalty magnitude at/above the cap (DAPO uses 1.0; OPD adv ~O(0.1)).
+  overlong_penalty_factor: 1.0
+
+  # Hard cap = max response length. If null, inferred from response_mask.shape[-1].
+  overlong_max_len: null
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8

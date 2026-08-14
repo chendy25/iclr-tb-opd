@@ -87,6 +87,27 @@ class DistillationLossConfig(BaseConfig):
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2
 
+    # ---- DAPO-style soft overlong punishment (advantage shaping) ----
+    # In reward-free OPD (use_task_rewards=False) there is no reward channel, so the
+    # length penalty is applied directly to the token-level advantage in the policy
+    # gradient path (see verl/trainer/distillation/losses.py), analogous to rep_penalty.
+    # The penalty is a function of the *effective* (post-mask) response length: with
+    # mask_after_answer on, post-answer refrain is already zeroed, so this term guards
+    # the remaining length (pre-answer bloat / no-answer ramble) rather than double-
+    # charging a correct prefix for refrain the mask already dropped.
+    # penalty(L) = clamp((L - (max_len - buffer)) / buffer, 0, 1) * factor, subtracted
+    # per (unmasked) token, so overlong sequences get a uniform negative advantage.
+    overlong_enable: bool = False
+    # Length (in response tokens) of the soft ramp before the hard cap.
+    overlong_buffer_len: int = 4096
+    # Peak penalty magnitude at/above the cap. DAPO uses 1.0; OPD advantages are ~O(0.1),
+    # so a smaller value (e.g. 0.5) is usually a safer first try.
+    overlong_penalty_factor: float = 1.0
+    # Hard cap = max response length. If None, inferred from response_mask.shape[-1]
+    # (padded response length of the micro-batch); set explicitly to the configured
+    # max_response_length to keep the threshold batch-independent.
+    overlong_max_len: Optional[int] = None
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch

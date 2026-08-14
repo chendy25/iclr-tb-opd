@@ -292,6 +292,24 @@ def distillation_loss(
                 distillation_metrics["distillation/rep_penalty_mean"] = (
                     rep_penalty[pen_mask].mean().item() if pen_mask.any() else 0.0
                 )
+        # DAPO-style soft overlong punishment on the *effective* (post-mask) response
+        # length: subtract a per-sequence non-negative penalty (broadcast over tokens)
+        # from the advantage so overlong sequences are pushed down. With mask_after_answer
+        # on, post-answer refrain is already masked out of response_mask, so eff_len here
+        # measures the length that is NOT post-answer refrain (pre-answer bloat / ramble).
+        if getattr(loss_config, "overlong_enable", False):
+            max_len = loss_config.overlong_max_len or response_mask.shape[-1]
+            buffer_len = max(int(loss_config.overlong_buffer_len), 1)
+            expected_len = max_len - buffer_len
+            eff_len = response_mask.sum(dim=-1).to(advantages.dtype)  # (bsz,)
+            over = ((eff_len - expected_len).clamp(min=0.0) / buffer_len).clamp(max=1.0)
+            overlong_pen = over * float(loss_config.overlong_penalty_factor)  # (bsz,) >= 0
+            advantages = advantages - overlong_pen.unsqueeze(-1)
+            over_mask = over > 0
+            distillation_metrics["distillation/overlong_seq_frac"] = over_mask.float().mean().item()
+            distillation_metrics["distillation/overlong_pen_mean"] = (
+                overlong_pen[over_mask].mean().item() if over_mask.any() else 0.0
+            )
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,

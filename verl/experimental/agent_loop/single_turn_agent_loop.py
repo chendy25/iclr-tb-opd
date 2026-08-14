@@ -137,7 +137,12 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # the first complete final answer. Generation is unchanged; only the mask
         # (and therefore the distillation / policy-gradient loss) is affected.
         if getattr(self.rollout_config, "mask_after_answer", False) and response_mask:
-            keep = keep_len_after_final_answer(self.tokenizer, response_ids)
+            keep = keep_len_after_final_answer(
+                self.tokenizer,
+                response_ids,
+                eos_id=self.tokenizer.eos_token_id,
+                post_answer_cap=int(getattr(self.rollout_config, "mask_after_answer_post_cap", 512)),
+            )
             if keep is not None and 0 < keep < len(response_mask):
                 response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
 

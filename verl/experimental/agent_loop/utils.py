@@ -62,7 +62,12 @@ def _first_answer_end_char(text: str) -> Optional[int]:
     return min(ends)
 
 
-def keep_len_after_final_answer(tokenizer, response_ids: list[int]) -> Optional[int]:
+def keep_len_after_final_answer(
+    tokenizer,
+    response_ids: list[int],
+    eos_id: Optional[int] = None,
+    post_answer_cap: int = 512,
+) -> Optional[int]:
     """Number of leading response tokens to keep so the loss ignores post-answer text.
 
     Decodes ``response_ids`` and locates the first complete final answer
@@ -70,6 +75,16 @@ def keep_len_after_final_answer(tokenizer, response_ids: list[int]) -> Optional[
     ``k`` whose decoded prefix already contains that answer, so callers can zero
     the response mask beyond ``k`` and drop trailing repetition. Returns ``None``
     when no complete answer is found (leave the mask untouched).
+
+    EOS retention: if the model stopped *promptly* after answering -- i.e. an
+    ``eos_id`` appears within ``post_answer_cap`` tokens of the answer end -- the
+    kept region is extended through that EOS so the "answer then stop" signal
+    (including the terminal EOS) stays in the loss and the model keeps learning to
+    stop. When the model instead ran on into a long refrain (no EOS within the
+    cap, e.g. it hit ``max_response_length``), the kept region stays at the answer
+    end so only the pre-answer + answer tokens contribute and the refrain is
+    dropped. This fixes the earlier behavior where the answer-tail EOS was always
+    masked out (which removed the stop signal entirely).
     """
     if not response_ids:
         return None
@@ -86,7 +101,14 @@ def keep_len_after_final_answer(tokenizer, response_ids: list[int]) -> Optional[
             hi = mid
         else:
             lo = mid + 1
-    return lo
+    keep = lo
+    # Extend through a prompt-close EOS so the terminal stop stays in the loss.
+    if eos_id is not None:
+        limit = min(len(response_ids), keep + max(int(post_answer_cap), 0))
+        for i in range(keep, limit):
+            if response_ids[i] == eos_id:
+                return i + 1
+    return keep
 
 
 def _mark_ngram_runs(

@@ -60,6 +60,12 @@ class MultiTurnConfig(BaseConfig):
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
     num_repeat_rollouts: Optional[int] = None
+    # Wall-clock cap (seconds) on a single multi-turn trajectory. When set (>0),
+    # ToolAgentLoop stops the generate->tool state machine once the deadline is
+    # hit and finalizes whatever tokens were produced so far, so one slow/hung
+    # tool trajectory cannot stall the whole synchronous rollout batch. None/<=0
+    # disables it. Mirrors the ClawGym remote-agent ``session_timeout``.
+    trajectory_timeout: Optional[float] = None
 
 
 @dataclass
@@ -171,6 +177,12 @@ class RolloutConfig(BaseConfig):
     # (``\boxed{...}`` or an ``Answer:`` line) so post-answer repetition does not
     # contribute to the loss. Only affects the loss mask; generation is unchanged.
     mask_after_answer: bool = False
+
+    # When mask_after_answer is on, if a terminal EOS appears within this many tokens
+    # of the answer end, extend the kept region through that EOS so the "answer then
+    # stop" signal (incl. the terminal EOS) stays in the loss. A long refrain (no EOS
+    # within the cap, e.g. hit max_response_length) keeps only up to the answer end.
+    mask_after_answer_post_cap: int = 512
 
     # Advantage-shaping repetition penalty. When enabled, degenerate repetition
     # (consecutive n-gram runs / line stutter) is detected on the rollout token ids

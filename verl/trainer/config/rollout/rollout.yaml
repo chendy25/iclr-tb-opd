@@ -135,6 +135,10 @@ repetition_penalty: 1.0
 # Only affects the loss mask; generation is unchanged. See single_turn_agent_loop.
 mask_after_answer: False
 
+# When mask_after_answer is on, keep the answer-tail through a prompt-close EOS if it
+# occurs within this many tokens of the answer end (preserves the stop signal).
+mask_after_answer_post_cap: 512
+
 # Advantage-shaping repetition penalty. Detects degenerate repetition (consecutive
 # n-gram runs / line stutter) on rollout token ids and subtracts a per-token penalty
 # from the token-level distillation advantage (see trainer/distillation/losses.py).
