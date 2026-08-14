@@ -17,7 +17,11 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
-from verl.experimental.agent_loop.utils import compute_repetition_penalty, keep_len_after_final_answer
+from verl.experimental.agent_loop.utils import (
+    _first_answer_end_char,
+    compute_repetition_penalty,
+    keep_len_after_final_answer,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -59,6 +63,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
         penalty = compute_repetition_penalty(
             response_ids,
             ngram_ns=tuple(getattr(cfg, "rep_penalty_ngram_ns", (1, 3, 5, 8))),
+            ngram_max_period=int(getattr(cfg, "rep_penalty_ngram_max", 64)),
             min_repeat=int(getattr(cfg, "rep_penalty_min_repeat", 8)),
             min_line_repeat=int(getattr(cfg, "rep_penalty_min_line_repeat", 20)),
             newline_ids=newline_ids,
@@ -133,10 +138,22 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
 
+        # Drop unambiguously degenerate rollouts from the loss entirely: a sequence
+        # that hit ``max_response_length`` (no terminal EOS) *and* never produced a
+        # complete final answer (no ``\boxed{}`` / ``Answer:``) is a no-answer refrain
+        # / wall-hit (already scored -1). Zero its whole response mask so it does not
+        # pollute the token-mean gradient. Generation is unchanged.
+        if getattr(self.rollout_config, "mask_truncated_no_answer", False) and response_mask:
+            eos_id = self.tokenizer.eos_token_id
+            hit_cap = len(output.token_ids) >= self.response_length
+            no_eos = eos_id is None or not response_ids or response_ids[-1] != eos_id
+            if hit_cap and no_eos and _first_answer_end_char(self.tokenizer.decode(response_ids)) is None:
+                response_mask = [0] * len(response_mask)
+
         # Drop post-answer repetition from the loss: zero the response mask beyond
         # the first complete final answer. Generation is unchanged; only the mask
         # (and therefore the distillation / policy-gradient loss) is affected.
-        if getattr(self.rollout_config, "mask_after_answer", False) and response_mask:
+        if getattr(self.rollout_config, "mask_after_answer", False) and response_mask and any(response_mask):
             keep = keep_len_after_final_answer(
                 self.tokenizer,
                 response_ids,

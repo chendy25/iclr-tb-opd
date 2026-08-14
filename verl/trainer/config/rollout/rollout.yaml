@@ -139,12 +139,19 @@ mask_after_answer: False
 # occurs within this many tokens of the answer end (preserves the stop signal).
 mask_after_answer_post_cap: 512
 
+# Drop unambiguously degenerate rollouts from the loss entirely: a sequence that hit
+# max_response_length (no terminal EOS) *and* has no complete final answer
+# (\boxed{}/Answer:) has its whole response mask zeroed. Only affects the loss mask.
+mask_truncated_no_answer: False
+
 # Advantage-shaping repetition penalty. Detects degenerate repetition (consecutive
 # n-gram runs / line stutter) on rollout token ids and subtracts a per-token penalty
 # from the token-level distillation advantage (see trainer/distillation/losses.py).
 # Generation is unchanged; only the training signal is shaped.
 rep_penalty_enable: False
 rep_penalty_ngram_ns: [1, 3, 5, 8]
+# Densely scan periods 1..ngram_max so sentence-length refrains are caught.
+rep_penalty_ngram_max: 64
 rep_penalty_min_repeat: 8
 rep_penalty_line_enable: True
 rep_penalty_min_line_repeat: 20

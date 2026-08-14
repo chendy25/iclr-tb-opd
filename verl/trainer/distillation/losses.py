@@ -277,6 +277,10 @@ def distillation_loss(
         # repetition spans get a negative advantage (a gradient "wall" at the entry
         # token) instead of being reinforced.
         advantages = -distillation_losses.detach()
+        # Fraction of sequences fully dropped from the loss (all-zero response mask),
+        # e.g. by mask_truncated_no_answer (no-answer wall-hits). Monitors method D.
+        dropped_seq = response_mask.bool().sum(dim=-1) == 0
+        distillation_metrics["distillation/dropped_seq_frac"] = dropped_seq.float().mean().item()
         rep_penalty = data.get("rep_penalty", None)
         if rep_penalty is not None:
             if rep_penalty.is_nested:

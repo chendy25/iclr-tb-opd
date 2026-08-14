@@ -184,6 +184,12 @@ class RolloutConfig(BaseConfig):
     # within the cap, e.g. hit max_response_length) keeps only up to the answer end.
     mask_after_answer_post_cap: int = 512
 
+    # Drop unambiguously degenerate rollouts from the loss entirely: a sequence that
+    # hit max_response_length (no terminal EOS) *and* has no complete final answer
+    # (\boxed{}/Answer:) is a no-answer wall-hit; its whole response mask is zeroed so
+    # it contributes nothing to the token-mean gradient. Only affects the loss mask.
+    mask_truncated_no_answer: bool = False
+
     # Advantage-shaping repetition penalty. When enabled, degenerate repetition
     # (consecutive n-gram runs / line stutter) is detected on the rollout token ids
     # and a per-token penalty is subtracted from the token-level distillation
@@ -191,6 +197,9 @@ class RolloutConfig(BaseConfig):
     rep_penalty_enable: bool = False
     # Consecutive n-gram periods to scan and the min back-to-back repeats to flag.
     rep_penalty_ngram_ns: list = field(default_factory=lambda: [1, 3, 5, 8])
+    # Densely scan periods 1..ngram_max (not just ngram_ns) so sentence-length refrains
+    # (~9-token units that a sparse set misses) are caught.
+    rep_penalty_ngram_max: int = 64
     rep_penalty_min_repeat: int = 8
     # Newline-delimited line stutter (min identical consecutive lines). 0 disables.
     rep_penalty_min_line_repeat: int = 20

@@ -212,6 +212,7 @@ def compute_repetition_penalty(
     response_ids: list[int],
     *,
     ngram_ns: tuple[int, ...] = (1, 3, 5, 8),
+    ngram_max_period: int = 64,
     min_repeat: int = 8,
     min_line_repeat: int = 20,
     newline_ids: Optional[set[int]] = None,
@@ -235,16 +236,24 @@ def compute_repetition_penalty(
     (aligned equations, a couple of ``$$``) is left untouched. The terminal EOS/stop
     token is never penalized so the model keeps learning to stop.
 
+    Periods are scanned *densely* from 1 up to ``ngram_max_period`` (not a sparse set)
+    so sentence-length refrains such as ``"Let's compute the value:\\n\\n"`` -- observed
+    as ~9-token units that a sparse ``(1,3,5,8)`` set misses entirely -- are caught.
+    ``min_repeat`` back-to-back copies keeps the bar high enough that ordinary math is
+    untouched (e.g. a 9-token block must repeat 8x = 72 tokens to trigger).
+
     Returns ``None`` when nothing is flagged (caller may skip attaching the tensor).
     """
     t = len(response_ids)
     if t == 0:
         return None
     covered = [0.0] * t
+    max_p = max(int(ngram_max_period), (max(ngram_ns) if ngram_ns else 1))
+    periods = tuple(range(1, max_p + 1))
     _mark_ngram_runs(
         response_ids,
         covered,
-        ngram_ns=tuple(ngram_ns),
+        ngram_ns=periods,
         min_repeat=min_repeat,
         lambda_body=lambda_body,
         lambda_entry=lambda_entry,
