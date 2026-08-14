@@ -114,9 +114,19 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    # A micro-batch may be fully masked (e.g. every sequence dropped by
+    # mask_truncated_no_answer), leaving an empty selection. min()/max() over an
+    # empty tensor raises, so fall back to aggregation-neutral sentinels (+inf for
+    # MIN, -inf for MAX); any non-empty micro-batch in the global batch dominates.
+    if distillation_losses_response.numel() == 0:
+        loss_min = distillation_losses.new_tensor(float("inf"))
+        loss_max = distillation_losses.new_tensor(float("-inf"))
+    else:
+        loss_min = distillation_losses_response.min()
+        loss_max = distillation_losses_response.max()
     return {
-        "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
-        "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
+        "distillation/loss_min": Metric(AggregationType.MIN, loss_min),
+        "distillation/loss_max": Metric(AggregationType.MAX, loss_max),
     }
 
 
@@ -435,8 +445,13 @@ def compute_distillation_loss_reverse_kl_estimator(
     distillation_losses = kl_penalty(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
-    # Since k1 can be negative, log the mean absolute loss.
+    # Since k1 can be negative, log the mean absolute loss. Guard the empty case
+    # (a fully-masked micro-batch, e.g. all sequences dropped) so .mean() is not NaN.
+    _abs_sel = distillation_losses[response_mask_bool].abs()
     metrics = {
-        "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+        "distillation/abs_loss": Metric(
+            AggregationType.MEAN,
+            _abs_sel.mean() if _abs_sel.numel() > 0 else distillation_losses.new_tensor(0.0),
+        ),
     }
     return distillation_losses, metrics
