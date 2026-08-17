@@ -1261,16 +1261,25 @@ class AgentLoopWorker:
         )
         await self._compute_score([output], kwargs=kwargs)
 
-        # Learn-EOS supervision mask: 1 at the supervised EOS position (see
-        # single_turn_agent_loop.run). Optionally gate on correctness so we only teach
-        # "stop after a *correct* answer" -- reward_score is available now that
-        # _compute_score has run. Padded/aligned exactly like rep_penalty.
+        # Learn-EOS supervision mask: 1 at the supervised (injected) EOS position (see
+        # single_turn_agent_loop._apply_learn_eos). Optionally gate on correctness so we
+        # only teach "stop after a *correct* answer". Crucially the correctness must be
+        # judged at the INJECTION point (the FIRST box) rather than the full-response
+        # reward_score (which scores the LAST box): a rollout can be right-then-wrong
+        # (correct first box, later wrong box -> last-box reward says wrong) or
+        # wrong-then-right, and gating on the last-box reward would either drop a valid
+        # stop signal or teach stopping at a wrong first answer. Padded like rep_penalty.
         eos_sft_mask = None
         if output.eos_sft_mask is not None:
             mask_vals = list(output.eos_sft_mask)
             require_correct = getattr(self.rollout_config, "learn_eos_require_correct", True)
-            if require_correct and not (output.reward_score is not None and output.reward_score > 0):
-                mask_vals = [0.0] * len(mask_vals)
+            inj_positions = [i for i, v in enumerate(mask_vals) if v > 0]
+            if require_correct and inj_positions:
+                # Re-score the prefix up to the first box; leave wrong first boxes free to
+                # self-correct (do not lock them in) by dropping their supervision.
+                first_box_correct = await self._score_first_box_correct(output, inj_positions[0], kwargs)
+                if not first_box_correct:
+                    mask_vals = [0.0] * len(mask_vals)
             pad_size = self.rollout_config.response_length - len(mask_vals)
             eos_sft_mask = torch.tensor(mask_vals + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
 
@@ -1460,6 +1469,28 @@ class AgentLoopWorker:
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
+
+    async def _score_first_box_correct(self, output: AgentLoopOutput, keep: int, kwargs: dict) -> bool:
+        """Reward-verify the response prefix up to the first answer (the learn-EOS
+        injection point) so correctness is judged where we teach the model to stop --
+        not on the full-response reward, which scores the LAST box. ``keep`` is the index
+        of the injected EOS, so ``response_ids[:keep]`` is exactly ``pre-answer + first
+        box``. Returns True iff that prefix verifies as correct. Falls back to the
+        full-response reward when the async reward path is unavailable.
+        """
+        if self.reward_loop_worker_handles is None or keep <= 0 or keep >= len(output.response_ids):
+            return output.reward_score is not None and output.reward_score > 0
+        prefix = output.model_copy(
+            update={
+                "response_ids": list(output.response_ids[:keep]),
+                "reward_score": None,
+                # Fresh dict so scoring the prefix does not clobber the full response's
+                # reward_extra_info on the shared extra_fields object.
+                "extra_fields": dict(output.extra_fields),
+            }
+        )
+        await self._compute_score([prefix], kwargs=kwargs)
+        return prefix.reward_score is not None and prefix.reward_score > 0
 
     async def _compute_teacher_logprobs(
         self,
