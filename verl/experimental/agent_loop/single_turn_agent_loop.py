@@ -85,19 +85,31 @@ class SingleTurnAgentLoop(AgentLoopBase):
         response_ids: list[int],
         response_mask: list[int],
         response_logprobs: list[float] | None,
-    ) -> tuple[list[int], list[int], list[float] | None, list[float] | None]:
-        """Truncate past the first answer and teach the model to stop with an EOS.
+    ) -> tuple[list[int], list[int], list[float] | None, list[float]]:
+        """Keep the FULL generation; mask the post-answer refrain out of the main loss
+        and teach the model to stop with an EOS after the first answer.
 
-        Locates the first complete final answer (``\\boxed{}`` / ``Answer:``) and keeps
-        only the pre-answer + answer tokens (like ``mask_after_answer``). If the model
-        did *not* already stop on its own EOS there, a single EOS token is appended and
-        marked in ``eos_sft_mask`` so the loss adds a small auxiliary cross-entropy
-        teaching "emit EOS after the answer". The appended EOS is excluded from the main
-        OPD/PG response mask (mask entry ``0``); its only training signal is that aux CE.
-        Returns ``(response_ids, response_mask, response_logprobs, eos_sft_mask)`` with
-        ``eos_sft_mask=None`` when nothing was appended (no answer, or the model already
-        stopped, or no room before the length cap).
+        Unlike the previous behavior this does **not** truncate ``response_ids`` -- the
+        entire rollout is preserved for scoring, logging and length metrics so any
+        post-answer repetition stays visible. It only:
+
+        1. Locates the first complete final answer (``\\boxed{}`` / ``Answer:``) and zeros
+           ``response_mask`` beyond it (same as ``mask_after_answer``; a promptly-emitted
+           EOS is folded into ``keep`` so the "answer then stop" signal stays in-loss).
+        2. When the model did *not* stop on its own there (it ran into a post-answer
+           refrain), overwrites the single first post-answer token with an EOS and marks
+           it in ``eos_sft_mask`` so the loss adds a small auxiliary cross-entropy
+           teaching ``p(EOS | pre-answer + answer)``. That position is already masked out
+           of the main OPD/PG loss, so the injected EOS is that token's only signal, its
+           context is exactly ``[pre-answer + answer]``, and the sequence length (hence
+           the visible refrain) is unchanged.
+
+        Returns ``(response_ids, response_mask, response_logprobs, eos_sft_mask)`` where
+        ``eos_sft_mask`` is always a full-length vector (all zeros unless an EOS was
+        injected) so the batch column stays uniform and observable.
         """
+        n = len(response_ids)
+        eos_sft_mask = [0.0] * n
         eos_id = self.tokenizer.eos_token_id
         keep = keep_len_after_final_answer(
             self.tokenizer,
@@ -105,22 +117,21 @@ class SingleTurnAgentLoop(AgentLoopBase):
             eos_id=eos_id,
             post_answer_cap=int(getattr(self.rollout_config, "mask_after_answer_post_cap", 512)),
         )
-        if keep is None or keep <= 0 or keep > len(response_ids):
-            return response_ids, response_mask, response_logprobs, None
-        resp = response_ids[:keep]
-        mask = response_mask[:keep]
-        lp = response_logprobs[:keep] if response_logprobs is not None else None
-        stopped = eos_id is not None and len(resp) > 0 and resp[-1] == eos_id
-        if stopped or eos_id is None or len(resp) >= self.response_length:
-            # Already stopped (EOS kept in the main loss) or no room to append: nothing
-            # extra to teach; just drop the post-answer refrain via truncation.
-            return resp, mask, lp, None
-        resp = resp + [eos_id]
-        mask = mask + [0]  # appended EOS is not part of the main OPD/PG loss
-        if lp is not None:
-            lp = lp + [0.0]
-        eos_sft_mask = [0.0] * (len(resp) - 1) + [1.0]
-        return resp, mask, lp, eos_sft_mask
+        if keep is None or keep <= 0 or keep >= n:
+            # No complete answer, or the answer (incl. a prompt EOS) already spans the
+            # whole response (nothing after to mask/inject). Full generation is kept.
+            return response_ids, response_mask, response_logprobs, eos_sft_mask
+        # Drop the post-answer refrain from the main loss (keep pre-answer + answer).
+        response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
+        stopped = eos_id is not None and response_ids[keep - 1] == eos_id
+        if not stopped and eos_id is not None:
+            # Model ran on instead of stopping: inject a supervised EOS at the first
+            # post-answer position (context == [pre-answer + answer]) and mark it for the
+            # aux CE. Overwrite (not append) so the full length / visible refrain stays.
+            response_ids = list(response_ids)
+            response_ids[keep] = eos_id
+            eos_sft_mask[keep] = 1.0
+        return response_ids, response_mask, response_logprobs, eos_sft_mask
 
     async def _generate_early_stop(
         self,
@@ -280,8 +291,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
             if hit_cap and no_eos and _first_answer_end_char(self.tokenizer.decode(response_ids)) is None:
                 response_mask = [0] * len(response_mask)
 
-        # Learn-EOS: truncate past the first answer and (when the model did not stop on
-        # its own) append a supervised EOS so the loss teaches "answer then stop" in the
+        # Learn-EOS: keep the full generation, mask the post-answer refrain out of the
+        # main loss, and (when the model did not stop on its own) inject a supervised EOS
+        # at the first post-answer token so the loss teaches "answer then stop" in the
         # model itself. Supersedes mask_after_answer (which only masks) when enabled.
         eos_sft_mask: list[float] | None = None
         if getattr(self.rollout_config, "learn_eos_after_answer", False) and response_mask and any(response_mask):

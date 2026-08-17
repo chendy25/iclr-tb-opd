@@ -101,7 +101,7 @@ class AgentLoopOutput(BaseModel):
     rep_penalty: Optional[list[float]] = None
     """Per-token repetition penalty weights (advantage shaping); None if unused."""
     eos_sft_mask: Optional[list[float]] = None
-    """Per-token learn-EOS supervision mask: 1 at the appended EOS position, else 0."""
+    """Per-token learn-EOS supervision mask: 1 at the supervised EOS position, else 0."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -181,7 +181,7 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     rep_penalty: Optional[torch.Tensor] = None
     """Padded per-token repetition penalty weights (advantage shaping)."""
     eos_sft_mask: Optional[torch.Tensor] = None
-    """Padded per-token learn-EOS supervision mask (1 at the appended EOS position)."""
+    """Padded per-token learn-EOS supervision mask (1 at the supervised EOS position)."""
     teacher_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
@@ -1261,7 +1261,7 @@ class AgentLoopWorker:
         )
         await self._compute_score([output], kwargs=kwargs)
 
-        # Learn-EOS supervision mask: 1 at the appended EOS position (see
+        # Learn-EOS supervision mask: 1 at the supervised EOS position (see
         # single_turn_agent_loop.run). Optionally gate on correctness so we only teach
         # "stop after a *correct* answer" -- reward_score is available now that
         # _compute_score has run. Padded/aligned exactly like rep_penalty.
