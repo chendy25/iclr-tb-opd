@@ -287,9 +287,21 @@ def distillation_loss(
         # repetition spans get a negative advantage (a gradient "wall" at the entry
         # token) instead of being reinforced.
         advantages = -distillation_losses.detach()
+        # Penalty scale: repetition / overlong penalties are expressed as *multiples of
+        # the current advantage scale* rather than absolute values. The OPD token
+        # advantage is the raw per-token KL, whose magnitude shrinks ~5-6x over training
+        # as the student approaches the teacher; a fixed absolute penalty would therefore
+        # silently ramp up (from ~1x to ~7x the signal) over a run. Scaling by the batch
+        # mean |advantage| keeps each penalty a constant fraction of the signal. The
+        # advantage itself is left un-normalized so OPD's absolute "-KL as reward"
+        # semantics are preserved (no whitening / de-meaning).
+        valid_mask = response_mask.bool()
+        adv_scale = advantages[valid_mask].abs().mean().detach() if valid_mask.any() else advantages.new_tensor(0.0)
+        adv_scale = adv_scale.clamp(min=1e-6)
+        distillation_metrics["distillation/adv_scale"] = adv_scale.item()
         # Fraction of sequences fully dropped from the loss (all-zero response mask),
         # e.g. by mask_truncated_no_answer (no-answer wall-hits). Monitors method D.
-        dropped_seq = response_mask.bool().sum(dim=-1) == 0
+        dropped_seq = valid_mask.sum(dim=-1) == 0
         distillation_metrics["distillation/dropped_seq_frac"] = dropped_seq.float().mean().item()
         rep_penalty = data.get("rep_penalty", None)
         if rep_penalty is not None:
@@ -297,12 +309,15 @@ def distillation_loss(
                 rep_penalty = rep_penalty.to_padded_tensor(0.0)
             rep_penalty = rep_penalty.to(device=advantages.device, dtype=advantages.dtype)
             if rep_penalty.shape == advantages.shape:
+                # Relative penalty: the per-token weights are multiples of adv_scale.
+                rep_penalty = rep_penalty * adv_scale
                 advantages = advantages - rep_penalty
-                pen_mask = (rep_penalty > 0) & response_mask.bool()
-                num_resp = response_mask.bool().sum().clamp(min=1)
+                pen_mask = (rep_penalty > 0) & valid_mask
+                num_resp = valid_mask.sum().clamp(min=1)
                 distillation_metrics["distillation/rep_penalty_token_frac"] = (
                     pen_mask.sum().float() / num_resp
                 ).item()
+                # Effective (post-scaling) penalty magnitude actually subtracted.
                 distillation_metrics["distillation/rep_penalty_mean"] = (
                     rep_penalty[pen_mask].mean().item() if pen_mask.any() else 0.0
                 )
@@ -311,13 +326,14 @@ def distillation_loss(
         # from the advantage so overlong sequences are pushed down. With mask_after_answer
         # on, post-answer refrain is already masked out of response_mask, so eff_len here
         # measures the length that is NOT post-answer refrain (pre-answer bloat / ramble).
+        # The penalty is likewise scaled by adv_scale (a multiple of the advantage scale).
         if getattr(loss_config, "overlong_enable", False):
             max_len = loss_config.overlong_max_len or response_mask.shape[-1]
             buffer_len = max(int(loss_config.overlong_buffer_len), 1)
             expected_len = max_len - buffer_len
             eff_len = response_mask.sum(dim=-1).to(advantages.dtype)  # (bsz,)
             over = ((eff_len - expected_len).clamp(min=0.0) / buffer_len).clamp(max=1.0)
-            overlong_pen = over * float(loss_config.overlong_penalty_factor)  # (bsz,) >= 0
+            overlong_pen = over * float(loss_config.overlong_penalty_factor) * adv_scale  # (bsz,) >= 0
             advantages = advantages - overlong_pen.unsqueeze(-1)
             over_mask = over > 0
             distillation_metrics["distillation/overlong_seq_frac"] = over_mask.float().mean().item()
@@ -337,7 +353,7 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
 
         # Learn-EOS auxiliary loss: teach the model to emit EOS right after a (correct)
-        # final answer. ``eos_sft_mask`` marks the appended EOS position for each eligible
+        # final answer. ``eos_sft_mask`` marks the supervised EOS position for each eligible
         # rollout (produced + correctness-gated in the agent loop). Add a small CE
         # ``learn_eos_coef * mean(-log p_student(EOS))`` over those positions -- a
         # per-sequence-scale term independent of loss_agg_mode. The EOS positions are
