@@ -353,11 +353,23 @@ def distillation_loss(
         distillation_metrics.update(pg_metrics)
 
         # Learn-EOS auxiliary loss: teach the model to emit EOS right after a (correct)
-        # final answer. ``eos_sft_mask`` marks the supervised EOS position for each eligible
-        # rollout (produced + correctness-gated in the agent loop). Add a small CE
-        # ``learn_eos_coef * mean(-log p_student(EOS))`` over those positions -- a
-        # per-sequence-scale term independent of loss_agg_mode. The EOS positions are
-        # already excluded from ``response_mask`` above, so this is their only signal.
+        # final answer. ``eos_sft_mask`` marks the supervised EOS position for each
+        # eligible rollout (produced + correctness-gated in the agent loop). The EOS
+        # positions are already excluded from ``response_mask`` above, so this CE is
+        # their only signal.
+        #
+        # Normalization: mirror the main token-mean loss (see agg_loss) -- normalize the
+        # SUM of the per-EOS NLL by the GLOBAL batch size (number of sequences) and
+        # compensate FSDP grad-averaging with ``* dp_size``. Two reasons this matters:
+        #   1. A plain local ``.mean()`` over the micro-batch EOS count divides by a tiny
+        #      number (~1-2 positions), giving each EOS ~100x a normal token's gradient
+        #      weight, so a handful of EOS positions dominated the (grad-clipped) update
+        #      and starved the OPD objective early in training.
+        #   2. That local mean also drifts with the (dynamic) micro-batch count and dp
+        #      size, so ``learn_eos_coef`` was not a stable knob.
+        # With this global normalization the effective term is ``seq_frac * mean_NLL``:
+        # it auto-scales with how many rollouts actually need the stop signal and cannot
+        # be dominated by a few positions.
         learn_eos_coef = float(getattr(loss_config, "learn_eos_coef", 0.0) or 0.0)
         eos_sft_mask = data.get("eos_sft_mask", None)
         if learn_eos_coef > 0.0 and eos_sft_mask is not None:
@@ -368,9 +380,15 @@ def distillation_loss(
                 eos_bool = eos_sft_mask > 0
                 num_eos = eos_bool.sum()
                 if num_eos > 0:
-                    eos_ce = -(log_prob[eos_bool]).mean()
-                    distillation_loss = distillation_loss + learn_eos_coef * eos_ce
-                    distillation_metrics["distillation/learn_eos_ce"] = eos_ce.detach().item()
+                    eos_nll = -log_prob[eos_bool]  # per-EOS negative log-likelihood
+                    gbs = config.global_batch_info.get("global_batch_size") or log_prob.shape[0]
+                    dp = config.global_batch_info.get("dp_size") or 1
+                    eos_term = eos_nll.sum() / gbs * dp
+                    distillation_loss = distillation_loss + learn_eos_coef * eos_term
+                    # raw per-EOS mean NLL (diagnostic: -> 0 as the model learns to stop)
+                    distillation_metrics["distillation/learn_eos_ce"] = eos_nll.mean().detach().item()
+                    # normalized term actually added (pre-coef); comparable to distillation/loss
+                    distillation_metrics["distillation/learn_eos_term"] = eos_term.detach().item()
                     distillation_metrics["distillation/learn_eos_seq_frac"] = (
                         num_eos.float() / log_prob.shape[0]
                     ).item()
