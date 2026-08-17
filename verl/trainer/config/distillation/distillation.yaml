@@ -67,6 +67,10 @@ distillation_loss:
   # Hard cap = max response length. If null, inferred from response_mask.shape[-1].
   overlong_max_len: null
 
+  # Weight of the auxiliary "emit EOS after the answer" cross-entropy. Active only when
+  # the rollout emits an eos_sft_mask (rollout.learn_eos_after_answer). 0.0 disables.
+  learn_eos_coef: 0.0
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8

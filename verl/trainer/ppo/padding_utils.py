@@ -116,6 +116,8 @@ def construct_minimal_padding_template(
     # otherwise the cloned full-length tensor mismatches the 1-token padding sample.
     if "rep_penalty" in template_sample:
         template_sample["rep_penalty"] = torch.zeros_like(response_mask, dtype=torch.float32)
+    if "eos_sft_mask" in template_sample:
+        template_sample["eos_sft_mask"] = torch.zeros_like(response_mask, dtype=torch.float32)
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

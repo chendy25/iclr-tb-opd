@@ -335,6 +335,31 @@ def distillation_loss(
         )
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
+
+        # Learn-EOS auxiliary loss: teach the model to emit EOS right after a (correct)
+        # final answer. ``eos_sft_mask`` marks the appended EOS position for each eligible
+        # rollout (produced + correctness-gated in the agent loop). Add a small CE
+        # ``learn_eos_coef * mean(-log p_student(EOS))`` over those positions -- a
+        # per-sequence-scale term independent of loss_agg_mode. The EOS positions are
+        # already excluded from ``response_mask`` above, so this is their only signal.
+        learn_eos_coef = float(getattr(loss_config, "learn_eos_coef", 0.0) or 0.0)
+        eos_sft_mask = data.get("eos_sft_mask", None)
+        if learn_eos_coef > 0.0 and eos_sft_mask is not None:
+            if eos_sft_mask.is_nested:
+                eos_sft_mask = eos_sft_mask.to_padded_tensor(0.0)
+            eos_sft_mask = eos_sft_mask.to(device=log_prob.device, dtype=log_prob.dtype)
+            if eos_sft_mask.shape == log_prob.shape:
+                eos_bool = eos_sft_mask > 0
+                num_eos = eos_bool.sum()
+                if num_eos > 0:
+                    eos_ce = -(log_prob[eos_bool]).mean()
+                    distillation_loss = distillation_loss + learn_eos_coef * eos_ce
+                    distillation_metrics["distillation/learn_eos_ce"] = eos_ce.detach().item()
+                    distillation_metrics["distillation/learn_eos_seq_frac"] = (
+                        num_eos.float() / log_prob.shape[0]
+                    ).item()
+                else:
+                    distillation_metrics["distillation/learn_eos_seq_frac"] = 0.0
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:

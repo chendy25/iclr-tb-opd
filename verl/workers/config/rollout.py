@@ -190,6 +190,20 @@ class RolloutConfig(BaseConfig):
     # it contributes nothing to the token-mean gradient. Only affects the loss mask.
     mask_truncated_no_answer: bool = False
 
+    # Learn to stop *in the model* (instead of external generation early-stop): when a
+    # rollout produces a complete final answer (\boxed{}/Answer:) but did not itself
+    # emit a terminal EOS, truncate the response just past the answer, append a single
+    # EOS token, and mark that position so the loss adds a small auxiliary cross-entropy
+    # teaching "emit EOS after the answer" (see distillation.distillation_loss.learn_eos_coef).
+    # The appended EOS is excluded from the main OPD/PG response mask (its only signal is
+    # the aux CE). Requires mask_after_answer-style truncation; supersedes mask_after_answer
+    # when both are set. Generation is unchanged (unlike early_stop_after_answer).
+    learn_eos_after_answer: bool = False
+    # Only inject/supervise the EOS on correct rollouts (reward_score > 0). This teaches
+    # "stop once you have a *good* boxed answer" without teaching the model to prematurely
+    # commit to a wrong/uncertain answer (which would hurt hard competition problems).
+    learn_eos_require_correct: bool = True
+
     # Generation early-stop: generate in chunks and stop once a complete final answer
     # (\boxed{}/Answer:) appears, truncating the response right after it. Kills the
     # post-answer refrain at the *generation* level (not just the loss mask), so the

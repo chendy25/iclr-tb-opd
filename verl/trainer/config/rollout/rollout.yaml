@@ -144,6 +144,14 @@ mask_after_answer_post_cap: 512
 # (\boxed{}/Answer:) has its whole response mask zeroed. Only affects the loss mask.
 mask_truncated_no_answer: False
 
+# Learn to stop in the model: when a rollout answers (\boxed{}/Answer:) but did not emit
+# a terminal EOS, truncate past the answer, append one EOS, and mark it for an auxiliary
+# cross-entropy loss (distillation.distillation_loss.learn_eos_coef) teaching "EOS after
+# answer". Supersedes mask_after_answer when both set. Generation is unchanged.
+learn_eos_after_answer: False
+# Only inject/supervise EOS on correct rollouts (reward_score > 0).
+learn_eos_require_correct: True
+
 # Generation early-stop: generate in chunks and stop once a complete \boxed{}/Answer:
 # appears, truncating right after it (kills post-answer refrain at generation time).
 # single_turn_agent_loop only. Chunk size and kept tail are configurable.

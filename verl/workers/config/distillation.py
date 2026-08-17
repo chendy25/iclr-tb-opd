@@ -108,6 +108,16 @@ class DistillationLossConfig(BaseConfig):
     # max_response_length to keep the threshold batch-independent.
     overlong_max_len: Optional[int] = None
 
+    # ---- Learn-EOS auxiliary loss ----
+    # Weight (lambda) of the auxiliary cross-entropy that teaches the model to emit EOS
+    # right after a final answer. Active only when the rollout produced an ``eos_sft_mask``
+    # (see rollout.learn_eos_after_answer): for the marked EOS position(s) we add
+    # ``learn_eos_coef * (-log p_student(EOS | prefix))`` to the loss. The mask is already
+    # correctness-gated at rollout time (learn_eos_require_correct), so this only fires on
+    # the EOS token, never on the reasoning tokens. 0.0 disables. OPD token advantages are
+    # ~O(0.1); a small value (e.g. 0.1-0.5) keeps the stop signal from dominating.
+    learn_eos_coef: float = 0.0
+
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
     # batch_num_tokens: number of valid tokens in global batch

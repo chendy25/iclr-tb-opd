@@ -100,6 +100,8 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     rep_penalty: Optional[list[float]] = None
     """Per-token repetition penalty weights (advantage shaping); None if unused."""
+    eos_sft_mask: Optional[list[float]] = None
+    """Per-token learn-EOS supervision mask: 1 at the appended EOS position, else 0."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -130,6 +132,10 @@ class AgentLoopOutput(BaseModel):
         rep_penalty = output.pop("rep_penalty", None)
         if rep_penalty is not None:
             output["rep_penalty"] = torch.tensor(rep_penalty, dtype=torch.float32)
+
+        eos_sft_mask = output.pop("eos_sft_mask", None)
+        if eos_sft_mask is not None:
+            output["eos_sft_mask"] = torch.tensor(eos_sft_mask, dtype=torch.float32)
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
@@ -174,6 +180,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities for the response tokens."""
     rep_penalty: Optional[torch.Tensor] = None
     """Padded per-token repetition penalty weights (advantage shaping)."""
+    eos_sft_mask: Optional[torch.Tensor] = None
+    """Padded per-token learn-EOS supervision mask (1 at the appended EOS position)."""
     teacher_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
@@ -1252,6 +1260,20 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
+
+        # Learn-EOS supervision mask: 1 at the appended EOS position (see
+        # single_turn_agent_loop.run). Optionally gate on correctness so we only teach
+        # "stop after a *correct* answer" -- reward_score is available now that
+        # _compute_score has run. Padded/aligned exactly like rep_penalty.
+        eos_sft_mask = None
+        if output.eos_sft_mask is not None:
+            mask_vals = list(output.eos_sft_mask)
+            require_correct = getattr(self.rollout_config, "learn_eos_require_correct", True)
+            if require_correct and not (output.reward_score is not None and output.reward_score > 0):
+                mask_vals = [0.0] * len(mask_vals)
+            pad_size = self.rollout_config.response_length - len(mask_vals)
+            eos_sft_mask = torch.tensor(mask_vals + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -1286,6 +1308,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             rep_penalty=rep_penalty,
+            eos_sft_mask=eos_sft_mask,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -1488,6 +1511,14 @@ class AgentLoopWorker:
                 for input in inputs
             ]
             optional_outputs["rep_penalty"] = torch.cat(rep_parts, dim=0)
+        if any(input.eos_sft_mask is not None for input in inputs):
+            # Fill zeros for samples without an EOS-supervision position so cat stays uniform.
+            resp_len = self.rollout_config.response_length
+            eos_parts = [
+                input.eos_sft_mask if input.eos_sft_mask is not None else torch.zeros(1, resp_len, dtype=torch.float32)
+                for input in inputs
+            ]
+            optional_outputs["eos_sft_mask"] = torch.cat(eos_parts, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
