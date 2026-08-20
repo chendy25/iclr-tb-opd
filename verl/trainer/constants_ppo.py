@@ -132,6 +132,8 @@ def get_ppo_ray_runtime_env(config=None):
         "SWANLAB_API_KEY",
         "SWANLAB_MODE",
         "SWANLAB_LOG_DIR",
+        "SWANLAB_RESUME",
+        "SWANLAB_RUN_ID",
         "MODELING_BACKEND",
     ):
         if os.environ.get(key) is not None:

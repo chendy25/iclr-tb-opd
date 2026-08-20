@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    last_tokens_and_stop_reasons,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
@@ -542,6 +543,19 @@ class RayPPOTrainer:
                 if key.startswith("tb_opd_"):
                     v = batch.non_tensor_batch[key]
                     reward_extra_infos_to_dump.setdefault(key, v.tolist() if hasattr(v, "tolist") else list(v))
+
+            if "response_mask" in batch.batch:
+                resp_len = batch.batch["response_mask"].sum(-1)
+            else:
+                resp_len = torch.full(
+                    (batch.batch["responses"].size(0),),
+                    batch.batch["responses"].size(1),
+                    dtype=torch.long,
+                    device=batch.batch["responses"].device,
+                )
+            last_token_ids, stop_reasons = last_tokens_and_stop_reasons(batch.batch["responses"], resp_len)
+            reward_extra_infos_to_dump["last_token_id"] = last_token_ids
+            reward_extra_infos_to_dump["stop_reason"] = stop_reasons
 
             self._dump_generations(
                 inputs=inputs,

@@ -140,13 +140,23 @@ class Tracking:
 
             if config is None:
                 config = {}  # make sure config is not None, otherwise **config will raise error
-            swanlab.init(
+            # Resume an existing SwanLab run when SWANLAB_RUN_ID / SWANLAB_RESUME
+            # are set, so interrupted training appends to the same chart instead
+            # of opening a new experiment. 0.7.5 accepts both kwargs.
+            swanlab_init_kwargs = dict(
                 project=project_name,
                 experiment_name=experiment_name,
                 config={"FRAMEWORK": "verl", **config},
                 logdir=SWANLAB_LOG_DIR,
                 mode=SWANLAB_MODE,
             )
+            swanlab_run_id = os.environ.get("SWANLAB_RUN_ID")
+            swanlab_resume = os.environ.get("SWANLAB_RESUME")
+            if swanlab_run_id:
+                swanlab_init_kwargs["id"] = swanlab_run_id
+            if swanlab_resume:
+                swanlab_init_kwargs["resume"] = swanlab_resume
+            swanlab.init(**swanlab_init_kwargs)
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:

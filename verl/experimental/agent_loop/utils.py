@@ -21,27 +21,117 @@ from typing import Any, Optional
 # cut at the end of that line.
 _ANSWER_LINE_RE = re.compile(r"(?im)^[ \t]*Answer[ \t]*:[ \t]*\S[^\n]*")
 
+# A ``\boxed{...}`` content that is a single bare latin variable (``N``, ``x``,
+# ``k`` ...) is treated as a placeholder, not a final value.
+_BARE_VAR_RE = re.compile(r"^[A-Za-z]$")
+
+# Unwrap text-formatting commands (``\text{?}`` -> ``?``) the same way the reward
+# extractor (``math_dapo.normalize_final_answer``) does, so a placeholder RHS like
+# ``\text{?}`` reduces to bare punctuation and is rejected below.
+_TEXT_WRAP_RE = re.compile(r"\\(?:text|textbf|textit|mathrm|mathbf|mbox|operatorname)\s*\{([^{}]*)\}")
+
+
+def _iter_boxed(text: str):
+    """Yield ``(start, end, content)`` for each brace-balanced ``\\boxed{...}``.
+
+    ``start`` is the offset of the ``\\`` and ``end`` is one past the matching
+    ``}``; ``content`` is the text between the outer braces. Stops at the first
+    unterminated ``\\boxed{`` (no complete boxed can follow it either).
+    """
+    tok = "\\boxed{"
+    search = 0
+    while True:
+        start = text.find(tok, search)
+        if start < 0:
+            return
+        i = start + len(tok)
+        depth = 1
+        while i < len(text) and depth > 0:
+            c = text[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            i += 1
+        if depth != 0:
+            return  # unterminated boxed -> no complete answer from here on
+        yield start, i, text[start + len(tok) : i - 1]
+        search = i
+
+
+def _strip_math_wrappers(s: str) -> str:
+    """Strip surrounding whitespace and a single math delimiter layer (``$``/``\\(``/``\\[``)."""
+    s = s.strip()
+    for left, right in (("$", "$"), ("\\(", "\\)"), ("\\[", "\\]")):
+        if len(s) >= len(left) + len(right) and s.startswith(left) and s.endswith(right):
+            s = s[len(left) : len(s) - len(right)].strip()
+            break
+    return s
+
+
+def _is_answer_box(content: str) -> bool:
+    """Heuristic: does a ``\\boxed{...}`` content look like a real final answer?
+
+    Conservative on purpose -- only rejects boxes that are *clearly* not a final
+    value so we never skip a genuine answer (any ambiguous case is accepted). This
+    fixes the "fake first box" anchor bug where a mid-reasoning placeholder box
+    (``\\boxed{N}``, ``\\boxed{}``, a nested ``\\boxed``) was mistaken for the final
+    answer, masking real reasoning out of the loss (and teaching EOS at the wrong
+    spot).
+
+    Equation-form answers are NOT rejected: a box like ``1 + 8 = 9`` or ``x = 5`` is
+    a real commitment whose value is the right-hand side. We reduce it to that RHS
+    the way the reward extractor does (``math_dapo.normalize_final_answer`` reduces
+    via ``split("=")[-1]`` and unwraps ``\\text{...}``) and judge the reduced value,
+    instead of dropping every box that contains ``=``. Empirically ~180/207
+    equation-first boxes in a full run were the actual answer written out (reward
+    scored them correct), so the old "reject any ``=``" rule wrongly skipped real
+    answers (and let format-shaping mis-penalize them).
+
+    Nested ``\\boxed`` is unwrapped to its innermost box rather than rejected: a real
+    pattern is ``\\boxed{288 + 143 = \\boxed{431}}`` whose actual answer is the inner
+    ``431`` -- exactly what the reward extractor picks (``last_boxed_only_string`` takes
+    the LAST ``\\boxed``). We recurse to that innermost value before judging.
+
+    Rejected patterns (after unwrapping nesting and reducing an equation to its RHS):
+      * empty box / RHS empty (a trailing ``=`` with nothing after) / empty inner box
+      * a single bare latin variable (``N`` / ``x`` / ``k``)
+      * no alphanumeric char at all (pure punctuation, e.g. ``?`` / ``\\text{?}``)
+    """
+    inner = _strip_math_wrappers(content)
+    # Nested \boxed: the real value is the innermost box (reward uses the LAST \boxed).
+    while "\\boxed" in inner:
+        inner_c = None
+        for _s, _e, c in _iter_boxed(inner):
+            inner_c = c  # keep the last (innermost when singly nested)
+        if inner_c is None:
+            return False  # unbalanced nested \boxed -> placeholder, not a value
+        inner = _strip_math_wrappers(inner_c)
+    if "=" in inner:
+        # Value is the RHS of the last '=', mirroring the reward extractor.
+        inner = inner.split("=")[-1]
+    # Unwrap \text{...} etc so a placeholder like \text{?} reduces to bare punctuation.
+    inner = _TEXT_WRAP_RE.sub(r"\1", inner).replace("$", "").strip()
+    if not inner:
+        return False
+    if _BARE_VAR_RE.match(inner):
+        return False
+    if not any(ch.isalnum() for ch in inner):
+        return False
+    return True
+
 
 def _first_boxed_end(text: str) -> Optional[int]:
-    """Return the char offset just past the first balanced ``\\boxed{...}``.
+    """Char offset just past the first *answer-shaped* balanced ``\\boxed{...}``.
 
-    Returns ``None`` if there is no complete (brace-balanced) boxed expression.
+    Skips fake / placeholder boxes (see ``_is_answer_box``) so the anchor lands on
+    a real final answer instead of a mid-reasoning box. Returns ``None`` when no
+    complete answer-shaped boxed expression exists.
     """
-    start = text.find("\\boxed{")
-    if start < 0:
-        return None
-    i = start + len("\\boxed{")
-    depth = 1
-    while i < len(text):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return None  # unterminated boxed -> treat as no complete answer
+    for _start, end, content in _iter_boxed(text):
+        if _is_answer_box(content):
+            return end
+    return None
 
 
 def _first_answer_end_char(text: str) -> Optional[int]:

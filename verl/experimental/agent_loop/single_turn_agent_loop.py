@@ -80,6 +80,42 @@ class SingleTurnAgentLoop(AgentLoopBase):
             return [0.0] * len(response_ids)
         return penalty
 
+    def _maybe_format_penalty(self, response_ids: list[int]) -> list[float] | None:
+        """Per-token format-shaping penalty (advantage shaping), or None if disabled.
+
+        Fires only on rollouts that never produced an answer-shaped final answer
+        (no valid ``\\boxed{}`` / ``Answer:`` -- with the fixed anchor a placeholder box
+        like ``\\boxed{N}`` does not count). Returns a uniform per-token weight
+        (``format_penalty_factor``, plus ``format_penalty_wall_extra`` when the rollout
+        also hit ``max_response_length`` with no terminal EOS). The loss multiplies this
+        by ``adv_scale`` and subtracts it from the token advantage, so the whole
+        no-answer trajectory is pushed down (teaching the model to emit a box).
+        Generation is unchanged.
+
+        When enabled, this always returns a fixed-length vector (all zeros for a
+        clean / answered rollout) rather than ``None``. Returning ``None`` on answered
+        samples would drop the ``format_penalty`` field from those samples' ``as_dict``
+        outputs; the per-sample TransferQueue puts would then have a ragged schema and
+        the mixed-batch actor read silently omits the column, making the penalty a
+        no-op (exactly what happened in learneos4fmt). Mirrors ``_maybe_rep_penalty``
+        / ``eos_sft_mask``, which likewise emit a uniform column whenever enabled.
+        """
+        cfg = self.rollout_config
+        if not getattr(cfg, "format_penalty_enable", False) or not response_ids:
+            return None
+        zeros = [0.0] * len(response_ids)
+        if _first_answer_end_char(self.tokenizer.decode(response_ids)) is not None:
+            return zeros  # has a real answer -> no penalty, but keep the column uniform
+        value = float(getattr(cfg, "format_penalty_factor", 0.5))
+        eos_id = self.tokenizer.eos_token_id
+        hit_cap = len(response_ids) >= self.response_length
+        no_eos = eos_id is None or response_ids[-1] != eos_id
+        if hit_cap and no_eos:
+            value += float(getattr(cfg, "format_penalty_wall_extra", 0.5))
+        if value <= 0.0:
+            return zeros
+        return [value] * len(response_ids)
+
     def _apply_learn_eos(
         self,
         response_ids: list[int],
@@ -202,6 +238,64 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 break
         return last_output, resp_ids, (resp_logprobs if have_lp else None)
 
+    def apply_answer_shaping(
+        self,
+        response_ids: list[int],
+        response_mask: list[int],
+        response_logprobs: list[float] | None,
+    ) -> tuple[list[int], list[int], list[float] | None, list[float] | None, list[float] | None, list[float] | None]:
+        """Post-generation answer shaping shared by the main rollout and TB-OPD branches.
+
+        Applies, in order: ``mask_truncated_no_answer`` (drop no-answer wall-hits),
+        ``learn_eos_after_answer`` (mask post-answer + inject supervised EOS) or else
+        ``mask_after_answer`` (mask post-answer only), then the per-token
+        ``rep_penalty`` / ``format_penalty`` advantage-shaping columns. Generation is
+        never re-run; only masks / auxiliary columns are derived from ``response_ids``.
+
+        Returns ``(response_ids, response_mask, response_logprobs, eos_sft_mask,
+        rep_penalty, format_penalty)``.
+        """
+        # Drop unambiguously degenerate rollouts from the loss entirely: a sequence
+        # that hit ``max_response_length`` (no terminal EOS) *and* never produced a
+        # complete final answer (no ``\boxed{}`` / ``Answer:``) is a no-answer refrain
+        # / wall-hit (already scored -1). Zero its whole response mask so it does not
+        # pollute the token-mean gradient. Generation is unchanged.
+        if getattr(self.rollout_config, "mask_truncated_no_answer", False) and response_mask:
+            eos_id = self.tokenizer.eos_token_id
+            hit_cap = len(response_ids) >= self.response_length
+            no_eos = eos_id is None or not response_ids or response_ids[-1] != eos_id
+            if hit_cap and no_eos and _first_answer_end_char(self.tokenizer.decode(response_ids)) is None:
+                response_mask = [0] * len(response_mask)
+
+        # Learn-EOS: keep the full generation, mask the post-answer refrain out of the
+        # main loss, and (when the model did not stop on its own) inject a supervised EOS
+        # at the first post-answer token so the loss teaches "answer then stop" in the
+        # model itself. Supersedes mask_after_answer (which only masks) when enabled.
+        eos_sft_mask: list[float] | None = None
+        if getattr(self.rollout_config, "learn_eos_after_answer", False) and response_mask and any(response_mask):
+            response_ids, response_mask, response_logprobs, eos_sft_mask = self._apply_learn_eos(
+                response_ids, response_mask, response_logprobs
+            )
+        # Drop post-answer repetition from the loss: zero the response mask beyond
+        # the first complete final answer. Generation is unchanged; only the mask
+        # (and therefore the distillation / policy-gradient loss) is affected.
+        elif getattr(self.rollout_config, "mask_after_answer", False) and response_mask and any(response_mask):
+            keep = keep_len_after_final_answer(
+                self.tokenizer,
+                response_ids,
+                eos_id=self.tokenizer.eos_token_id,
+                post_answer_cap=int(getattr(self.rollout_config, "mask_after_answer_post_cap", 512)),
+            )
+            if keep is not None and 0 < keep < len(response_mask):
+                response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
+
+        response_ids = response_ids[: self.response_length]
+        if eos_sft_mask is not None:
+            eos_sft_mask = eos_sft_mask[: self.response_length]
+        rep_penalty = self._maybe_rep_penalty(response_ids)
+        format_penalty = self._maybe_format_penalty(response_ids)
+        return response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], priority: int = 0, **kwargs) -> AgentLoopOutput:
         # priority may arrive as np.int64 from non_tensor_batch; normalize to Python int.
@@ -279,44 +373,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask = [1] * len(output.token_ids)
             response_logprobs = output.log_probs
 
-        # Drop unambiguously degenerate rollouts from the loss entirely: a sequence
-        # that hit ``max_response_length`` (no terminal EOS) *and* never produced a
-        # complete final answer (no ``\boxed{}`` / ``Answer:``) is a no-answer refrain
-        # / wall-hit (already scored -1). Zero its whole response mask so it does not
-        # pollute the token-mean gradient. Generation is unchanged.
-        if getattr(self.rollout_config, "mask_truncated_no_answer", False) and response_mask:
-            eos_id = self.tokenizer.eos_token_id
-            hit_cap = len(response_ids) >= self.response_length
-            no_eos = eos_id is None or not response_ids or response_ids[-1] != eos_id
-            if hit_cap and no_eos and _first_answer_end_char(self.tokenizer.decode(response_ids)) is None:
-                response_mask = [0] * len(response_mask)
-
-        # Learn-EOS: keep the full generation, mask the post-answer refrain out of the
-        # main loss, and (when the model did not stop on its own) inject a supervised EOS
-        # at the first post-answer token so the loss teaches "answer then stop" in the
-        # model itself. Supersedes mask_after_answer (which only masks) when enabled.
-        eos_sft_mask: list[float] | None = None
-        if getattr(self.rollout_config, "learn_eos_after_answer", False) and response_mask and any(response_mask):
-            response_ids, response_mask, response_logprobs, eos_sft_mask = self._apply_learn_eos(
-                response_ids, response_mask, response_logprobs
-            )
-        # Drop post-answer repetition from the loss: zero the response mask beyond
-        # the first complete final answer. Generation is unchanged; only the mask
-        # (and therefore the distillation / policy-gradient loss) is affected.
-        elif getattr(self.rollout_config, "mask_after_answer", False) and response_mask and any(response_mask):
-            keep = keep_len_after_final_answer(
-                self.tokenizer,
-                response_ids,
-                eos_id=self.tokenizer.eos_token_id,
-                post_answer_cap=int(getattr(self.rollout_config, "mask_after_answer_post_cap", 512)),
-            )
-            if keep is not None and 0 < keep < len(response_mask):
-                response_mask = [m if i < keep else 0 for i, m in enumerate(response_mask)]
-
-        response_ids = response_ids[: self.response_length]
-        if eos_sft_mask is not None:
-            eos_sft_mask = eos_sft_mask[: self.response_length]
-        rep_penalty = self._maybe_rep_penalty(response_ids)
+        (
+            response_ids,
+            response_mask,
+            response_logprobs,
+            eos_sft_mask,
+            rep_penalty,
+            format_penalty,
+        ) = self.apply_answer_shaping(response_ids, response_mask, response_logprobs)
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -324,6 +388,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             rep_penalty=rep_penalty,
+            format_penalty=format_penalty,
             eos_sft_mask=eos_sft_mask,
             routed_experts=(
                 output.routed_experts[: len(prompt_ids) + self.response_length]

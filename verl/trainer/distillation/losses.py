@@ -321,6 +321,28 @@ def distillation_loss(
                 distillation_metrics["distillation/rep_penalty_mean"] = (
                     rep_penalty[pen_mask].mean().item() if pen_mask.any() else 0.0
                 )
+        # Format-shaping penalty: rollouts with no answer-shaped final answer (no valid
+        # \boxed{}/Answer: -- see rollout.format_penalty_enable) carry a uniform per-token
+        # weight; subtract it (scaled by adv_scale, like rep_penalty) so the whole
+        # no-answer trajectory gets a negative advantage and the model learns to emit a
+        # box. Distinct from mask_truncated_no_answer, which only *drops* such rollouts
+        # (neutral); use one or the other (masked tokens make this a no-op).
+        format_penalty = data.get("format_penalty", None)
+        if format_penalty is not None:
+            if format_penalty.is_nested:
+                format_penalty = format_penalty.to_padded_tensor(0.0)
+            format_penalty = format_penalty.to(device=advantages.device, dtype=advantages.dtype)
+            if format_penalty.shape == advantages.shape:
+                format_penalty = format_penalty * adv_scale
+                advantages = advantages - format_penalty
+                fmt_mask = (format_penalty > 0) & valid_mask
+                # Fraction of *sequences* carrying the format penalty (any penalized token).
+                distillation_metrics["distillation/format_penalty_seq_frac"] = (
+                    (fmt_mask.any(dim=-1).float().mean().item()) if fmt_mask.numel() else 0.0
+                )
+                distillation_metrics["distillation/format_penalty_mean"] = (
+                    format_penalty[fmt_mask].mean().item() if fmt_mask.any() else 0.0
+                )
         # DAPO-style soft overlong punishment on the *effective* (post-mask) response
         # length: subtract a per-sequence non-negative penalty (broadcast over tokens)
         # from the advantage so overlong sequences are pushed down. With mask_after_answer

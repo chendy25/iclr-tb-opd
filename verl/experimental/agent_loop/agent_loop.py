@@ -100,6 +100,8 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     rep_penalty: Optional[list[float]] = None
     """Per-token repetition penalty weights (advantage shaping); None if unused."""
+    format_penalty: Optional[list[float]] = None
+    """Per-token format-shaping penalty weights (no-valid-answer advantage shaping); None if unused."""
     eos_sft_mask: Optional[list[float]] = None
     """Per-token learn-EOS supervision mask: 1 at the supervised EOS position, else 0."""
     routed_experts: Optional[Any] = None
@@ -132,6 +134,10 @@ class AgentLoopOutput(BaseModel):
         rep_penalty = output.pop("rep_penalty", None)
         if rep_penalty is not None:
             output["rep_penalty"] = torch.tensor(rep_penalty, dtype=torch.float32)
+
+        format_penalty = output.pop("format_penalty", None)
+        if format_penalty is not None:
+            output["format_penalty"] = torch.tensor(format_penalty, dtype=torch.float32)
 
         eos_sft_mask = output.pop("eos_sft_mask", None)
         if eos_sft_mask is not None:
@@ -180,6 +186,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities for the response tokens."""
     rep_penalty: Optional[torch.Tensor] = None
     """Padded per-token repetition penalty weights (advantage shaping)."""
+    format_penalty: Optional[torch.Tensor] = None
+    """Padded per-token format-shaping penalty weights (no-valid-answer advantage shaping)."""
     eos_sft_mask: Optional[torch.Tensor] = None
     """Padded per-token learn-EOS supervision mask (1 at the supervised EOS position)."""
     teacher_logprobs: Optional[torch.Tensor] = None
@@ -637,6 +645,15 @@ class AgentLoopWorker:
             logprobs=config.calculate_log_probs,
         )
 
+        # Extra stop token ids (in addition to the model's own EOS). Used to align a
+        # Base student's stop set with the teacher / chat template close token (e.g.
+        # [<|im_end|>, <|endoftext|>] for Qwen3-Base). Passed straight to vLLM's
+        # SamplingParams.stop_token_ids. Applied to both train and val rollouts so
+        # generation stays train/eval-consistent.
+        stop_token_ids = getattr(config, "stop_token_ids", None)
+        if stop_token_ids:
+            sampling_params["stop_token_ids"] = [int(t) for t in stop_token_ids]
+
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
             params["top_k"] = -1
@@ -857,6 +874,11 @@ class AgentLoopWorker:
         scheme_b_validate = bool(cfg.get("scheme_b_validate", False))
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
+        # Apply the main rollout's post-generation answer shaping (mask/EOS/penalty)
+        # to branch continuations too. Requires the agent loop to expose it.
+        shape_branches = bool(cfg.get("shape_branches", False)) and hasattr(
+            agent_loop, "apply_answer_shaping"
+        )
 
         # Cache the tokenizer's special-id set once for the CURE-style filter.
         special_ids = getattr(self, "_tb_opd_special_ids", None)
@@ -993,12 +1015,18 @@ class AgentLoopWorker:
                         fork["pos"],
                         dict(sampling_params),
                         resample_temperature,
+                        apply_shaping=shape_branches,
                     )
                 else:
                     cands = fork["cand_token_ids"]
                     cand_token = cands[(slot - 1) % len(cands)]
                     branch_out = await self._tb_generate_branch(
-                        agent_loop, main_out, fork["pos"], int(cand_token), dict(sampling_params)
+                        agent_loop,
+                        main_out,
+                        fork["pos"],
+                        int(cand_token),
+                        dict(sampling_params),
+                        apply_shaping=shape_branches,
                     )
                 branch_out.extra_fields["tb_opd_slot"] = slot
                 branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
@@ -1017,6 +1045,25 @@ class AgentLoopWorker:
             results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
         return results
 
+    @staticmethod
+    def _tb_shape_branch_fields(
+        agent_loop,
+        response_ids: list[int],
+        response_logprobs: list[float] | None,
+        apply_shaping: bool,
+    ) -> tuple[list[int], list[int], list[float] | None, list[float] | None, list[float] | None, list[float] | None]:
+        """Build (response_ids, response_mask, response_logprobs, eos_sft_mask,
+        rep_penalty, format_penalty) for a branch continuation.
+
+        With ``apply_shaping`` the branch gets the SAME post-generation answer shaping
+        as the main rollout (mask/EOS/penalty via ``agent_loop.apply_answer_shaping``);
+        otherwise it keeps a full all-ones mask and no EOS/penalty columns (legacy).
+        """
+        response_mask = [1] * len(response_ids)
+        if apply_shaping:
+            return agent_loop.apply_answer_shaping(response_ids, response_mask, response_logprobs)
+        return response_ids, response_mask, response_logprobs, None, None, None
+
     async def _tb_generate_branch(
         self,
         agent_loop,
@@ -1024,6 +1071,7 @@ class AgentLoopWorker:
         fork_pos: int,
         cand_token: int,
         sampling_params: dict,
+        apply_shaping: bool = False,
     ) -> AgentLoopOutput:
         """Force ``cand_token`` at ``fork_pos`` then continue-generate the branch."""
         prompt_ids = list(main_out.prompt_ids)
@@ -1047,6 +1095,10 @@ class AgentLoopWorker:
             cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
             response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
 
+        response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty = (
+            self._tb_shape_branch_fields(agent_loop, response_ids, response_logprobs, apply_shaping)
+        )
+
         # Preserve weight-version tags for v1 off-policy metrics (TQ tags read these).
         extra_fields: dict[str, Any] = {"turn_scores": [], "tool_rewards": []}
         min_gs = main_out.extra_fields.get("min_global_steps")
@@ -1064,8 +1116,11 @@ class AgentLoopWorker:
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
-            response_mask=[1] * len(response_ids),
+            response_mask=response_mask,
             response_logprobs=response_logprobs,
+            rep_penalty=rep_penalty,
+            format_penalty=format_penalty,
+            eos_sft_mask=eos_sft_mask,
             multi_modal_data=main_out.multi_modal_data,
             mm_processor_kwargs=main_out.mm_processor_kwargs,
             num_turns=2,
@@ -1080,6 +1135,7 @@ class AgentLoopWorker:
         fork_pos: int,
         sampling_params: dict,
         resample_temperature: float,
+        apply_shaping: bool = False,
     ) -> AgentLoopOutput:
         """Continue-generate from the shared prefix at ``fork_pos`` (no forced token)."""
         prompt_ids = list(main_out.prompt_ids)
@@ -1105,6 +1161,10 @@ class AgentLoopWorker:
             cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
             response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
 
+        response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty = (
+            self._tb_shape_branch_fields(agent_loop, response_ids, response_logprobs, apply_shaping)
+        )
+
         extra_fields: dict[str, Any] = {"turn_scores": [], "tool_rewards": []}
         min_gs = main_out.extra_fields.get("min_global_steps")
         max_gs = main_out.extra_fields.get("max_global_steps")
@@ -1121,8 +1181,11 @@ class AgentLoopWorker:
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
-            response_mask=[1] * len(response_ids),
+            response_mask=response_mask,
             response_logprobs=response_logprobs,
+            rep_penalty=rep_penalty,
+            format_penalty=format_penalty,
+            eos_sft_mask=eos_sft_mask,
             multi_modal_data=main_out.multi_modal_data,
             mm_processor_kwargs=main_out.mm_processor_kwargs,
             num_turns=2,
@@ -1216,6 +1279,11 @@ class AgentLoopWorker:
         if output.rep_penalty is not None:
             pad_size = self.rollout_config.response_length - len(output.rep_penalty)
             rep_penalty = torch.tensor(output.rep_penalty + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
+        format_penalty = None
+        if output.format_penalty is not None:
+            pad_size = self.rollout_config.response_length - len(output.format_penalty)
+            format_penalty = torch.tensor(output.format_penalty + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -1317,6 +1385,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             rep_penalty=rep_penalty,
+            format_penalty=format_penalty,
             eos_sft_mask=eos_sft_mask,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
@@ -1542,6 +1611,16 @@ class AgentLoopWorker:
                 for input in inputs
             ]
             optional_outputs["rep_penalty"] = torch.cat(rep_parts, dim=0)
+        if any(input.format_penalty is not None for input in inputs):
+            # Fill zeros for samples without a format penalty vector so cat stays uniform.
+            resp_len = self.rollout_config.response_length
+            fmt_parts = [
+                input.format_penalty
+                if input.format_penalty is not None
+                else torch.zeros(1, resp_len, dtype=torch.float32)
+                for input in inputs
+            ]
+            optional_outputs["format_penalty"] = torch.cat(fmt_parts, dim=0)
         if any(input.eos_sft_mask is not None for input in inputs):
             # Fill zeros for samples without an EOS-supervision position so cat stays uniform.
             resp_len = self.rollout_config.response_length

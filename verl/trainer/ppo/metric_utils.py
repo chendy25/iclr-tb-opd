@@ -92,6 +92,69 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+# Qwen3 chat-close vs Base EOS. Telemetry only — not used as the generation stop set.
+# ``tokenizer.eos_token_id`` on Qwen3-*-Base is EOT; Instruct uses IM_END.
+QWEN_IM_END_ID = 151645  # <|im_end|>
+QWEN_EOT_ID = 151643  # <|endoftext|>
+
+
+def classify_stop_reason(last_token_id: int, response_len: int, max_response_length: int) -> str:
+    """Label how a rollout ended, from the last *generated* token (not pad-stripped).
+
+    Pad id on Qwen-Base equals EOT (151643), so "last non-pad" would drop a real
+    ``<|endoftext|>`` stop. Callers must pass the true generated length.
+    """
+    if response_len <= 0:
+        return "abort"
+    if int(last_token_id) == QWEN_IM_END_ID:
+        return "im_end"
+    if int(last_token_id) == QWEN_EOT_ID:
+        return "eot"
+    if response_len >= max_response_length:
+        return "clip"
+    return "other"
+
+
+def last_tokens_and_stop_reasons(
+    responses: torch.Tensor, response_length: torch.Tensor
+) -> tuple[list[int], list[str]]:
+    """Per-sample last generated token id and stop_reason (im_end/eot/clip/other/abort)."""
+    max_len = int(responses.shape[-1])
+    lengths = response_length.detach().long().view(-1).cpu()
+    last_ids: list[int] = []
+    reasons: list[str] = []
+    for i in range(responses.shape[0]):
+        length = int(lengths[i].item())
+        if length <= 0:
+            last_ids.append(-1)
+            reasons.append("abort")
+            continue
+        last = int(responses[i, length - 1].item())
+        last_ids.append(last)
+        reasons.append(classify_stop_reason(last, length, max_len))
+    return last_ids, reasons
+
+
+def compute_stop_token_metrics(responses: torch.Tensor, response_length: torch.Tensor) -> dict[str, float]:
+    """Batch fraction of rollouts that ended on im_end / eot / clip / other."""
+    max_len = responses.shape[-1]
+    length = response_length.detach().long().view(-1)
+    abort = length <= 0
+    idx = (length - 1).clamp(min=0).unsqueeze(1)
+    last = responses.gather(1, idx).squeeze(1)
+    last = last.masked_fill(abort, -1)
+    im_end = (~abort) & (last == QWEN_IM_END_ID)
+    eot = (~abort) & (last == QWEN_EOT_ID)
+    clip = (~abort) & (~im_end) & (~eot) & (length >= max_len)
+    other = ~(im_end | eot | clip)
+    return {
+        "stop/im_end_frac": im_end.float().mean().item(),
+        "stop/eot_frac": eot.float().mean().item(),
+        "stop/clip_frac": clip.float().mean().item(),
+        "stop/other_frac": other.float().mean().item(),
+    }
+
+
 def _get_nested_attr(obj: Any, name: str) -> Any:
     if hasattr(obj, "get"):
         return obj.get(name)
@@ -590,6 +653,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+        # How the rollout actually ended (last generated token). im_end vs eot
+        # distinguishes chat-close <|im_end|> from Base <|endoftext|>; clip is
+        # hit-max without either stop token. See last_tokens_and_stop_reasons.
+        **compute_stop_token_metrics(batch.batch["responses"], response_length),
     }
 
     # multi-turn conversation

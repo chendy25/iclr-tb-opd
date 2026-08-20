@@ -237,6 +237,34 @@ class RolloutConfig(BaseConfig):
     rep_penalty_lambda_entry: float = 3.0
     rep_penalty_mode: str = "wall"  # "wall" | "penalize"
 
+    # ---- Format-shaping advantage penalty (no valid answer / wall-hit) ----
+    # Actively *unlearn* rollouts that never produce an answer-shaped final answer
+    # (no valid \boxed{}/Answer: -- with the fixed anchor a fake box like \boxed{N}
+    # does not count). Unlike mask_truncated_no_answer (which merely drops such
+    # rollouts from the loss -> neutral), this subtracts a uniform per-token penalty
+    # from the token-level advantage (see trainer/distillation/losses.py), pushing
+    # the whole no-answer trajectory down so the model learns to emit a box. The
+    # penalty is expressed as a multiple of the batch mean |advantage| (adv_scale),
+    # like rep_penalty/overlong, so it stays a constant fraction of the OPD signal.
+    # Use *instead of* mask_truncated_no_answer (masking hides these tokens, so a
+    # penalty on them would be a no-op). Generation is unchanged.
+    format_penalty_enable: bool = False
+    # Base penalty (multiple of adv_scale) on every token of a no-valid-answer rollout.
+    format_penalty_factor: float = 0.5
+    # Extra penalty added when the no-answer rollout also hit max_response_length with
+    # no terminal EOS (a "wall-hit" ramble) -- the worst case (wastes the full budget).
+    format_penalty_wall_extra: float = 0.5
+
+    # Extra token ids that terminate generation, in ADDITION to the model's own EOS
+    # (from generation_config). Used to align a Base student's stop set with the
+    # teacher / chat template: a Qwen3-Base student's tokenizer + generation_config
+    # only stop on <|endoftext|> (151643), but the chat template closes an assistant
+    # turn with <|im_end|> (151645) and the (Instruct) teacher's prior puts EOS mass
+    # there. Setting [151645, 151643] lets the student actually stop once OPD teaches
+    # it to emit <|im_end|>. None/empty keeps vLLM's default (model EOS only). Applies
+    # to both train and validation rollouts so generation stays train/eval-consistent.
+    stop_token_ids: Optional[list] = None
+
     # Whether to enable full determinism for reproducibility.
     full_determinism: bool = False
 

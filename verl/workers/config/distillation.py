@@ -327,6 +327,13 @@ class TBOPDConfig(BaseConfig):
     resample_temperature (float):
         Sampling temperature for ``branch_mode="resample"``. Values < 0 reuse the
         rollout temperature from ``actor_rollout_ref.rollout``.
+    shape_branches (bool):
+        If True, apply the same post-generation answer shaping to TB-OPD branch
+        continuations as the main rollout gets in ``SingleTurnAgentLoop.run`` --
+        i.e. ``mask_truncated_no_answer`` / ``mask_after_answer`` / learn-EOS
+        (``eos_sft_mask``) and the ``rep_penalty`` / ``format_penalty`` columns.
+        When False (default) branches keep a full all-ones ``response_mask`` and no
+        EOS/penalty columns, so mask/EOS only constrain the main trajectory.
     """
 
     enable: bool = False
@@ -347,6 +354,7 @@ class TBOPDConfig(BaseConfig):
     scheme_b_validate: bool = False
     branch_mode: str = "forced_topk"
     resample_temperature: float = -1.0
+    shape_branches: bool = False
 
     def __post_init__(self):
         if not self.enable:

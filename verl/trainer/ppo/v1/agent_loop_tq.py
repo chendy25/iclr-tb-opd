@@ -69,6 +69,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             logprobs=config.calculate_log_probs,
         )
 
+        # Extra stop token ids (in addition to the model's own EOS). Mirrors the
+        # non-TQ AgentLoopWorker.generate_sequences path: the TQ variant builds its
+        # own sampling_params dict here, so the injection MUST be duplicated or the
+        # aligned stop set (e.g. [<|im_end|>, <|endoftext|>] for a Qwen3-Base
+        # student) never reaches vLLM's SamplingParams.stop_token_ids. Applied to
+        # both train and val so generation stays train/eval-consistent.
+        stop_token_ids = getattr(config, "stop_token_ids", None)
+        if stop_token_ids:
+            sampling_params["stop_token_ids"] = [int(t) for t in stop_token_ids]
+
         # override sampling params for validation
         if validate:
             sampling_params["top_p"] = config.val_kwargs.top_p

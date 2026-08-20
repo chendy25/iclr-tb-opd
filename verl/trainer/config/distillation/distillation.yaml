@@ -191,3 +191,8 @@ tb_opd:
 
   # Sampling temperature for resample branches; <0 reuses rollout.temperature.
   resample_temperature: -1.0
+
+  # Apply the same post-generation answer shaping to branch continuations as the
+  # main rollout (mask_truncated_no_answer / mask_after_answer / learn-EOS +
+  # rep_penalty / format_penalty). Off -> branches keep full mask, no EOS/penalty.
+  shape_branches: false

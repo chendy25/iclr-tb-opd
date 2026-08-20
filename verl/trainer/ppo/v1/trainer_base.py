@@ -58,6 +58,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    last_tokens_and_stop_reasons,
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
 )
@@ -1213,8 +1214,18 @@ class PPOTrainer(ABC):
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "extra_fields"]
             data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+            # Lengths before pad: Qwen-Base pad_id == <|endoftext|>, so "last non-pad"
+            # would drop a real EOT stop. Nested offsets are the generated length.
+            if hasattr(data["responses"], "offsets"):
+                response_length = data["responses"].offsets().diff()
+            else:
+                response_length = None
             data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
             data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            if response_length is None:
+                response_length = torch.full(
+                    (data["responses"].size(0),), data["responses"].size(1), dtype=torch.long
+                )
 
             uids = data.pop("uid").tolist()
             inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
@@ -1233,6 +1244,8 @@ class PPOTrainer(ABC):
             else:
                 extra_fields = [None] * len(uids)
 
+            last_token_ids, stop_reasons = last_tokens_and_stop_reasons(data["responses"], response_length)
+
             # Sort by uid key ({sample}_{rollout}_{output})
             sort_keys = []
             for key in batch.keys:
@@ -1248,8 +1261,14 @@ class PPOTrainer(ABC):
             gts = [gts[i] for i in sorted_indices]
             scores = [scores[i] for i in sorted_indices]
             extra_fields = [extra_fields[i] for i in sorted_indices]
+            last_token_ids = [last_token_ids[i] for i in sorted_indices]
+            stop_reasons = [stop_reasons[i] for i in sorted_indices]
 
-            reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
+            reward_extra_infos_dict = {
+                "uid": [batch.keys[i] for i in sorted_indices],
+                "last_token_id": last_token_ids,
+                "stop_reason": stop_reasons,
+            }
             # TB-OPD diagnostics live in agent-loop extra_fields; expand into dump columns.
             tb_keys: set[str] = set()
             for ef in extra_fields:

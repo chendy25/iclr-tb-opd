@@ -617,6 +617,22 @@ class vLLMHttpServer:
             sampling_params["extra_args"] = extra_args
 
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        # Log once per DISTINCT stop_token_ids value. A single one-shot latch could
+        # catch an empty warmup/dummy request first and hide the real aligned stop
+        # set, so key on the value to guarantee the real [im_end, endoftext] shows up.
+        _seen = getattr(self, "_logged_stop_token_ids_seen", None)
+        if _seen is None:
+            _seen = set()
+            self._logged_stop_token_ids_seen = _seen
+        _stop_key = tuple(sampling_params.stop_token_ids or [])
+        if _stop_key not in _seen:
+            _seen.add(_stop_key)
+            logger.info(
+                "vLLM SamplingParams.stop_token_ids=%s ignore_eos=%s "
+                "(model generation_config EOS still applies unless ignore_eos=True)",
+                list(_stop_key),
+                sampling_params.ignore_eos,
+            )
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
