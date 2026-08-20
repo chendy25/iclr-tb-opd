@@ -875,10 +875,9 @@ class AgentLoopWorker:
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
         # Apply the main rollout's post-generation answer shaping (mask/EOS/penalty)
-        # to branch continuations too. Requires the agent loop to expose it.
-        shape_branches = bool(cfg.get("shape_branches", False)) and hasattr(
-            agent_loop, "apply_answer_shaping"
-        )
+        # to branch continuations too. The agent-loop capability is checked after the
+        # loop instance is built (see below), since it is not available in this scope yet.
+        shape_branches_cfg = bool(cfg.get("shape_branches", False))
 
         # Cache the tokenizer's special-id set once for the CURE-style filter.
         special_ids = getattr(self, "_tb_opd_special_ids", None)
@@ -889,6 +888,8 @@ class AgentLoopWorker:
         n_slots = len(rows)
         _, _, main_kwargs = rows[0]
         agent_loop = self._make_agent_loop(agent_name)
+        # Now that the agent loop exists, resolve whether branch shaping is possible.
+        shape_branches = shape_branches_cfg and hasattr(agent_loop, "apply_answer_shaping")
 
         # Slot 0: main trajectory (standard single-turn generation). Under Scheme B
         # request per-token top-k logprobs so fork selection can read candidates
