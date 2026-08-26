@@ -362,6 +362,26 @@ def distillation_loss(
             distillation_metrics["distillation/overlong_pen_mean"] = (
                 overlong_pen[over_mask].mean().item() if over_mask.any() else 0.0
             )
+        # TB-OPD Rao-Blackwell branch weighting: a per-sequence multiplier (broadcast over
+        # tokens) reweighting the k+1 continuations of a fork by the student's own
+        # probability of the token each one was forced to take. It rides the existing
+        # importance-weight hook, so it multiplies the per-token loss but NOT the token
+        # count in the denominator; the weights have mean 1 within a group, which keeps
+        # the aggregate loss scale (and effective LR) identical to uniform weighting.
+        branch_weight = data.get("branch_weight", None)
+        if branch_weight is not None:
+            if branch_weight.is_nested:
+                branch_weight = branch_weight.to_padded_tensor(1.0)
+            branch_weight = branch_weight.to(device=advantages.device, dtype=advantages.dtype)
+            if branch_weight.shape == advantages.shape:
+                rollout_is_weights = (
+                    branch_weight if rollout_is_weights is None else rollout_is_weights * branch_weight
+                )
+                seq_w = branch_weight[:, 0]
+                distillation_metrics["distillation/branch_weight_mean"] = seq_w.mean().item()
+                distillation_metrics["distillation/branch_weight_min"] = seq_w.min().item()
+                distillation_metrics["distillation/branch_weight_max"] = seq_w.max().item()
+
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,

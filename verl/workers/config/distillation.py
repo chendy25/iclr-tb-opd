@@ -334,6 +334,39 @@ class TBOPDConfig(BaseConfig):
         (``eos_sft_mask``) and the ``rep_penalty`` / ``format_penalty`` columns.
         When False (default) branches keep a full all-ones ``response_mask`` and no
         EOS/penalty columns, so mask/EOS only constrain the main trajectory.
+    fork_alpha (float):
+        Blend between the two fork-ranking signals:
+        ``alpha * rank(entropy) + (1 - alpha) * rank(teacher_disagreement)``.
+        ``1.0`` (default) is pure entropy -- where the student is *unsure*. ``0.0`` is
+        pure teacher disagreement -- where the student is *wrong* relative to the
+        teacher, i.e. where the OPD signal actually lives. Values below 1.0 require
+        the teacher, so the main trajectory's teacher forward is issued before fork
+        selection (it is needed for the loss regardless, so this costs nothing extra).
+    fork_kl_window (int):
+        Window (in tokens) over which teacher/student disagreement is averaged when
+        ranking fork positions. A single token's log-ratio is far too noisy; the fork
+        should land where the *upcoming* span diverges. Ignored when ``fork_alpha=1``.
+    fork_fuse (str):
+        How entropy and teacher-disagreement combine after the entropy gate.
+        ``"blend"`` (default) averages the two ranks -- a position must do well on
+        both to stay in the top-k. ``"max"`` keeps whichever rank is larger, so
+        either extreme survives. ``"union"`` takes the top half by entropy and the
+        top half by disagreement, then samples from that union -- this is the mode
+        that lets *both* kinds of fork actually get chosen. Requires a teacher
+        signal (same as ``fork_alpha < 1``).
+    branch_weight_mode (str):
+        How the ``k+1`` continuations of a fork are weighted in the loss.
+        ``"off"`` (default) keeps the legacy uniform weighting. ``"rb"`` applies
+        Rao-Blackwellized weights ``pi_theta(a_j) / sum_i pi_theta(a_i)`` (rescaled to
+        mean 1), so a forced alternative contributes in proportion to how likely the
+        student was to emit it. Only applies to ``branch_mode="forced_topk"``;
+        ``"resample"`` branches are already drawn from ``pi_theta`` and stay uniform.
+    branch_weight_temp (float):
+        Temperature on the RB weights. ``1.0`` is the exact estimator; larger values
+        interpolate towards uniform.
+    branch_weight_floor (float):
+        Minimum per-slot weight (pre-renormalization) so a very unlikely branch still
+        contributes something after we paid to generate it. ``0.0`` = exact RB.
     """
 
     enable: bool = False
@@ -355,6 +388,12 @@ class TBOPDConfig(BaseConfig):
     branch_mode: str = "forced_topk"
     resample_temperature: float = -1.0
     shape_branches: bool = False
+    fork_alpha: float = 1.0
+    fork_kl_window: int = 128
+    fork_fuse: str = "blend"
+    branch_weight_mode: str = "off"
+    branch_weight_temp: float = 1.0
+    branch_weight_floor: float = 0.0
 
     def __post_init__(self):
         if not self.enable:
@@ -379,6 +418,18 @@ class TBOPDConfig(BaseConfig):
             raise ValueError(f"tb_opd.fork_topk_positions must be >= 1, got {self.fork_topk_positions}")
         if self.fork_skip_first < 0:
             raise ValueError(f"tb_opd.fork_skip_first must be >= 0, got {self.fork_skip_first}")
+        if not 0.0 <= self.fork_alpha <= 1.0:
+            raise ValueError(f"tb_opd.fork_alpha must be in [0, 1], got {self.fork_alpha}")
+        if self.fork_kl_window < 1:
+            raise ValueError(f"tb_opd.fork_kl_window must be >= 1, got {self.fork_kl_window}")
+        if self.fork_fuse not in ("blend", "max", "union"):
+            raise ValueError(f"tb_opd.fork_fuse must be 'blend', 'max', or 'union', got {self.fork_fuse}")
+        if self.branch_weight_mode not in ("off", "rb"):
+            raise ValueError(f"tb_opd.branch_weight_mode must be 'off' or 'rb', got {self.branch_weight_mode}")
+        if self.branch_weight_temp <= 0.0:
+            raise ValueError(f"tb_opd.branch_weight_temp must be > 0, got {self.branch_weight_temp}")
+        if not 0.0 <= self.branch_weight_floor < 1.0:
+            raise ValueError(f"tb_opd.branch_weight_floor must be in [0, 1), got {self.branch_weight_floor}")
 
 
 @dataclass

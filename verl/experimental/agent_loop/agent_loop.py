@@ -104,6 +104,8 @@ class AgentLoopOutput(BaseModel):
     """Per-token format-shaping penalty weights (no-valid-answer advantage shaping); None if unused."""
     eos_sft_mask: Optional[list[float]] = None
     """Per-token learn-EOS supervision mask: 1 at the supervised EOS position, else 0."""
+    branch_weight: Optional[list[float]] = None
+    """Per-token multiplicative loss weight (TB-OPD Rao-Blackwell branch weighting); 1.0 = neutral."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
     multi_modal_data: Optional[dict[str, Any]] = None
@@ -142,6 +144,10 @@ class AgentLoopOutput(BaseModel):
         eos_sft_mask = output.pop("eos_sft_mask", None)
         if eos_sft_mask is not None:
             output["eos_sft_mask"] = torch.tensor(eos_sft_mask, dtype=torch.float32)
+
+        branch_weight = output.pop("branch_weight", None)
+        if branch_weight is not None:
+            output["branch_weight"] = torch.tensor(branch_weight, dtype=torch.float32)
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:
@@ -190,6 +196,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded per-token format-shaping penalty weights (no-valid-answer advantage shaping)."""
     eos_sft_mask: Optional[torch.Tensor] = None
     """Padded per-token learn-EOS supervision mask (1 at the supervised EOS position)."""
+    branch_weight: Optional[torch.Tensor] = None
+    """Padded per-token multiplicative loss weight (TB-OPD Rao-Blackwell branch weighting)."""
     teacher_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
@@ -878,6 +886,13 @@ class AgentLoopWorker:
         # to branch continuations too. The agent-loop capability is checked after the
         # loop instance is built (see below), since it is not available in this scope yet.
         shape_branches_cfg = bool(cfg.get("shape_branches", False))
+        # Fork ranking blend and Rao-Blackwell branch weighting (see TBOPDConfig).
+        fork_alpha = float(cfg.get("fork_alpha", 1.0))
+        fork_kl_window = int(cfg.get("fork_kl_window", 128))
+        fork_fuse = str(cfg.get("fork_fuse", "blend"))
+        branch_weight_mode = str(cfg.get("branch_weight_mode", "off"))
+        branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
+        branch_weight_floor = float(cfg.get("branch_weight_floor", 0.0))
 
         # Cache the tokenizer's special-id set once for the CURE-style filter.
         special_ids = getattr(self, "_tb_opd_special_ids", None)
@@ -913,6 +928,32 @@ class AgentLoopWorker:
         fork = None
         none_reason = "not_attempted"
         used_scheme_b = False
+
+        # Teacher-guided fork ranking: entropy alone finds where the student is
+        # *unsure*, which is not the same as where it is *wrong*. The teacher logprobs
+        # are needed by the OPD loss anyway, so pulling the main trajectory's forward
+        # ahead of fork selection adds no teacher compute -- only ordering.
+        disagreement = None
+        need_teacher_fork = fork_fuse in ("union", "max") or fork_alpha < 1.0
+        if need_teacher_fork and do_branch and n_slots > 1 and main_out.response_logprobs is not None:
+            await self._compute_teacher_logprobs(
+                main_out,
+                prompt_ids=list(main_out.prompt_ids),
+                response_ids=list(main_out.response_ids),
+                validate=bool(rows[0][1]["validate"]),
+                sample_kwargs=main_kwargs,
+            )
+            teacher_lp = self._tb_teacher_token_logprobs(main_out, len(main_out.prompt_ids))
+            if teacher_lp:
+                disagreement = tb_opd.disagreement_window(
+                    list(main_out.response_logprobs), teacher_lp, fork_kl_window
+                )
+        # Without a teacher signal the disagreement ranks would be meaningless ties, so
+        # fall back to pure entropy rather than ranking on noise.
+        # No teacher signal -> ranks of D are noise; fall back to pure entropy.
+        eff_alpha = fork_alpha if disagreement else 1.0
+        eff_fuse = fork_fuse if disagreement else "blend"
+
         if do_branch and n_slots > 1:
             used_scheme_b = scheme_b and out_lp is not None and out_id is not None
             if used_scheme_b:
@@ -933,6 +974,10 @@ class AgentLoopWorker:
                     topk_positions=fork_topk_positions,
                     dedup_main=fork_dedup_main,
                     filter_mode=fork_token_filter,
+                    fork_alpha=eff_alpha,
+                    fork_fuse=eff_fuse,
+                    disagreement=disagreement,
+                    sampled_logprobs=main_out.response_logprobs,
                 )
             else:
                 fork = await tb_opd.select_fork(
@@ -952,6 +997,10 @@ class AgentLoopWorker:
                     topk_positions=fork_topk_positions,
                     dedup_main=fork_dedup_main,
                     filter_mode=fork_token_filter,
+                    fork_alpha=eff_alpha,
+                    fork_fuse=eff_fuse,
+                    disagreement=disagreement,
+                    sampled_logprobs=main_out.response_logprobs,
                 )
             none_reason = "ok" if fork.get("pos") is not None else str(fork.get("none_reason", "unknown"))
 
@@ -1005,6 +1054,9 @@ class AgentLoopWorker:
         if has_fork:
             rl = max(1, int(agent_loop.response_length))
             main_out.extra_fields["tb_opd_fork_pos_frac"] = float(fork["pos"]) / rl
+            main_out.extra_fields["tb_opd_fork_disagreement"] = float(fork.get("disagreement", 0.0))
+            main_out.extra_fields["tb_opd_num_gated"] = float(fork.get("num_gated", 0))
+            main_out.extra_fields["tb_opd_fork_source"] = str(fork.get("source", "entropy"))
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
         for slot in range(1, n_slots):
@@ -1041,10 +1093,65 @@ class AgentLoopWorker:
                 plain_out.extra_fields["tb_opd_mode_branch"] = 0.0
                 raw_outputs.append(plain_out)
 
+        # Rao-Blackwell branch weighting. Forcing the top-k alternatives makes the group
+        # off-policy: uniform averaging gives a token the student would emit ~1% of the
+        # time the same gradient mass as the one it actually sampled, which is what
+        # pushes entropy (and response length) up. Weighting each slot by the student's
+        # renormalized probability of its fork token restores the conditional
+        # expectation. Weights have mean 1, so the group's total contribution -- and the
+        # effective learning rate -- is unchanged; only the split inside it moves.
+        if branch_weight_mode == "rb":
+            weights = None
+            if mode == "branch" and branch_mode != "resample":
+                cand_lps = fork.get("cand_logprobs") or []
+                slot_lps: list[Optional[float]] = [fork.get("main_logprob")]
+                for slot in range(1, n_slots):
+                    slot_lps.append(cand_lps[(slot - 1) % len(cand_lps)] if cand_lps else None)
+                weights = tb_opd.branch_weights(
+                    slot_lps, temperature=branch_weight_temp, floor=branch_weight_floor
+                )
+            # Every sample must carry the column: a per-sample ragged schema silently
+            # drops the whole field on the TransferQueue path.
+            weights = weights or [1.0] * n_slots
+            for raw, w in zip(raw_outputs, weights, strict=True):
+                raw.branch_weight = [float(w)] * len(raw.response_ids)
+            main_out.extra_fields["tb_opd_weight_main"] = float(weights[0])
+            main_out.extra_fields["tb_opd_weight_max"] = float(max(weights))
+            main_out.extra_fields["tb_opd_weight_min"] = float(min(weights))
+
         results: list[_InternalAgentLoopOutput] = []
         for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
             results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
         return results
+
+    @staticmethod
+    def _tb_teacher_token_logprobs(output: AgentLoopOutput, prompt_len: int) -> Optional[list[float]]:
+        """Teacher logprob of each token the student actually emitted, per response position.
+
+        Reads the raw (unpadded) ``(S, K)`` teacher tensors left on ``extra_fields`` by
+        ``_compute_teacher_logprobs``; sequence index ``prompt_len + p`` holds the
+        distribution that produced response token ``p``. With the ``k1`` loss ``K == 1``
+        and the single column is the sampled token; the id lookup keeps this correct for
+        top-k teacher modes too.
+        """
+        teacher_ids = output.extra_fields.get("teacher_ids")
+        teacher_logprobs = output.extra_fields.get("teacher_logprobs")
+        if teacher_ids is None or teacher_logprobs is None:
+            return None
+        total = int(teacher_logprobs.shape[0])
+        out: list[float] = []
+        for p, tok in enumerate(output.response_ids):
+            idx = prompt_len + p
+            if idx >= total:
+                break
+            row_ids, row_lp = teacher_ids[idx], teacher_logprobs[idx]
+            if int(row_ids[0]) == int(tok):
+                out.append(float(row_lp[0]))
+                continue
+            hit = (row_ids == int(tok)).nonzero()
+            # Token outside the teacher's top-k: bound it by the least likely one kept.
+            out.append(float(row_lp[int(hit[0][0])]) if hit.numel() else float(row_lp.min()))
+        return out
 
     @staticmethod
     def _tb_shape_branch_fields(
@@ -1286,6 +1393,12 @@ class AgentLoopWorker:
             pad_size = self.rollout_config.response_length - len(output.format_penalty)
             format_penalty = torch.tensor(output.format_penalty + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
 
+        # Multiplicative weight -> pad with the neutral 1.0 rather than 0.0.
+        branch_weight = None
+        if output.branch_weight is not None:
+            pad_size = self.rollout_config.response_length - len(output.branch_weight)
+            branch_weight = torch.tensor(output.branch_weight + [1.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -1388,6 +1501,7 @@ class AgentLoopWorker:
             rep_penalty=rep_penalty,
             format_penalty=format_penalty,
             eos_sft_mask=eos_sft_mask,
+            branch_weight=branch_weight,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -1570,7 +1684,15 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Compute teacher logprobs for single sample."""
+        """Compute teacher logprobs for single sample.
+
+        Idempotent: TB-OPD fork ranking needs the main trajectory's teacher logprobs
+        *before* the branches are generated, so it issues this call early and leaves the
+        result on ``extra_fields``. Returning early here keeps that from becoming a
+        second (identical) teacher forward during post-processing.
+        """
+        if "teacher_logprobs" in output.extra_fields and "teacher_ids" in output.extra_fields:
+            return
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -1630,6 +1752,14 @@ class AgentLoopWorker:
                 for input in inputs
             ]
             optional_outputs["eos_sft_mask"] = torch.cat(eos_parts, dim=0)
+        if any(input.branch_weight is not None for input in inputs):
+            # Neutral fill is 1.0 here (multiplicative weight), not 0.0.
+            resp_len = self.rollout_config.response_length
+            bw_parts = [
+                input.branch_weight if input.branch_weight is not None else torch.ones(1, resp_len, dtype=torch.float32)
+                for input in inputs
+            ]
+            optional_outputs["branch_weight"] = torch.cat(bw_parts, dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

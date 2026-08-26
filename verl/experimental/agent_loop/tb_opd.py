@@ -59,6 +59,105 @@ def fork_uncertainty(logps: list[float], metric: str) -> float:
     return _truncated_entropy(logps)
 
 
+def disagreement_window(
+    student_logprobs: list[float],
+    teacher_logprobs: list[float],
+    window: int,
+) -> list[float]:
+    """Forward-looking teacher/student disagreement per response position.
+
+    ``D(t) = log pi_theta(a_t) - log pi_T(a_t)`` is the per-token surprise the OPD
+    loss already uses as the (negated) reward. A good fork point is one where the
+    *upcoming* span is where the student and teacher part ways, so each position is
+    scored by the mean ``D`` over the next ``window`` tokens rather than by ``D(t)``
+    alone -- a single token's disagreement is far too noisy to rank on.
+
+    Positive values mean the student is over-confident relative to the teacher,
+    which is exactly the region worth spending branches on.
+    """
+    n = min(len(student_logprobs), len(teacher_logprobs))
+    if n == 0:
+        return []
+    d = [student_logprobs[i] - teacher_logprobs[i] for i in range(n)]
+    # Suffix sums so each window mean is O(1).
+    suffix = [0.0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + d[i]
+    w = max(1, int(window))
+    out = [0.0] * n
+    for i in range(n):
+        j = min(n, i + w)
+        out[i] = (suffix[i] - suffix[j]) / (j - i)
+    return out
+
+
+def _normalized_ranks(values: list[float]) -> list[float]:
+    """Map values to their rank in ``[0, 1]`` (1.0 == largest). Ties broken by index."""
+    n = len(values)
+    if n <= 1:
+        return [1.0] * n
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    for r, i in enumerate(order):
+        ranks[i] = r / (n - 1)
+    return ranks
+
+
+def branch_weights(
+    logprobs: list[Optional[float]],
+    *,
+    temperature: float = 1.0,
+    floor: float = 0.0,
+) -> Optional[list[float]]:
+    """Rao-Blackwellized weights over the ``k+1`` realized continuations of a fork.
+
+    ``logprobs[j]`` is ``log pi_theta(a_j | s_fork)`` for the token slot ``j`` actually
+    took at the fork: slot 0 is the main rollout's own sampled token, slots ``1..k``
+    are the forced top-k alternatives.
+
+    Forcing the top-k alternatives and then averaging them uniformly is what makes
+    branch-OPD off-policy: the group's gradient estimates
+    ``(1/(k+1)) * sum_j f(a_j)`` when the on-policy quantity is
+    ``E_{a ~ pi_theta}[f(a)]``. Reweighting by the renormalized student probability
+    ``pi_theta(a_j) / sum_i pi_theta(a_i)`` turns the sum back into a conditional
+    expectation over the sampled support -- the standard Rao-Blackwell estimator,
+    which is unbiased for that support and strictly lower-variance than sampling one
+    continuation. Concretely it stops a rank-5 token the student would emit ~1% of the
+    time from carrying the same gradient mass as the token it actually chose, which is
+    what drives entropy up and the response length with it.
+
+    Weights are rescaled to sum to ``len(logprobs)`` (i.e. mean 1) so the group's total
+    contribution -- and therefore the effective learning rate -- matches the uniform
+    weighting it replaces. Only the *relative* weighting inside the group changes.
+
+    Args:
+        logprobs: per-slot fork-token logprob; ``None`` anywhere disables weighting.
+        temperature: softens the weights (``1.0`` = exact RB, larger -> uniform).
+        floor: minimum weight per slot before renormalization; keeps a very unlikely
+            branch from contributing literally nothing after we paid to generate it.
+
+    Returns:
+        Weights summing to ``len(logprobs)``, or ``None`` if they cannot be computed.
+    """
+    if not logprobs or any(lp is None for lp in logprobs):
+        return None
+    n = len(logprobs)
+    t = max(1e-6, float(temperature))
+    scaled = [float(lp) / t for lp in logprobs]
+    m = max(scaled)
+    probs = [math.exp(s - m) for s in scaled]
+    z = sum(probs)
+    if not math.isfinite(z) or z <= 0.0:
+        return None
+    w = [p / z for p in probs]
+    f = max(0.0, float(floor))
+    if f > 0.0:
+        w = [max(x, f) for x in w]
+        z2 = sum(w)
+        w = [x / z2 for x in w]
+    return [x * n for x in w]
+
+
 def normalize_ground_truth(reward_model: Any) -> Optional[str]:
     if reward_model is None:
         return None
@@ -155,6 +254,7 @@ def _collect_fork_candidates(
     min_token_strip_len: int,
     filter_mode: str,
     metric: str,
+    disagreement: Optional[list[float]] = None,
 ) -> tuple[list, int]:
     """Score every eligible response position as a fork candidate.
 
@@ -163,8 +263,12 @@ def _collect_fork_candidates(
     position ``p`` -- or ``None`` if unavailable. Shared by the second-forward
     (``select_fork``) and Scheme-B (``select_fork_from_topk``) paths so filtering
     and scoring stay identical; only the source of the per-position top-k differs.
+
+    Each candidate is ``(uncertainty, position, token_ids, logprobs, disagreement)``;
+    the last entry is the teacher/student disagreement at that position (0.0 when no
+    teacher signal was supplied) and is consumed by ``_finalize_fork``.
     """
-    cands: list[tuple[float, int, list[int]]] = []
+    cands: list[tuple[float, int, list[int], list[float], float]] = []
     n_considered = 0
     for p in range(resp_len):
         # Skip opener positions (CURE skips position 0).
@@ -185,7 +289,8 @@ def _collect_fork_candidates(
         ):
             continue
         n_considered += 1
-        cands.append((fork_uncertainty(row_lp, metric), p, row_id))
+        dis = float(disagreement[p]) if disagreement is not None and p < len(disagreement) else 0.0
+        cands.append((fork_uncertainty(row_lp, metric), p, row_id, row_lp, dis))
     return cands, n_considered
 
 
@@ -199,34 +304,116 @@ def _finalize_fork(
     select: str,
     topk_positions: int,
     dedup_main: bool,
+    fork_alpha: float = 1.0,
+    fork_fuse: str = "blend",
+    sampled_logprobs: Optional[list[float]] = None,
 ) -> dict:
-    """Choose a fork position from scored candidates and build the result dict."""
+    """Choose a fork position from scored candidates and build the result dict.
+
+    Selection is a two-stage process:
+
+    1. **Entropy gate.** ``min_entropy`` *filters* the candidate pool instead of
+       vetoing the whole prompt after the fact. Ranking by entropy alone still
+       returns a fork on a response whose most uncertain position is a near-certain
+       token, where forcing a top-k alternative injects a token the policy would
+       essentially never sample; those forks are the ones that push the branch
+       off-policy. Dropping them here degrades the prompt to plain rollouts
+       (``none_reason="below_min_entropy"``) rather than branching badly.
+    2. **How the two signals combine** (``fork_fuse``):
+       - ``"blend"`` (default): ``alpha * rank(H) + (1 - alpha) * rank(D)``. A
+         position has to score well on *both* to stay in the top-k, so a
+         high-entropy / low-disagreement token (or the reverse) is squeezed out.
+       - ``"max"``: ``max(rank(H), rank(D))``. Either extreme ranks at the top.
+       - ``"union"``: take the top ``ceil(k/2)`` by entropy *and* the top
+         ``ceil(k/2)`` by disagreement, then pick from that union. This is the
+         mode that actually lets both kinds of position be selected.
+
+    The result carries ``cand_logprobs`` (aligned with ``cand_token_ids``) and
+    ``main_logprob`` so the caller can weight each branch by the student's own
+    probability of the forced token. ``source`` is ``"entropy"`` /
+    ``"disagreement"`` / ``"both"`` for diagnostics.
+    """
     if not cands:
         return {"pos": None, "none_reason": "all_positions_filtered"}
 
-    if select == "topk_uniform":
-        cands.sort(key=lambda c: c[0], reverse=True)
-        pool = cands[: max(1, topk_positions)]
-        best_score, best_pos, best_cands = random.choice(pool)
-    else:  # argmax
-        best_score, best_pos, best_cands = max(cands, key=lambda c: c[0])
+    n_before_gate = len(cands)
+    # Stage 1: entropy gate as a filter (only meaningful for the entropy metric).
+    if metric == "entropy" and min_entropy > 0.0:
+        gated = [c for c in cands if c[0] >= min_entropy]
+        if not gated:
+            best = max(c[0] for c in cands)
+            return {"pos": None, "none_reason": "below_min_entropy", "score": float(best)}
+        cands = gated
 
-    # Entropy gate (only meaningful for the entropy metric).
-    if metric == "entropy" and min_entropy > 0.0 and best_score < min_entropy:
-        return {"pos": None, "none_reason": "below_min_entropy", "score": float(best_score)}
+    # Stage 2: combine entropy with teacher-disagreement.
+    alpha = min(1.0, max(0.0, float(fork_alpha)))
+    fuse = str(fork_fuse)
+    use_teacher = fuse in ("max", "union") or alpha < 1.0
+    n_h = n_d = 0
+    source = "entropy"
+    if not use_teacher:
+        fused = [c[0] for c in cands]
+        order = sorted(range(len(cands)), key=lambda i: fused[i], reverse=True)
+        pool = order[: max(1, topk_positions)] if select == "topk_uniform" else order[:1]
+        pick = random.choice(pool) if select == "topk_uniform" else order[0]
+        n_h = len(pool)
+    else:
+        rank_h = _normalized_ranks([c[0] for c in cands])
+        rank_d = _normalized_ranks([c[4] for c in cands])
+        n_each = max(1, (int(topk_positions) + 1) // 2)
+        top_h = sorted(range(len(cands)), key=lambda i: cands[i][0], reverse=True)[:n_each]
+        top_d = sorted(range(len(cands)), key=lambda i: cands[i][4], reverse=True)[:n_each]
+        set_h, set_d = set(top_h), set(top_d)
+        if fuse == "union":
+            # Preserve entropy-first then disagreement so ties stay deterministic.
+            pool = list(dict.fromkeys(top_h + top_d))
+            fused = [max(rank_h[i], rank_d[i]) for i in range(len(cands))]
+            if select == "topk_uniform":
+                pick = random.choice(pool)
+            else:
+                pick = max(pool, key=lambda i: fused[i])
+            n_h, n_d = len(set_h), len(set_d)
+        else:
+            if fuse == "max":
+                fused = [max(rank_h[i], rank_d[i]) for i in range(len(cands))]
+            else:  # blend
+                fused = [alpha * rank_h[i] + (1.0 - alpha) * rank_d[i] for i in range(len(cands))]
+            order = sorted(range(len(cands)), key=lambda i: fused[i], reverse=True)
+            pool = order[: max(1, topk_positions)] if select == "topk_uniform" else order[:1]
+            pick = random.choice(pool) if select == "topk_uniform" else order[0]
+            n_h = sum(1 for i in pool if i in set_h)
+            n_d = sum(1 for i in pool if i in set_d)
+        in_h, in_d = pick in set_h, pick in set_d
+        source = "both" if in_h and in_d else ("disagreement" if in_d else "entropy")
+
+    best_score, best_pos, best_cands, best_lps, best_dis = cands[pick]
 
     # Exclude the main-sampled token so each branch is a genuine alternative.
+    main_tok = int(response_ids[best_pos])
+    lp_by_id = {int(t): float(lp) for t, lp in zip(best_cands, best_lps, strict=False)}
+    main_logprob = lp_by_id.get(main_tok)
+    if main_logprob is None and sampled_logprobs is not None and best_pos < len(sampled_logprobs):
+        # Main token fell outside the top-k row; fall back to its rollout logprob.
+        main_logprob = float(sampled_logprobs[best_pos])
     if dedup_main:
-        main_tok = int(response_ids[best_pos])
-        deduped = [t for t in best_cands if int(t) != main_tok]
+        deduped = [(t, lp) for t, lp in zip(best_cands, best_lps, strict=False) if int(t) != main_tok]
         if deduped:
-            best_cands = deduped
+            best_cands = [t for t, _ in deduped]
+            best_lps = [lp for _, lp in deduped]
 
     return {
         "pos": best_pos,
         "cand_token_ids": best_cands,
+        "cand_logprobs": [float(x) for x in best_lps],
+        "main_logprob": main_logprob,
         "score": float(best_score),
+        "fused_score": float(fused[pick]),
+        "disagreement": float(best_dis),
         "num_positions": n_considered,
+        "num_gated": n_before_gate - len(cands),
+        "source": source,
+        "pool_entropy": n_h,
+        "pool_disagreement": n_d,
     }
 
 
@@ -248,6 +435,10 @@ async def select_fork(
     topk_positions: int = 20,
     dedup_main: bool = True,
     filter_mode: str = "math_aware",
+    fork_alpha: float = 1.0,
+    fork_fuse: str = "blend",
+    disagreement: Optional[list[float]] = None,
+    sampled_logprobs: Optional[list[float]] = None,
 ) -> Optional[dict]:
     """Second student forward to locate a high-uncertainty response fork position.
 
@@ -314,6 +505,7 @@ async def select_fork(
         min_token_strip_len=min_token_strip_len,
         filter_mode=filter_mode,
         metric=metric,
+        disagreement=disagreement,
     )
     return _finalize_fork(
         cands,
@@ -324,6 +516,9 @@ async def select_fork(
         select=select,
         topk_positions=topk_positions,
         dedup_main=dedup_main,
+        fork_alpha=fork_alpha,
+        fork_fuse=fork_fuse,
+        sampled_logprobs=sampled_logprobs,
     )
 
 
@@ -344,6 +539,10 @@ def select_fork_from_topk(
     topk_positions: int = 20,
     dedup_main: bool = True,
     filter_mode: str = "math_aware",
+    fork_alpha: float = 1.0,
+    fork_fuse: str = "blend",
+    disagreement: Optional[list[float]] = None,
+    sampled_logprobs: Optional[list[float]] = None,
 ) -> dict:
     """Scheme B: locate the fork from the main rollout's OWN per-token top-k
     logprobs (captured during generation via ``logprobs=k``), with no extra
@@ -388,6 +587,7 @@ def select_fork_from_topk(
         min_token_strip_len=min_token_strip_len,
         filter_mode=filter_mode,
         metric=metric,
+        disagreement=disagreement,
     )
     return _finalize_fork(
         cands,
@@ -398,4 +598,7 @@ def select_fork_from_topk(
         select=select,
         topk_positions=topk_positions,
         dedup_main=dedup_main,
+        fork_alpha=fork_alpha,
+        fork_fuse=fork_fuse,
+        sampled_logprobs=sampled_logprobs,
     )

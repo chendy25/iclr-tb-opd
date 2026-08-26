@@ -734,6 +734,27 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
     if fork_score:
         metrics["tb_opd/fork_score/mean"] = float(np.mean(fork_score))
 
+    # Fork ranking (teacher-guided selection) and Rao-Blackwell branch weights.
+    disagreement = _floats("tb_opd_fork_disagreement")
+    if disagreement:
+        metrics["tb_opd/fork_disagreement/mean"] = float(np.mean(disagreement))
+    if "tb_opd_fork_source" in ntb:
+        srcs = [str(s) for s in ntb["tb_opd_fork_source"] if s is not None]
+        if srcs:
+            nsrc = float(len(srcs))
+            for name in ("entropy", "disagreement", "both"):
+                metrics[f"tb_opd/fork_source/{name}"] = srcs.count(name) / nsrc
+    num_gated = _floats("tb_opd_num_gated")
+    if num_gated:
+        metrics["tb_opd/fork_gated_positions/mean"] = float(np.mean(num_gated))
+    w_main, w_max, w_min = _floats("tb_opd_weight_main"), _floats("tb_opd_weight_max"), _floats("tb_opd_weight_min")
+    if w_main:
+        # Uniform weighting would put all three at exactly 1.0; the spread is how far
+        # the group's gradient split moved away from that.
+        metrics["tb_opd/branch_weight/main"] = float(np.mean(w_main))
+        metrics["tb_opd/branch_weight/max"] = float(np.mean(w_max))
+        metrics["tb_opd/branch_weight/min"] = float(np.mean(w_min))
+
     # Distribution of None reasons among attempted forks.
     if "tb_opd_none_reason" in ntb:
         reasons = [str(r) for r in ntb["tb_opd_none_reason"] if r is not None and str(r) not in ("ok", "not_attempted")]

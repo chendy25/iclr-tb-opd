@@ -120,6 +120,8 @@ def construct_minimal_padding_template(
         template_sample["format_penalty"] = torch.zeros_like(response_mask, dtype=torch.float32)
     if "eos_sft_mask" in template_sample:
         template_sample["eos_sft_mask"] = torch.zeros_like(response_mask, dtype=torch.float32)
+    if "branch_weight" in template_sample:
+        template_sample["branch_weight"] = torch.ones_like(response_mask, dtype=torch.float32)
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
     if routed_experts is not None:

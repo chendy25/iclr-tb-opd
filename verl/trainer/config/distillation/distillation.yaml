@@ -196,3 +196,24 @@ tb_opd:
   # main rollout (mask_truncated_no_answer / mask_after_answer / learn-EOS +
   # rep_penalty / format_penalty). Off -> branches keep full mask, no EOS/penalty.
   shape_branches: false
+
+  # Fork ranking blend: alpha * rank(entropy) + (1 - alpha) * rank(teacher disagreement).
+  # 1.0 = pure entropy (student unsure); 0.0 = pure teacher KL (student wrong).
+  fork_alpha: 1.0
+
+  # Token window over which teacher/student disagreement is averaged for fork ranking.
+  fork_kl_window: 128
+
+  # How the two fork signals combine: "blend" (average ranks), "max" (either
+  # extreme ranks high), "union" (top-half entropy ∪ top-half disagreement).
+  fork_fuse: blend
+
+  # Weighting of the k+1 continuations of a fork: "off" (uniform) or "rb"
+  # (Rao-Blackwell: proportional to the student's own probability of the forced token).
+  branch_weight_mode: "off"
+
+  # Temperature on the RB weights; 1.0 = exact, larger -> uniform.
+  branch_weight_temp: 1.0
+
+  # Minimum per-slot RB weight before renormalization; 0.0 = exact RB.
+  branch_weight_floor: 0.0
