@@ -886,6 +886,10 @@ class AgentLoopWorker:
         # to branch continuations too. The agent-loop capability is checked after the
         # loop instance is built (see below), since it is not available in this scope yet.
         shape_branches_cfg = bool(cfg.get("shape_branches", False))
+        # Train the tokens shared with the main trajectory once instead of (1 + k) times,
+        # and keep the fork out of the span the main trajectory already masked away.
+        dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
+        fork_respect_mask = bool(cfg.get("fork_respect_mask", True))
         # Fork ranking blend and Rao-Blackwell branch weighting (see TBOPDConfig).
         fork_alpha = float(cfg.get("fork_alpha", 1.0))
         fork_kl_window = int(cfg.get("fork_kl_window", 128))
@@ -954,6 +958,12 @@ class AgentLoopWorker:
         eff_alpha = fork_alpha if disagreement else 1.0
         eff_fuse = fork_fuse if disagreement else "blend"
 
+        # Positions the main trajectory already dropped from the loss (post-answer span
+        # under mask_after_answer / learn-EOS) are useless fork points: the branch would
+        # re-derive the same answer out of the shared prefix and have its whole
+        # continuation masked away.
+        eligible_mask = list(main_out.response_mask) if fork_respect_mask else None
+
         if do_branch and n_slots > 1:
             used_scheme_b = scheme_b and out_lp is not None and out_id is not None
             if used_scheme_b:
@@ -978,6 +988,7 @@ class AgentLoopWorker:
                     fork_fuse=eff_fuse,
                     disagreement=disagreement,
                     sampled_logprobs=main_out.response_logprobs,
+                    eligible_mask=eligible_mask,
                 )
             else:
                 fork = await tb_opd.select_fork(
@@ -1001,6 +1012,7 @@ class AgentLoopWorker:
                     fork_fuse=eff_fuse,
                     disagreement=disagreement,
                     sampled_logprobs=main_out.response_logprobs,
+                    eligible_mask=eligible_mask,
                 )
             none_reason = "ok" if fork.get("pos") is not None else str(fork.get("none_reason", "unknown"))
 
@@ -1051,6 +1063,8 @@ class AgentLoopWorker:
         main_out.extra_fields["tb_opd_fork_found"] = float(has_fork)
         main_out.extra_fields["tb_opd_none_reason"] = none_reason
         main_out.extra_fields["tb_opd_scheme_b"] = float(used_scheme_b)
+        if fork is not None:
+            main_out.extra_fields["tb_opd_num_mask_skipped"] = float(fork.get("num_mask_skipped", 0))
         if has_fork:
             rl = max(1, int(agent_loop.response_length))
             main_out.extra_fields["tb_opd_fork_pos_frac"] = float(fork["pos"]) / rl
@@ -1069,6 +1083,7 @@ class AgentLoopWorker:
                         dict(sampling_params),
                         resample_temperature,
                         apply_shaping=shape_branches,
+                        dedup_shared_prefix=dedup_shared_prefix,
                     )
                 else:
                     cands = fork["cand_token_ids"]
@@ -1080,6 +1095,7 @@ class AgentLoopWorker:
                         int(cand_token),
                         dict(sampling_params),
                         apply_shaping=shape_branches,
+                        dedup_shared_prefix=dedup_shared_prefix,
                     )
                 branch_out.extra_fields["tb_opd_slot"] = slot
                 branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
@@ -1113,8 +1129,18 @@ class AgentLoopWorker:
             # Every sample must carry the column: a per-sample ragged schema silently
             # drops the whole field on the TransferQueue path.
             weights = weights or [1.0] * n_slots
-            for raw, w in zip(raw_outputs, weights, strict=True):
-                raw.branch_weight = [float(w)] * len(raw.response_ids)
+            # The RB weights sum to n, so a prefix left at the main slot's weight would
+            # still be counted more than once relative to an unbranched trajectory. With
+            # the branch copies masked away, the main slot's prefix carries the whole
+            # group's prefix and belongs at weight 1.0; only the fork onward is split.
+            prefix_len = int(fork["pos"]) if (dedup_shared_prefix and mode == "branch") else 0
+            for slot, (raw, w) in enumerate(zip(raw_outputs, weights, strict=True)):
+                n_tok = len(raw.response_ids)
+                if slot == 0 and prefix_len > 0:
+                    head = min(prefix_len, n_tok)
+                    raw.branch_weight = [1.0] * head + [float(w)] * (n_tok - head)
+                else:
+                    raw.branch_weight = [float(w)] * n_tok
             main_out.extra_fields["tb_opd_weight_main"] = float(weights[0])
             main_out.extra_fields["tb_opd_weight_max"] = float(max(weights))
             main_out.extra_fields["tb_opd_weight_min"] = float(min(weights))
@@ -1159,6 +1185,7 @@ class AgentLoopWorker:
         response_ids: list[int],
         response_logprobs: list[float] | None,
         apply_shaping: bool,
+        shared_prefix_len: int = 0,
     ) -> tuple[list[int], list[int], list[float] | None, list[float] | None, list[float] | None, list[float] | None]:
         """Build (response_ids, response_mask, response_logprobs, eos_sft_mask,
         rep_penalty, format_penalty) for a branch continuation.
@@ -1166,11 +1193,30 @@ class AgentLoopWorker:
         With ``apply_shaping`` the branch gets the SAME post-generation answer shaping
         as the main rollout (mask/EOS/penalty via ``agent_loop.apply_answer_shaping``);
         otherwise it keeps a full all-ones mask and no EOS/penalty columns (legacy).
+
+        ``shared_prefix_len`` tokens at the front are byte-identical to the main
+        trajectory, so they are zeroed out of both ``response_mask`` and
+        ``eos_sft_mask``: the main slot already supervises them, and leaving them in
+        would multiply that supervision by the number of branches.
         """
         response_mask = [1] * len(response_ids)
+        eos_sft_mask = rep_penalty = format_penalty = None
         if apply_shaping:
-            return agent_loop.apply_answer_shaping(response_ids, response_mask, response_logprobs)
-        return response_ids, response_mask, response_logprobs, None, None, None
+            (
+                response_ids,
+                response_mask,
+                response_logprobs,
+                eos_sft_mask,
+                rep_penalty,
+                format_penalty,
+            ) = agent_loop.apply_answer_shaping(response_ids, response_mask, response_logprobs)
+        if shared_prefix_len > 0:
+            from verl.experimental.agent_loop import tb_opd
+
+            response_mask, eos_sft_mask = tb_opd.mask_shared_prefix(
+                response_mask, eos_sft_mask, shared_prefix_len
+            )
+        return response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty
 
     async def _tb_generate_branch(
         self,
@@ -1180,6 +1226,7 @@ class AgentLoopWorker:
         cand_token: int,
         sampling_params: dict,
         apply_shaping: bool = False,
+        dedup_shared_prefix: bool = False,
     ) -> AgentLoopOutput:
         """Force ``cand_token`` at ``fork_pos`` then continue-generate the branch."""
         prompt_ids = list(main_out.prompt_ids)
@@ -1201,10 +1248,23 @@ class AgentLoopWorker:
         response_logprobs = None
         if main_out.response_logprobs is not None:
             cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
-            response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
+            # The prefix was sampled by the rollout policy in the main pass, so reuse its
+            # recorded logprobs rather than 0.0 (which reads as "p = 1" to any
+            # rollout-correction / IS consumer). The forced token itself keeps 0.0: its
+            # behaviour distribution really is a point mass, and correcting for how
+            # unlikely the student was to emit it is what branch_weight_mode="rb" does.
+            prefix_lp = [float(x) for x in main_out.response_logprobs[:fork_pos]]
+            prefix_lp += [0.0] * (len(resp_prefix) - len(prefix_lp))
+            response_logprobs = (prefix_lp + list(cont_lp))[:response_length]
 
         response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty = (
-            self._tb_shape_branch_fields(agent_loop, response_ids, response_logprobs, apply_shaping)
+            self._tb_shape_branch_fields(
+                agent_loop,
+                response_ids,
+                response_logprobs,
+                apply_shaping,
+                shared_prefix_len=fork_pos if dedup_shared_prefix else 0,
+            )
         )
 
         # Preserve weight-version tags for v1 off-policy metrics (TQ tags read these).
@@ -1244,6 +1304,7 @@ class AgentLoopWorker:
         sampling_params: dict,
         resample_temperature: float,
         apply_shaping: bool = False,
+        dedup_shared_prefix: bool = False,
     ) -> AgentLoopOutput:
         """Continue-generate from the shared prefix at ``fork_pos`` (no forced token)."""
         prompt_ids = list(main_out.prompt_ids)
@@ -1267,10 +1328,20 @@ class AgentLoopWorker:
         response_logprobs = None
         if main_out.response_logprobs is not None:
             cont_lp = out.log_probs if out.log_probs is not None else [0.0] * len(continuation)
-            response_logprobs = ([0.0] * len(resp_prefix) + list(cont_lp))[:response_length]
+            # Same as the forced-token path: the prefix keeps the rollout logprobs it was
+            # actually sampled with instead of 0.0.
+            prefix_lp = [float(x) for x in main_out.response_logprobs[:fork_pos]]
+            prefix_lp += [0.0] * (len(resp_prefix) - len(prefix_lp))
+            response_logprobs = (prefix_lp + list(cont_lp))[:response_length]
 
         response_ids, response_mask, response_logprobs, eos_sft_mask, rep_penalty, format_penalty = (
-            self._tb_shape_branch_fields(agent_loop, response_ids, response_logprobs, apply_shaping)
+            self._tb_shape_branch_fields(
+                agent_loop,
+                response_ids,
+                response_logprobs,
+                apply_shaping,
+                shared_prefix_len=fork_pos if dedup_shared_prefix else 0,
+            )
         )
 
         extra_fields: dict[str, Any] = {"turn_scores": [], "tool_rewards": []}

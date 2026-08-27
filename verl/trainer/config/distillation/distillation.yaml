@@ -197,6 +197,15 @@ tb_opd:
   # rep_penalty / format_penalty). Off -> branches keep full mask, no EOS/penalty.
   shape_branches: false
 
+  # Mask the pre-fork prefix out of every branch row so the tokens shared with the
+  # main trajectory are trained once instead of (1 + k) times. Under rb weighting the
+  # main slot's prefix also falls back to weight 1.0.
+  dedup_shared_prefix: true
+
+  # Only fork at positions still in-loss on the main trajectory (response_mask == 1),
+  # i.e. never inside the post-answer span that mask_after_answer / learn-EOS zeroed.
+  fork_respect_mask: true
+
   # Fork ranking blend: alpha * rank(entropy) + (1 - alpha) * rank(teacher disagreement).
   # 1.0 = pure entropy (student unsure); 0.0 = pure teacher KL (student wrong).
   fork_alpha: 1.0

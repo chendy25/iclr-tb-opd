@@ -158,6 +158,30 @@ def branch_weights(
     return [x * n for x in w]
 
 
+def mask_shared_prefix(
+    response_mask: list[int],
+    eos_sft_mask: Optional[list[float]],
+    prefix_len: int,
+) -> tuple[list[int], Optional[list[float]]]:
+    """Drop a branch's replay of the main trajectory from the loss.
+
+    A branch is generated as ``main[:fork] + forced_token + continuation``, so the
+    first ``prefix_len`` tokens are byte-identical to the main trajectory. Left
+    unmasked they are trained once per slot, which up-weights early tokens by the
+    number of slots and (via ``eos_sft_mask``) can duplicate the learn-EOS
+    supervision at the very same index. Zeroing both columns leaves the prefix
+    supervised exactly once, by the main slot.
+    """
+    if prefix_len <= 0:
+        return list(response_mask), (list(eos_sft_mask) if eos_sft_mask is not None else None)
+    n = min(int(prefix_len), len(response_mask))
+    masked = [0] * n + list(response_mask[n:])
+    if eos_sft_mask is None:
+        return masked, None
+    m = min(int(prefix_len), len(eos_sft_mask))
+    return masked, [0.0] * m + list(eos_sft_mask[m:])
+
+
 def normalize_ground_truth(reward_model: Any) -> Optional[str]:
     if reward_model is None:
         return None
@@ -255,7 +279,8 @@ def _collect_fork_candidates(
     filter_mode: str,
     metric: str,
     disagreement: Optional[list[float]] = None,
-) -> tuple[list, int]:
+    eligible_mask: Optional[list[int]] = None,
+) -> tuple[list, int, int]:
     """Score every eligible response position as a fork candidate.
 
     ``row_getter(p)`` returns ``(logprobs, token_ids)`` -- the top-k logprobs and
@@ -264,12 +289,20 @@ def _collect_fork_candidates(
     (``select_fork``) and Scheme-B (``select_fork_from_topk``) paths so filtering
     and scoring stay identical; only the source of the per-position top-k differs.
 
+    ``eligible_mask`` is the main trajectory's ``response_mask``: positions it zeroes
+    are already out of the loss (post-answer span under ``mask_after_answer`` /
+    learn-EOS), and forking there yields a branch whose whole continuation is masked
+    away while its injected EOS collides with the main trajectory's.
+
     Each candidate is ``(uncertainty, position, token_ids, logprobs, disagreement)``;
     the last entry is the teacher/student disagreement at that position (0.0 when no
     teacher signal was supplied) and is consumed by ``_finalize_fork``.
+
+    Returns ``(candidates, n_considered, n_mask_skipped)``.
     """
     cands: list[tuple[float, int, list[int], list[float], float]] = []
     n_considered = 0
+    n_mask_skipped = 0
     for p in range(resp_len):
         # Skip opener positions (CURE skips position 0).
         if p < skip_first:
@@ -277,6 +310,9 @@ def _collect_fork_candidates(
         # Need enough remaining budget to make a branch worthwhile.
         if response_length - p < min_tokens:
             break
+        if eligible_mask is not None and (p >= len(eligible_mask) or not eligible_mask[p]):
+            n_mask_skipped += 1
+            continue
         row = row_getter(p)
         if row is None:
             continue
@@ -291,7 +327,7 @@ def _collect_fork_candidates(
         n_considered += 1
         dis = float(disagreement[p]) if disagreement is not None and p < len(disagreement) else 0.0
         cands.append((fork_uncertainty(row_lp, metric), p, row_id, row_lp, dis))
-    return cands, n_considered
+    return cands, n_considered, n_mask_skipped
 
 
 def _finalize_fork(
@@ -307,6 +343,7 @@ def _finalize_fork(
     fork_alpha: float = 1.0,
     fork_fuse: str = "blend",
     sampled_logprobs: Optional[list[float]] = None,
+    n_mask_skipped: int = 0,
 ) -> dict:
     """Choose a fork position from scored candidates and build the result dict.
 
@@ -334,7 +371,11 @@ def _finalize_fork(
     ``"disagreement"`` / ``"both"`` for diagnostics.
     """
     if not cands:
-        return {"pos": None, "none_reason": "all_positions_filtered"}
+        return {
+            "pos": None,
+            "none_reason": "all_positions_filtered",
+            "num_mask_skipped": n_mask_skipped,
+        }
 
     n_before_gate = len(cands)
     # Stage 1: entropy gate as a filter (only meaningful for the entropy metric).
@@ -342,7 +383,12 @@ def _finalize_fork(
         gated = [c for c in cands if c[0] >= min_entropy]
         if not gated:
             best = max(c[0] for c in cands)
-            return {"pos": None, "none_reason": "below_min_entropy", "score": float(best)}
+            return {
+                "pos": None,
+                "none_reason": "below_min_entropy",
+                "score": float(best),
+                "num_mask_skipped": n_mask_skipped,
+            }
         cands = gated
 
     # Stage 2: combine entropy with teacher-disagreement.
@@ -411,6 +457,7 @@ def _finalize_fork(
         "disagreement": float(best_dis),
         "num_positions": n_considered,
         "num_gated": n_before_gate - len(cands),
+        "num_mask_skipped": n_mask_skipped,
         "source": source,
         "pool_entropy": n_h,
         "pool_disagreement": n_d,
@@ -439,6 +486,7 @@ async def select_fork(
     fork_fuse: str = "blend",
     disagreement: Optional[list[float]] = None,
     sampled_logprobs: Optional[list[float]] = None,
+    eligible_mask: Optional[list[int]] = None,
 ) -> Optional[dict]:
     """Second student forward to locate a high-uncertainty response fork position.
 
@@ -493,7 +541,7 @@ async def select_fork(
             return None
         return pl[di], pid[di]
 
-    cands, n_considered = _collect_fork_candidates(
+    cands, n_considered, n_mask_skipped = _collect_fork_candidates(
         response_ids,
         _row,
         resp_len=resp_len,
@@ -506,6 +554,7 @@ async def select_fork(
         filter_mode=filter_mode,
         metric=metric,
         disagreement=disagreement,
+        eligible_mask=eligible_mask,
     )
     return _finalize_fork(
         cands,
@@ -519,6 +568,7 @@ async def select_fork(
         fork_alpha=fork_alpha,
         fork_fuse=fork_fuse,
         sampled_logprobs=sampled_logprobs,
+        n_mask_skipped=n_mask_skipped,
     )
 
 
@@ -543,6 +593,7 @@ def select_fork_from_topk(
     fork_fuse: str = "blend",
     disagreement: Optional[list[float]] = None,
     sampled_logprobs: Optional[list[float]] = None,
+    eligible_mask: Optional[list[int]] = None,
 ) -> dict:
     """Scheme B: locate the fork from the main rollout's OWN per-token top-k
     logprobs (captured during generation via ``logprobs=k``), with no extra
@@ -575,7 +626,7 @@ def select_fork_from_topk(
             return None
         return out_logprobs[p], out_ids[p]
 
-    cands, n_considered = _collect_fork_candidates(
+    cands, n_considered, n_mask_skipped = _collect_fork_candidates(
         response_ids,
         _row,
         resp_len=resp_len,
@@ -588,6 +639,7 @@ def select_fork_from_topk(
         filter_mode=filter_mode,
         metric=metric,
         disagreement=disagreement,
+        eligible_mask=eligible_mask,
     )
     return _finalize_fork(
         cands,
@@ -601,4 +653,5 @@ def select_fork_from_topk(
         fork_alpha=fork_alpha,
         fork_fuse=fork_fuse,
         sampled_logprobs=sampled_logprobs,
+        n_mask_skipped=n_mask_skipped,
     )

@@ -747,6 +747,11 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
     num_gated = _floats("tb_opd_num_gated")
     if num_gated:
         metrics["tb_opd/fork_gated_positions/mean"] = float(np.mean(num_gated))
+    # Positions rejected because the main trajectory had already masked them out of the
+    # loss (post-answer span). Large values mean forks used to be landing there.
+    num_mask_skipped = _floats("tb_opd_num_mask_skipped")
+    if num_mask_skipped:
+        metrics["tb_opd/fork_mask_skipped_positions/mean"] = float(np.mean(num_mask_skipped))
     w_main, w_max, w_min = _floats("tb_opd_weight_main"), _floats("tb_opd_weight_max"), _floats("tb_opd_weight_min")
     if w_main:
         # Uniform weighting would put all three at exactly 1.0; the spread is how far

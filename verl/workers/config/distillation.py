@@ -334,6 +334,25 @@ class TBOPDConfig(BaseConfig):
         (``eos_sft_mask``) and the ``rep_penalty`` / ``format_penalty`` columns.
         When False (default) branches keep a full all-ones ``response_mask`` and no
         EOS/penalty columns, so mask/EOS only constrain the main trajectory.
+    dedup_shared_prefix (bool):
+        Every branch replays the main trajectory's tokens before the fork, so with
+        ``rollout.n = 1 + k`` that shared prefix is forward/backward-ed and enters the
+        loss ``1 + k`` times -- a silent ``(1 + k)x`` up-weighting of early tokens (and
+        of the learn-EOS supervision, whenever the fork lands past the final answer).
+        When True (default) the prefix is masked out of every *branch* row, so it is
+        trained exactly once via the main slot and each branch only supervises the
+        forced token onward. Under ``branch_weight_mode="rb"`` the main slot's prefix
+        also drops back to weight 1.0 (the RB weights sum to ``n``, so leaving it at
+        the main slot's weight would still over-count it). False restores the legacy
+        duplicated-prefix behaviour.
+    fork_respect_mask (bool):
+        Restrict fork candidates to positions that are still in-loss on the main
+        trajectory, i.e. where ``response_mask == 1``. Without this the fork can land
+        inside the post-answer span that ``mask_after_answer`` / learn-EOS already
+        zeroed: the branch then re-derives the *same* answer from the shared prefix,
+        everything it generates after the fork is masked away, and its injected EOS
+        duplicates the main trajectory's at the same index. Default True; False
+        restores the legacy behaviour of scanning the whole response.
     fork_alpha (float):
         Blend between the two fork-ranking signals:
         ``alpha * rank(entropy) + (1 - alpha) * rank(teacher_disagreement)``.
@@ -388,6 +407,8 @@ class TBOPDConfig(BaseConfig):
     branch_mode: str = "forced_topk"
     resample_temperature: float = -1.0
     shape_branches: bool = False
+    dedup_shared_prefix: bool = True
+    fork_respect_mask: bool = True
     fork_alpha: float = 1.0
     fork_kl_window: int = 128
     fork_fuse: str = "blend"

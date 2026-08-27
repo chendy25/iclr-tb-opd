@@ -377,10 +377,22 @@ def distillation_loss(
                 rollout_is_weights = (
                     branch_weight if rollout_is_weights is None else rollout_is_weights * branch_weight
                 )
-                seq_w = branch_weight[:, 0]
-                distillation_metrics["distillation/branch_weight_mean"] = seq_w.mean().item()
-                distillation_metrics["distillation/branch_weight_min"] = seq_w.min().item()
-                distillation_metrics["distillation/branch_weight_max"] = seq_w.max().item()
+                # Weights are per-token, not per-sequence: under dedup_shared_prefix the
+                # main slot's pre-fork tokens sit at 1.0 while the fork onward carries the
+                # RB weight, so position 0 is no longer representative. Summarize over the
+                # tokens that actually reach the loss instead.
+                w_mask = response_mask.to(branch_weight.dtype)
+                n_in_loss = w_mask.sum()
+                if n_in_loss > 0:
+                    distillation_metrics["distillation/branch_weight_mean"] = (
+                        (branch_weight * w_mask).sum() / n_in_loss
+                    ).item()
+                    distillation_metrics["distillation/branch_weight_min"] = (
+                        branch_weight.masked_fill(w_mask == 0, float("inf")).min().item()
+                    )
+                    distillation_metrics["distillation/branch_weight_max"] = (
+                        branch_weight.masked_fill(w_mask == 0, float("-inf")).max().item()
+                    )
 
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
