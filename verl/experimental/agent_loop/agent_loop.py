@@ -457,7 +457,10 @@ class AgentLoopBase(ABC):
 
         Args:
             sampling_params (Dict[str, Any]): LLM sampling params.
-            **kwargs: dataset fields from `verl.utils.dataset.RLHFDataset`.
+            **kwargs: dataset fields from `verl.utils.dataset.RLHFDataset`, plus
+                ``validate`` (bool) marking a validation rollout. Loops that hold
+                split-specific state (e.g. an environment pool) should branch on it;
+                others may ignore it.
 
         Returns:
             AgentLoopOutput: Agent loop output.
@@ -716,7 +719,11 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            # ``validate`` is passed separately rather than merged into ``kwargs``,
+            # which is reused below as **kwargs alongside a positional ``validate``.
+            output: AgentLoopOutput = await agent_loop.run(
+                sampling_params, validate=trajectory["validate"], **kwargs
+            )
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _make_agent_loop(self, agent_name: str):

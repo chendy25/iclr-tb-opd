@@ -119,6 +119,17 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        # A micro-batch can hold no supervised token at all -- e.g. a multi-turn
+        # rollout whose episode produced zero assistant tokens, so its whole
+        # response_mask is padding. min/max are undefined on an empty set and must
+        # not abort the optimizer step; report nothing and let the caller's other
+        # metrics stand.
+        logger.warning(
+            "distillation loss range: micro-batch has no unmasked response token "
+            "(response_mask sums to 0); skipping loss_min/loss_max for it."
+        )
+        return {}
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),

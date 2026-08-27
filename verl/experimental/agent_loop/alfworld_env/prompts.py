@@ -20,8 +20,13 @@ accumulates the full transcript, so the model already sees prior turns. We
 therefore only render:
   - an instruction-bearing initial user turn (task + first observation), and
   - a compact follow-up user turn carrying the new observation each step.
-Both keep the ATOD ``<think>``/``<action>`` answer contract so the same teacher /
-projection / reward semantics apply.
+The answer contract is ATOD's ``<action>`` block. ATOD also asks for a ``<think>``
+block, but we run with ``enable_thinking=False``, under which Qwen3's chat template
+pre-fills an empty ``<think></think>`` into the generation prompt: the model is
+already "done thinking" before it emits a token, so asking it to think again is
+self-contradictory and no ``<think>`` can ever appear in the generated text. Restore
+the request here only together with real thinking (drop the ``enable_thinking`` kwarg)
+and a much larger per-turn / per-episode token budget.
 """
 
 from typing import List
@@ -31,14 +36,14 @@ Your current observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
-Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
+Choose exactly one action from the admissible actions above and present it within <action> </action> tags.
+Output nothing else."""
 
 ALFWORLD_FOLLOWUP_TEMPLATE = """Your new observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step within <think> </think> tags, then present one admissible action within <action> </action> tags."""
+Choose exactly one admissible action and present it within <action> </action> tags."""
 
 
 def _format_admissible(admissible_actions: List[str]) -> str:

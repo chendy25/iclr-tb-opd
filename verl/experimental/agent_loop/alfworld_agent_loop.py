@@ -92,13 +92,23 @@ class AlfWorldAgentLoop(AgentLoopBase):
         self.max_steps = int(_cfg("max_steps", 50))
         self.pool_size = int(_cfg("pool_size", 16))
         self.config_path = _cfg("config_path", None)
-        # Rollout uses training games. A proper unseen-eval split needs the core
-        # loop to thread ``validate`` into ``run`` (follow-up); overridable via env.
+        # AlfredTWEnv fixes its game list at construction, so training and validation
+        # use two separate pools; ``run`` picks one per episode via ``validate``.
+        # Splits: train | eval_in_distribution (valid_seen) | eval_out_of_distribution
+        # (valid_unseen). Validation defaults to the unseen rooms.
         self.train_eval = os.environ.get("ALFWORLD_TRAIN_EVAL", str(_cfg("train_eval", "train")))
+        self.eval_split = os.environ.get(
+            "ALFWORLD_EVAL_SPLIT", str(_cfg("eval_split", "eval_out_of_distribution"))
+        )
         # Per-turn generation cap keeps a single turn from consuming the whole budget.
         self.max_turn_tokens = int(_cfg("max_turn_tokens", 512))
 
     def _game_seed(self, kwargs: dict) -> int:
+        # Prefer the dataset index: it makes the game a reproducible function of the
+        # row, and rollout.n replicas of one prompt share a game (needed for GRPO
+        # grouping). Rollout dumps that appeared to show this index broadcast across a
+        # batch were actually reading synthetic padding rows, which copy row 0's
+        # metadata -- see upsample_batch_to_divisible_size.
         extra_info = _to_py(kwargs.get("extra_info")) or {}
         if isinstance(extra_info, dict) and extra_info.get("index") is not None:
             return int(_to_py(extra_info["index"]))
@@ -108,10 +118,11 @@ class AlfWorldAgentLoop(AgentLoopBase):
         return 0
 
     @rollout_trace_op
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], validate: bool = False, **kwargs) -> AgentLoopOutput:
         metrics: dict[str, Any] = {}
         seed = self._game_seed(kwargs)
-        pool = get_env_pool(self.config_path, self.train_eval, self.pool_size)
+        split = self.eval_split if validate else self.train_eval
+        pool = get_env_pool(self.config_path, split, self.pool_size)
 
         handle = await pool.acquire()
         won = False
@@ -195,16 +206,45 @@ class AlfWorldAgentLoop(AgentLoopBase):
 
         # Split running sequence into prompt / response (mirror ToolAgentLoop).
         resp_len = len(response_mask)
+        if resp_len == 0:
+            # Such a row enters the batch fully masked, which downstream shows up as a
+            # micro-batch with zero supervised tokens. The only path here is the very
+            # first generate() returning no token, so log enough to tell whether the
+            # prompt overran the model window or the model emitted EOS immediately.
+            logger.warning(
+                "[alfworld] degenerate episode: 0 assistant tokens (env_steps=%d, "
+                "prompt_len=%d, split=%s, gamefile=%s)",
+                num_env_steps,
+                len(running_ids),
+                split,
+                gamefile,
+            )
         response_ids = running_ids[-resp_len:] if resp_len else []
         prompt_ids = running_ids[: len(running_ids) - resp_len]
 
         metrics.setdefault("num_preempted", -1)
-        extra_fields: dict[str, Any] = {
-            "turn_scores": [],
-            "tool_rewards": [],
+        # Diagnostics go under ``reward_extra_info``: that is the only nested key the
+        # trainer expands into validation metrics. It is safe to set here because the
+        # async reward loop only overwrites it when ``reward_score`` is None, and we
+        # always set one. Under pure OPD from an ALFWorld-naive teacher, success rate
+        # sits near the floor, so these are the signals that actually discriminate.
+        diagnostics: dict[str, Any] = {
             "alfworld_won": float(won),
             "alfworld_num_env_steps": float(num_env_steps),
             "alfworld_invalid_action_frac": float(invalid_actions) / max(1, num_env_steps),
+            # Response budget usage: a mean near response_length means episodes are
+            # being cut off mid-task, a min of 0 means degenerate rows reached the batch.
+            "alfworld_resp_len": float(resp_len),
+            # Episode seed == the game index. Dumped so that "how many distinct games
+            # did this batch actually play" is checkable against distinct gamefiles.
+            "alfworld_seed": float(seed),
+        }
+        extra_fields: dict[str, Any] = {
+            "alfworld_split": split,
+            "turn_scores": [],
+            "tool_rewards": [],
+            "reward_extra_info": diagnostics,
+            **diagnostics,
         }
         if gamefile is not None:
             extra_fields["alfworld_gamefile"] = str(gamefile)

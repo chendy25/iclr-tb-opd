@@ -1250,12 +1250,13 @@ class PPOTrainer(ABC):
             extra_fields = [extra_fields[i] for i in sorted_indices]
 
             reward_extra_infos_dict = {"uid": [batch.keys[i] for i in sorted_indices]}
-            # TB-OPD diagnostics live in agent-loop extra_fields; expand into dump columns.
-            tb_keys: set[str] = set()
+            # TB-OPD / env diagnostics live in agent-loop extra_fields; expand into dump columns.
+            diag_prefixes = ("tb_opd_", "alfworld_")
+            diag_keys: set[str] = set()
             for ef in extra_fields:
                 if isinstance(ef, dict):
-                    tb_keys.update(k for k in ef if k.startswith("tb_opd_"))
-            for key in sorted(tb_keys):
+                    diag_keys.update(k for k in ef if k.startswith(diag_prefixes))
+            for key in sorted(diag_keys):
                 reward_extra_infos_dict[key] = [
                     ef.get(key) if isinstance(ef, dict) else None for ef in extra_fields
                 ]

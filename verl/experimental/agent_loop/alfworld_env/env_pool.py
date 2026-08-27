@@ -43,6 +43,21 @@ import yaml
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# TextWorld's PDDL parser (tatsu) keeps mutable state that is not per-instance, and
+# because batch_size=1 selects SyncBatchEnv it runs directly in whichever executor
+# thread drove the call. Concurrent episodes therefore corrupt each other: 24
+# concurrent resets in one process failed 23 times (IndexError / FailedToken /
+# TypeError raised from inside tatsu) where the same workload run serially failed zero
+# times. Those failures killed whole episodes, and the trainer replaced each one with
+# synthetic padding rows, so a run could report full batches while training on almost
+# no real trajectories.
+#
+# Both reset and step are covered: parsing is not confined to game loading, and
+# locking reset alone still left tatsu failures raised from step. The cost is small
+# because the dominant per-turn cost -- LLM generation -- is awaited outside the lock,
+# while an env call is a short CPU-bound step.
+_TEXTWORLD_LOCK = threading.Lock()
+
 _DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "config_tw.yaml")
 
 # Per-process singletons keyed by (config_path, train_eval).
@@ -93,44 +108,75 @@ def _get_base_env(config_path: str, train_eval: str):
     return _BASE_ENVS[key]
 
 
+def _first(value, default=None):
+    """Unwrap a batched TextWorld value (one entry per env) for our batch_size=1 handle.
+
+    Values arrive as list / tuple / ndarray per env, but scalars and already-unwrapped
+    strings also show up depending on the wrapper, so leave those untouched.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (str, bytes, dict)):
+        return value
+    try:
+        return value[0]
+    except (TypeError, IndexError, KeyError):
+        return value
+
+
 def _extract0(infos: dict, key: str, default=None):
     """Batched TextWorld infos are dict[str, list]; return the first element."""
-    val = infos.get(key, None)
-    if val is None:
+    if not isinstance(infos, dict):
         return default
-    try:
-        return val[0]
-    except (TypeError, IndexError):
-        return val
+    return _first(infos.get(key), default)
 
 
 class AlfredEnvHandle:
     """A single-game TextWorld env handle (batch_size=1). Blocking; call from executor."""
 
     def __init__(self, base_env):
-        self.env = base_env.init_env(batch_size=1)
+        # Registering games touches the same TextWorld machinery as loading one, and
+        # handles are built concurrently on first use; serialize it too (bounded by
+        # pool_size per process, so the cost is negligible).
+        with _TEXTWORLD_LOCK:
+            self.env = base_env.init_env(batch_size=1)
+        # Sorted so the seed -> game mapping is identical in every worker process and
+        # across runs; ``collect_game_files`` walks directories, so its natural order
+        # is not guaranteed stable.
+        self.game_files = sorted(base_env.game_files)
 
     def reset(self, seed: int) -> dict:
-        """Seed then reset so a given ``seed`` deterministically selects a game."""
-        try:
-            self.env.seed(int(seed))
-        except Exception as e:  # noqa: BLE001 - some backends seed lazily
-            logger.warning("[alfworld] seed(%s) failed: %s", seed, e)
-        obs, infos = self.env.reset()
+        """Reset onto the game named by ``seed`` (index into the split's game list).
+
+        TextWorld's own ``seed(s)`` only reshuffles the game order and leaves the
+        actual pick to an iterator, which made a batch of distinct seeds collapse
+        onto a handful of games. Pointing ``gamefiles`` at the single game we want
+        and re-seeding rebuilds the iterator over that one entry, so ``reset()``
+        lands on it exactly.
+        """
+        idx = int(seed) % len(self.game_files)
+        game = self.game_files[idx]
+        with _TEXTWORLD_LOCK:
+            self.env.gamefiles = [game]
+            self.env.seed(0)
+            obs, infos = self.env.reset()
         return {
-            "observation": obs[0],
+            "observation": _first(obs, ""),
             "admissible_commands": _extract0(infos, "admissible_commands", []),
             "won": bool(_extract0(infos, "won", False)),
             "gamefile": _extract0(infos, "extra.gamefile", None),
         }
 
     def step(self, action: str) -> dict:
-        obs, scores, dones, infos = self.env.step([action])
+        # ``dones`` is a plain per-env sequence, not an infos dict, so it unwraps
+        # via _first rather than _extract0.
+        with _TEXTWORLD_LOCK:
+            obs, _scores, dones, infos = self.env.step([action])
         return {
-            "observation": obs[0],
+            "observation": _first(obs, ""),
             "admissible_commands": _extract0(infos, "admissible_commands", []),
             "won": bool(_extract0(infos, "won", False)),
-            "done": bool(_extract0(dones if isinstance(dones, list) else [dones], 0, False)),
+            "done": bool(_first(dones, False)),
             "gamefile": _extract0(infos, "extra.gamefile", None),
         }
 
