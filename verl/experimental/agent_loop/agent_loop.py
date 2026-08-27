@@ -890,6 +890,10 @@ class AgentLoopWorker:
         # and keep the fork out of the span the main trajectory already masked away.
         dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
         fork_respect_mask = bool(cfg.get("fork_respect_mask", True))
+        # B fork positions x k forced alternatives each, so rollout.n should be 1 + B*k.
+        branch_k = max(1, int(cfg.get("k", 2)))
+        num_forks = max(1, int(cfg.get("num_forks", 1)))
+        fork_min_gap = max(0, int(cfg.get("fork_min_gap", 0)))
         # Fork ranking blend and Rao-Blackwell branch weighting (see TBOPDConfig).
         fork_alpha = float(cfg.get("fork_alpha", 1.0))
         fork_kl_window = int(cfg.get("fork_kl_window", 128))
@@ -989,6 +993,8 @@ class AgentLoopWorker:
                     disagreement=disagreement,
                     sampled_logprobs=main_out.response_logprobs,
                     eligible_mask=eligible_mask,
+                    num_forks=num_forks,
+                    fork_min_gap=fork_min_gap,
                 )
             else:
                 fork = await tb_opd.select_fork(
@@ -1013,6 +1019,8 @@ class AgentLoopWorker:
                     disagreement=disagreement,
                     sampled_logprobs=main_out.response_logprobs,
                     eligible_mask=eligible_mask,
+                    num_forks=num_forks,
+                    fork_min_gap=fork_min_gap,
                 )
             none_reason = "ok" if fork.get("pos") is not None else str(fork.get("none_reason", "unknown"))
 
@@ -1071,33 +1079,55 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_fork_disagreement"] = float(fork.get("disagreement", 0.0))
             main_out.extra_fields["tb_opd_num_gated"] = float(fork.get("num_gated", 0))
             main_out.extra_fields["tb_opd_fork_source"] = str(fork.get("source", "entropy"))
+            # How many fork positions actually survived the gap filter (<= num_forks),
+            # and how far apart they landed -- forks bunched together yield branches
+            # that share nearly their whole prefix.
+            fk_all = fork.get("forks") or [fork]
+            main_out.extra_fields["tb_opd_forks_used"] = float(len(fk_all))
+            if len(fk_all) > 1:
+                pos_all = sorted(int(f["pos"]) for f in fk_all)
+                main_out.extra_fields["tb_opd_fork_span"] = float(pos_all[-1] - pos_all[0])
+                main_out.extra_fields["tb_opd_fork_min_gap"] = float(
+                    min(b - a for a, b in zip(pos_all, pos_all[1:], strict=False))
+                )
+
+        # Slot layout: slot 0 is the main trajectory, slot ``1 + b*k + j`` is the j-th
+        # forced alternative at fork b. rollout.n should be 1 + B*k; the modulo keeps
+        # every slot filled when it is not -- fewer forks may survive the gap filter.
+        fork_list = (fork.get("forks") or [fork]) if mode == "branch" else []
+
+        def _slot_fork(slot: int) -> tuple[dict, int, int]:
+            b, j = tb_opd.slot_fork_index(slot, branch_k, len(fork_list))
+            return fork_list[b], b, j
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
         for slot in range(1, n_slots):
             if mode == "branch":
+                fk, fork_idx, cand_idx = _slot_fork(slot)
                 if branch_mode == "resample":
                     branch_out = await self._tb_generate_branch_resample(
                         agent_loop,
                         main_out,
-                        fork["pos"],
+                        fk["pos"],
                         dict(sampling_params),
                         resample_temperature,
                         apply_shaping=shape_branches,
                         dedup_shared_prefix=dedup_shared_prefix,
                     )
                 else:
-                    cands = fork["cand_token_ids"]
-                    cand_token = cands[(slot - 1) % len(cands)]
+                    cands = fk["cand_token_ids"]
+                    cand_token = cands[cand_idx % len(cands)]
                     branch_out = await self._tb_generate_branch(
                         agent_loop,
                         main_out,
-                        fork["pos"],
+                        fk["pos"],
                         int(cand_token),
                         dict(sampling_params),
                         apply_shaping=shape_branches,
                         dedup_shared_prefix=dedup_shared_prefix,
                     )
                 branch_out.extra_fields["tb_opd_slot"] = slot
+                branch_out.extra_fields["tb_opd_fork_idx"] = float(fork_idx)
                 branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
                 branch_out.extra_fields["tb_opd_mode_branch"] = 1.0
                 branch_out.extra_fields["tb_opd_branch_mode"] = branch_mode
@@ -1118,14 +1148,34 @@ class AgentLoopWorker:
         # effective learning rate -- is unchanged; only the split inside it moves.
         if branch_weight_mode == "rb":
             weights = None
+            multi_fork = mode == "branch" and len(fork_list) > 1
             if mode == "branch" and branch_mode != "resample":
-                cand_lps = fork.get("cand_logprobs") or []
-                slot_lps: list[Optional[float]] = [fork.get("main_logprob")]
-                for slot in range(1, n_slots):
-                    slot_lps.append(cand_lps[(slot - 1) % len(cand_lps)] if cand_lps else None)
-                weights = tb_opd.branch_weights(
-                    slot_lps, temperature=branch_weight_temp, floor=branch_weight_floor
-                )
+                if multi_fork:
+                    # The main trajectory passes through all B forks, so a single scalar
+                    # per token cannot carry a per-fork weight. Pin it at 1.0 -- the same
+                    # "count it once" accounting dedup_shared_prefix uses for the prefix
+                    # -- and normalize each fork's k forced branches among themselves to
+                    # mass k. The total is still 1 + B*k = n, so the mean stays 1.
+                    weights = [1.0] * n_slots
+                    for b in range(len(fork_list)):
+                        slots_b = [s for s in range(1, n_slots) if _slot_fork(s)[1] == b]
+                        lps_b = fork_list[b].get("cand_logprobs") or []
+                        group = tb_opd.branch_weights(
+                            [lps_b[_slot_fork(s)[2] % len(lps_b)] if lps_b else None for s in slots_b],
+                            temperature=branch_weight_temp,
+                            floor=branch_weight_floor,
+                        )
+                        if group:
+                            for s, w in zip(slots_b, group, strict=True):
+                                weights[s] = w
+                else:
+                    cand_lps = fork.get("cand_logprobs") or []
+                    slot_lps: list[Optional[float]] = [fork.get("main_logprob")]
+                    for slot in range(1, n_slots):
+                        slot_lps.append(cand_lps[(slot - 1) % len(cand_lps)] if cand_lps else None)
+                    weights = tb_opd.branch_weights(
+                        slot_lps, temperature=branch_weight_temp, floor=branch_weight_floor
+                    )
             # Every sample must carry the column: a per-sample ragged schema silently
             # drops the whole field on the TransferQueue path.
             weights = weights or [1.0] * n_slots
@@ -1133,7 +1183,11 @@ class AgentLoopWorker:
             # still be counted more than once relative to an unbranched trajectory. With
             # the branch copies masked away, the main slot's prefix carries the whole
             # group's prefix and belongs at weight 1.0; only the fork onward is split.
-            prefix_len = int(fork["pos"]) if (dedup_shared_prefix and mode == "branch") else 0
+            # Under multi-fork the main slot is already at 1.0 throughout, so there is
+            # nothing left to split off.
+            prefix_len = (
+                int(fork["pos"]) if (dedup_shared_prefix and mode == "branch" and not multi_fork) else 0
+            )
             for slot, (raw, w) in enumerate(zip(raw_outputs, weights, strict=True)):
                 n_tok = len(raw.response_ids)
                 if slot == 0 and prefix_len > 0:

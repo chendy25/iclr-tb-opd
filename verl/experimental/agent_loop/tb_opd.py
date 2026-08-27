@@ -158,6 +158,20 @@ def branch_weights(
     return [x * n for x in w]
 
 
+def slot_fork_index(slot: int, k: int, n_forks: int) -> tuple[int, int]:
+    """Map a rollout slot to ``(fork_index, candidate_index)``.
+
+    Slot 0 is the main trajectory; slot ``1 + b*k + j`` is the j-th forced alternative
+    at fork ``b``, so ``rollout.n`` should be ``1 + B*k``. The modulo keeps every slot
+    filled when it is not: the minimum-gap filter can return fewer forks than requested,
+    and leaving a slot unassigned would break the fixed ``rollout.n`` row contract.
+    """
+    i = int(slot) - 1
+    k = max(1, int(k))
+    n_forks = max(1, int(n_forks))
+    return (i // k) % n_forks, i % k
+
+
 def mask_shared_prefix(
     response_mask: list[int],
     eos_sft_mask: Optional[list[float]],
@@ -330,6 +344,70 @@ def _collect_fork_candidates(
     return cands, n_considered, n_mask_skipped
 
 
+def _greedy_pick(cands: list, seq: list[int], num_forks: int, min_gap: int) -> list[int]:
+    """Take up to ``num_forks`` candidate indices from ``seq``, at least ``min_gap`` apart.
+
+    ``seq`` is walked in order, so the caller decides the policy: ranked by fused score
+    for ``argmax``, shuffled for ``topk_uniform``. The gap check is what makes ``B > 1``
+    worth the rollouts -- the top-ranked positions are usually neighbours, and two forks
+    a few tokens apart share almost their entire prefix, so their branches come out as
+    near-duplicates of each other.
+    """
+    picked: list[int] = []
+    for i in seq:
+        p = cands[i][1]
+        if all(abs(p - cands[j][1]) >= min_gap for j in picked):
+            picked.append(i)
+            if len(picked) >= num_forks:
+                break
+    return picked
+
+
+def _fork_entry(
+    cands: list,
+    pick: int,
+    response_ids: list[int],
+    *,
+    dedup_main: bool,
+    sampled_logprobs: Optional[list[float]],
+    fused: list[float],
+    set_h: Optional[set],
+    set_d: Optional[set],
+) -> dict:
+    """Build the per-fork payload: position, forced candidates, and their logprobs."""
+    best_score, best_pos, best_cands, best_lps, best_dis = cands[pick]
+
+    # Exclude the main-sampled token so each branch is a genuine alternative.
+    main_tok = int(response_ids[best_pos])
+    lp_by_id = {int(t): float(lp) for t, lp in zip(best_cands, best_lps, strict=False)}
+    main_logprob = lp_by_id.get(main_tok)
+    if main_logprob is None and sampled_logprobs is not None and best_pos < len(sampled_logprobs):
+        # Main token fell outside the top-k row; fall back to its rollout logprob.
+        main_logprob = float(sampled_logprobs[best_pos])
+    if dedup_main:
+        deduped = [(t, lp) for t, lp in zip(best_cands, best_lps, strict=False) if int(t) != main_tok]
+        if deduped:
+            best_cands = [t for t, _ in deduped]
+            best_lps = [lp for _, lp in deduped]
+
+    if set_h is None or set_d is None:
+        source = "entropy"
+    else:
+        in_h, in_d = pick in set_h, pick in set_d
+        source = "both" if in_h and in_d else ("disagreement" if in_d else "entropy")
+
+    return {
+        "pos": best_pos,
+        "cand_token_ids": best_cands,
+        "cand_logprobs": [float(x) for x in best_lps],
+        "main_logprob": main_logprob,
+        "score": float(best_score),
+        "fused_score": float(fused[pick]),
+        "disagreement": float(best_dis),
+        "source": source,
+    }
+
+
 def _finalize_fork(
     cands: list,
     n_considered: int,
@@ -344,8 +422,10 @@ def _finalize_fork(
     fork_fuse: str = "blend",
     sampled_logprobs: Optional[list[float]] = None,
     n_mask_skipped: int = 0,
+    num_forks: int = 1,
+    fork_min_gap: int = 0,
 ) -> dict:
-    """Choose a fork position from scored candidates and build the result dict.
+    """Choose fork position(s) from scored candidates and build the result dict.
 
     Selection is a two-stage process:
 
@@ -365,7 +445,12 @@ def _finalize_fork(
          ``ceil(k/2)`` by disagreement, then pick from that union. This is the
          mode that actually lets both kinds of position be selected.
 
-    The result carries ``cand_logprobs`` (aligned with ``cand_token_ids``) and
+    3. **How many forks** (``num_forks``, ``B``). ``B == 1`` returns the single best
+       position. ``B > 1`` walks the same ordering greedily, skipping anything within
+       ``fork_min_gap`` tokens of a position already taken, and returns them under
+       ``forks``. Fork 0's fields are mirrored at the top level for existing readers.
+
+    Each fork carries ``cand_logprobs`` (aligned with ``cand_token_ids``) and
     ``main_logprob`` so the caller can weight each branch by the student's own
     probability of the forced token. ``source`` is ``"entropy"`` /
     ``"disagreement"`` / ``"both"`` for diagnostics.
@@ -375,6 +460,7 @@ def _finalize_fork(
             "pos": None,
             "none_reason": "all_positions_filtered",
             "num_mask_skipped": n_mask_skipped,
+            "forks": [],
         }
 
     n_before_gate = len(cands)
@@ -388,6 +474,7 @@ def _finalize_fork(
                 "none_reason": "below_min_entropy",
                 "score": float(best),
                 "num_mask_skipped": n_mask_skipped,
+                "forks": [],
             }
         cands = gated
 
@@ -396,12 +483,12 @@ def _finalize_fork(
     fuse = str(fork_fuse)
     use_teacher = fuse in ("max", "union") or alpha < 1.0
     n_h = n_d = 0
-    source = "entropy"
+    set_h = set_d = None
     if not use_teacher:
         fused = [c[0] for c in cands]
         order = sorted(range(len(cands)), key=lambda i: fused[i], reverse=True)
         pool = order[: max(1, topk_positions)] if select == "topk_uniform" else order[:1]
-        pick = random.choice(pool) if select == "topk_uniform" else order[0]
+        ranked = order
         n_h = len(pool)
     else:
         rank_h = _normalized_ranks([c[0] for c in cands])
@@ -414,10 +501,7 @@ def _finalize_fork(
             # Preserve entropy-first then disagreement so ties stay deterministic.
             pool = list(dict.fromkeys(top_h + top_d))
             fused = [max(rank_h[i], rank_d[i]) for i in range(len(cands))]
-            if select == "topk_uniform":
-                pick = random.choice(pool)
-            else:
-                pick = max(pool, key=lambda i: fused[i])
+            ranked = sorted(pool, key=lambda i: fused[i], reverse=True)
             n_h, n_d = len(set_h), len(set_d)
         else:
             if fuse == "max":
@@ -426,42 +510,48 @@ def _finalize_fork(
                 fused = [alpha * rank_h[i] + (1.0 - alpha) * rank_d[i] for i in range(len(cands))]
             order = sorted(range(len(cands)), key=lambda i: fused[i], reverse=True)
             pool = order[: max(1, topk_positions)] if select == "topk_uniform" else order[:1]
-            pick = random.choice(pool) if select == "topk_uniform" else order[0]
+            ranked = order
             n_h = sum(1 for i in pool if i in set_h)
             n_d = sum(1 for i in pool if i in set_d)
-        in_h, in_d = pick in set_h, pick in set_d
-        source = "both" if in_h and in_d else ("disagreement" if in_d else "entropy")
 
-    best_score, best_pos, best_cands, best_lps, best_dis = cands[pick]
+    # Stage 3: how many fork positions to open. B == 1 keeps the original single-pick
+    # semantics byte for byte; B > 1 walks the same ordering greedily under a gap.
+    b = max(1, int(num_forks))
+    if b == 1:
+        picks = [random.choice(pool)] if select == "topk_uniform" else [ranked[0]]
+    else:
+        seq = random.sample(pool, len(pool)) if select == "topk_uniform" else ranked
+        picks = _greedy_pick(cands, seq, b, max(0, int(fork_min_gap)))
 
-    # Exclude the main-sampled token so each branch is a genuine alternative.
-    main_tok = int(response_ids[best_pos])
-    lp_by_id = {int(t): float(lp) for t, lp in zip(best_cands, best_lps, strict=False)}
-    main_logprob = lp_by_id.get(main_tok)
-    if main_logprob is None and sampled_logprobs is not None and best_pos < len(sampled_logprobs):
-        # Main token fell outside the top-k row; fall back to its rollout logprob.
-        main_logprob = float(sampled_logprobs[best_pos])
-    if dedup_main:
-        deduped = [(t, lp) for t, lp in zip(best_cands, best_lps, strict=False) if int(t) != main_tok]
-        if deduped:
-            best_cands = [t for t, _ in deduped]
-            best_lps = [lp for _, lp in deduped]
+    forks = [
+        _fork_entry(
+            cands,
+            i,
+            response_ids,
+            dedup_main=dedup_main,
+            sampled_logprobs=sampled_logprobs,
+            fused=fused,
+            set_h=set_h,
+            set_d=set_d,
+        )
+        for i in picks
+    ]
 
-    return {
-        "pos": best_pos,
-        "cand_token_ids": best_cands,
-        "cand_logprobs": [float(x) for x in best_lps],
-        "main_logprob": main_logprob,
-        "score": float(best_score),
-        "fused_score": float(fused[pick]),
-        "disagreement": float(best_dis),
-        "num_positions": n_considered,
-        "num_gated": n_before_gate - len(cands),
-        "num_mask_skipped": n_mask_skipped,
-        "source": source,
-        "pool_entropy": n_h,
-        "pool_disagreement": n_d,
-    }
+    # Fork 0's fields stay at the top level so every existing reader (metrics,
+    # has_fork checks) keeps working unchanged; ``forks`` carries the full list.
+    result = dict(forks[0])
+    result.update(
+        {
+            "forks": forks,
+            "num_forks": len(forks),
+            "num_positions": n_considered,
+            "num_gated": n_before_gate - len(cands),
+            "num_mask_skipped": n_mask_skipped,
+            "pool_entropy": n_h,
+            "pool_disagreement": n_d,
+        }
+    )
+    return result
 
 
 async def select_fork(
@@ -487,6 +577,8 @@ async def select_fork(
     disagreement: Optional[list[float]] = None,
     sampled_logprobs: Optional[list[float]] = None,
     eligible_mask: Optional[list[int]] = None,
+    num_forks: int = 1,
+    fork_min_gap: int = 0,
 ) -> Optional[dict]:
     """Second student forward to locate a high-uncertainty response fork position.
 
@@ -569,6 +661,8 @@ async def select_fork(
         fork_fuse=fork_fuse,
         sampled_logprobs=sampled_logprobs,
         n_mask_skipped=n_mask_skipped,
+        num_forks=num_forks,
+        fork_min_gap=fork_min_gap,
     )
 
 
@@ -594,6 +688,8 @@ def select_fork_from_topk(
     disagreement: Optional[list[float]] = None,
     sampled_logprobs: Optional[list[float]] = None,
     eligible_mask: Optional[list[int]] = None,
+    num_forks: int = 1,
+    fork_min_gap: int = 0,
 ) -> dict:
     """Scheme B: locate the fork from the main rollout's OWN per-token top-k
     logprobs (captured during generation via ``logprobs=k``), with no extra
@@ -654,4 +750,6 @@ def select_fork_from_topk(
         fork_fuse=fork_fuse,
         sampled_logprobs=sampled_logprobs,
         n_mask_skipped=n_mask_skipped,
+        num_forks=num_forks,
+        fork_min_gap=fork_min_gap,
     )

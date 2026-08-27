@@ -206,6 +206,15 @@ tb_opd:
   # i.e. never inside the post-answer span that mask_after_answer / learn-EOS zeroed.
   fork_respect_mask: true
 
+  # Number of fork POSITIONS per trajectory (B); rollout.n should be 1 + B * k.
+  # 1 = single-fork method. Raising B beats raising k at equal budget: RB weights
+  # renormalize within one fork, so extra k mostly inflates the main trajectory.
+  num_forks: 1
+
+  # Minimum token distance between fork positions when num_forks > 1, so the top-B
+  # ranked positions do not land adjacent and produce near-identical branches.
+  fork_min_gap: 16
+
   # Fork ranking blend: alpha * rank(entropy) + (1 - alpha) * rank(teacher disagreement).
   # 1.0 = pure entropy (student unsure); 0.0 = pure teacher KL (student wrong).
   fork_alpha: 1.0

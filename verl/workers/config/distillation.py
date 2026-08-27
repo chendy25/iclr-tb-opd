@@ -259,9 +259,10 @@ class TBOPDConfig(BaseConfig):
     enable (bool):
         Master switch. When False, rollout falls back to standard per-row generation.
     k (int):
-        Number of alternative tokens expanded into full branch continuations at the
-        fork position. With rollout.n = 1 + k, slot 0 is the main trajectory and
-        slots 1..k are the branches.
+        Number of alternative tokens expanded into full branch continuations at each
+        fork position. With ``rollout.n = 1 + num_forks * k``, slot 0 is the main
+        trajectory and slot ``1 + b*k + j`` is the j-th alternative at fork ``b``.
+        See ``num_forks`` on why spending budget on B beats spending it on k.
     only_fail (bool):
         If True, only branch when the main trajectory is judged incorrect by the
         rule-based reward; otherwise the extra slots are filled with plain rollouts.
@@ -353,6 +354,22 @@ class TBOPDConfig(BaseConfig):
         everything it generates after the fork is masked away, and its injected EOS
         duplicates the main trajectory's at the same index. Default True; False
         restores the legacy behaviour of scanning the whole response.
+    num_forks (int):
+        Number of fork *positions* opened per trajectory (``B``). Each fork expands
+        into ``k`` forced alternatives, so ``rollout.n`` should be ``1 + B * k``.
+        ``1`` (default) reproduces the single-fork method exactly.
+
+        Raising ``B`` is a strictly better use of a given rollout budget than raising
+        ``k``. RB weights renormalize to sum ``n`` *within one fork*, so at ``B=1``
+        the extra slots compete for a fixed pool: at ``k=6`` the rank-5 and rank-6
+        alternatives land near ``0.1`` while the main trajectory inflates past ``3``,
+        i.e. a full-length rollout is paid for ~1% of the gradient mass. Splitting the
+        same budget across ``B`` distinct fork positions gives every branch its own
+        normalization, so all of them carry usable weight.
+    fork_min_gap (int):
+        Minimum token distance between two fork positions when ``num_forks > 1``.
+        Without it the top-``B`` ranked positions are typically adjacent, and the
+        branches degenerate into near-copies of each other. Ignored when ``B == 1``.
     fork_alpha (float):
         Blend between the two fork-ranking signals:
         ``alpha * rank(entropy) + (1 - alpha) * rank(teacher_disagreement)``.
@@ -375,11 +392,23 @@ class TBOPDConfig(BaseConfig):
         signal (same as ``fork_alpha < 1``).
     branch_weight_mode (str):
         How the ``k+1`` continuations of a fork are weighted in the loss.
-        ``"off"`` (default) keeps the legacy uniform weighting. ``"rb"`` applies
+        ``"off"`` (default) keeps the legacy uniform weighting.         ``"rb"`` applies
         Rao-Blackwellized weights ``pi_theta(a_j) / sum_i pi_theta(a_i)`` (rescaled to
         mean 1), so a forced alternative contributes in proportion to how likely the
         student was to emit it. Only applies to ``branch_mode="forced_topk"``;
         ``"resample"`` branches are already drawn from ``pi_theta`` and stay uniform.
+
+        The estimator necessarily differs between ``num_forks == 1`` and ``> 1``:
+
+        - ``B == 1``: the exact conditional expectation. Normalization runs over
+          ``{main} + k`` alternatives, so the main trajectory's post-fork span carries
+          its own ``pi_theta(a_0)`` weight.
+        - ``B > 1``: the main trajectory sits in ``B`` fork groups at once and a single
+          scalar per token cannot carry ``B`` weights. It is therefore pinned at ``1.0``
+          -- the same "count it once" accounting as ``dedup_shared_prefix`` -- and each
+          fork's ``k`` forced branches are normalized among themselves to total mass
+          ``k``. The weights still sum to ``1 + B * k = n``, so the mean stays 1 and the
+          effective learning rate is unchanged.
     branch_weight_temp (float):
         Temperature on the RB weights. ``1.0`` is the exact estimator; larger values
         interpolate towards uniform.
@@ -409,6 +438,8 @@ class TBOPDConfig(BaseConfig):
     shape_branches: bool = False
     dedup_shared_prefix: bool = True
     fork_respect_mask: bool = True
+    num_forks: int = 1
+    fork_min_gap: int = 16
     fork_alpha: float = 1.0
     fork_kl_window: int = 128
     fork_fuse: str = "blend"
@@ -439,6 +470,10 @@ class TBOPDConfig(BaseConfig):
             raise ValueError(f"tb_opd.fork_topk_positions must be >= 1, got {self.fork_topk_positions}")
         if self.fork_skip_first < 0:
             raise ValueError(f"tb_opd.fork_skip_first must be >= 0, got {self.fork_skip_first}")
+        if self.num_forks < 1:
+            raise ValueError(f"tb_opd.num_forks must be >= 1, got {self.num_forks}")
+        if self.fork_min_gap < 0:
+            raise ValueError(f"tb_opd.fork_min_gap must be >= 0, got {self.fork_min_gap}")
         if not 0.0 <= self.fork_alpha <= 1.0:
             raise ValueError(f"tb_opd.fork_alpha must be in [0, 1], got {self.fork_alpha}")
         if self.fork_kl_window < 1:

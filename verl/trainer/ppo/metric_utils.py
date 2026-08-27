@@ -752,6 +752,16 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
     num_mask_skipped = _floats("tb_opd_num_mask_skipped")
     if num_mask_skipped:
         metrics["tb_opd/fork_mask_skipped_positions/mean"] = float(np.mean(num_mask_skipped))
+    # Multi-fork (B > 1): how many positions survived the gap filter and how far apart
+    # they landed. forks_used below num_forks means the gap is squeezing them out.
+    forks_used = _floats("tb_opd_forks_used")
+    if forks_used:
+        metrics["tb_opd/forks_used/mean"] = float(np.mean(forks_used))
+        metrics["tb_opd/forks_used/min"] = float(np.min(forks_used))
+    fork_span = _floats("tb_opd_fork_span")
+    if fork_span:
+        metrics["tb_opd/fork_span/mean"] = float(np.mean(fork_span))
+        metrics["tb_opd/fork_gap_min/mean"] = float(np.mean(_floats("tb_opd_fork_min_gap")))
     w_main, w_max, w_min = _floats("tb_opd_weight_main"), _floats("tb_opd_weight_max"), _floats("tb_opd_weight_min")
     if w_main:
         # Uniform weighting would put all three at exactly 1.0; the spread is how far
