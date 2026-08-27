@@ -408,6 +408,18 @@ class TBOPDConfig(BaseConfig):
         ``w_j / B``. An average of unbiased estimators is unbiased, weights are
         rescaled to sum ``n`` so the effective learning rate is unchanged, and ``B == 1``
         reduces to the plain conditional expectation byte for byte.
+
+        KNOWN APPROXIMATION at ``B > 1``: the main trajectory's weight jumps to its
+        final value at the *first* fork, but between ``p_1`` and ``p_B`` only some
+        branches have entered the loss yet, so that band is over-weighted (measured at
+        B=3/k=2 with forks at 16%/37%/52% of the response: 3.15 where the exact
+        segment-wise value is 2.61 and 2.88, giving +8.4% on the group's mean token
+        weight). The exact fix is a piecewise main profile with
+        ``scale(m) = (1 + m*k) * B / (B + m*k)`` for ``m`` upstream forks. It is not
+        applied because a branch has no positional correspondence to the main
+        trajectory once it diverges, so a star topology admits no fully exact
+        segment-wise accounting -- only the dominant term (the main row) could be
+        corrected. ``B == 1`` has no intermediate band and is unaffected.
     branch_weight_temp (float):
         Temperature on the RB weights. ``1.0`` is the exact estimator; larger values
         interpolate towards uniform.

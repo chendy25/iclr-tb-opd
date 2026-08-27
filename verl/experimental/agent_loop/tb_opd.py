@@ -184,35 +184,49 @@ def multifork_branch_weights(
     learning rate is unchanged. At ``B == 1`` the scale is exactly 1 and this reduces
     to the plain conditional expectation, byte for byte.
 
-    Returns ``None`` if any fork lacks the logprobs needed to weight it, which leaves
-    the caller on the uniform fallback.
+    Slots that wrap onto the same ``(fork, candidate)`` pair are independent samples of
+    one forced branch and split its weight, so a fork's total mass does not depend on
+    how many slots happened to land on it.
+
+    Returns ``None`` only if the weights cannot be normalized at all; a single fork
+    missing its logprobs degrades to uniform rather than disabling the group.
     """
     if not forks or n_slots < 1:
         return None
     k = max(1, int(k))
     b_count = len(forks)
 
-    main_acc = 0.0
     per_fork: list[list[float]] = []
     for fk in forks:
         lps = fk.get("cand_logprobs") or []
-        if not lps:
-            return None
-        slot_lps = [fk.get("main_logprob")] + [lps[j % len(lps)] for j in range(k)]
-        w = branch_weights(slot_lps, temperature=temperature, floor=floor)
-        if w is None:
-            return None
-        main_acc += w[0]
-        per_fork.append(w[1:])
+        w = None
+        if lps:
+            slot_lps = [fk.get("main_logprob")] + [lps[j % len(lps)] for j in range(k)]
+            w = branch_weights(slot_lps, temperature=temperature, floor=floor)
+        # Degrade one unweightable fork to uniform instead of dropping RB for the whole
+        # group: with B forks a single missing logprob would otherwise cost all of them,
+        # and the odds of hitting one scale with B.
+        per_fork.append(w if w is not None else [1.0] * (k + 1))
 
-    out = [main_acc / b_count]
+    # A (fork, candidate) pair owns several slots whenever rollout.n != 1 + B*k, which
+    # happens as soon as the gap filter returns fewer forks than requested and the
+    # modulo wraps. Those slots are independent samples of the SAME forced branch, so
+    # they must split that branch's weight. Leaving each at full weight multiplies the
+    # fork's mass by its slot count, and after renormalization that drags the main
+    # trajectory down -- with one surviving fork it fell from 3.15 to 1.50, inverting
+    # the very thing RB is for.
+    counts: dict[tuple[int, int], int] = {}
+    for slot in range(1, n_slots):
+        key = slot_fork_index(slot, k, b_count)
+        counts[key] = counts.get(key, 0) + 1
+
+    out = [sum(w[0] for w in per_fork) / b_count]
     for slot in range(1, n_slots):
         b, j = slot_fork_index(slot, k, b_count)
-        out.append(per_fork[b][j] / b_count)
+        out.append(per_fork[b][1 + j] / (b_count * counts[(b, j)]))
 
-    # Renormalize rather than applying n/(k+1) directly: when rollout.n != 1 + B*k the
-    # modulo repeats some (fork, candidate) pairs, and only rescaling by the realized
-    # total keeps the mean at 1. With a matching n the two are identical.
+    # Rescale by the realized total rather than a closed-form n/(k+1): the two agree
+    # when n == 1 + B*k, and only the realized total keeps the mean at 1 when it does not.
     total = sum(out)
     if not math.isfinite(total) or total <= 0.0:
         return None
