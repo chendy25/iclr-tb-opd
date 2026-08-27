@@ -1148,34 +1148,18 @@ class AgentLoopWorker:
         # effective learning rate -- is unchanged; only the split inside it moves.
         if branch_weight_mode == "rb":
             weights = None
-            multi_fork = mode == "branch" and len(fork_list) > 1
             if mode == "branch" and branch_mode != "resample":
-                if multi_fork:
-                    # The main trajectory passes through all B forks, so a single scalar
-                    # per token cannot carry a per-fork weight. Pin it at 1.0 -- the same
-                    # "count it once" accounting dedup_shared_prefix uses for the prefix
-                    # -- and normalize each fork's k forced branches among themselves to
-                    # mass k. The total is still 1 + B*k = n, so the mean stays 1.
-                    weights = [1.0] * n_slots
-                    for b in range(len(fork_list)):
-                        slots_b = [s for s in range(1, n_slots) if _slot_fork(s)[1] == b]
-                        lps_b = fork_list[b].get("cand_logprobs") or []
-                        group = tb_opd.branch_weights(
-                            [lps_b[_slot_fork(s)[2] % len(lps_b)] if lps_b else None for s in slots_b],
-                            temperature=branch_weight_temp,
-                            floor=branch_weight_floor,
-                        )
-                        if group:
-                            for s, w in zip(slots_b, group, strict=True):
-                                weights[s] = w
-                else:
-                    cand_lps = fork.get("cand_logprobs") or []
-                    slot_lps: list[Optional[float]] = [fork.get("main_logprob")]
-                    for slot in range(1, n_slots):
-                        slot_lps.append(cand_lps[(slot - 1) % len(cand_lps)] if cand_lps else None)
-                    weights = tb_opd.branch_weights(
-                        slot_lps, temperature=branch_weight_temp, floor=branch_weight_floor
-                    )
+                # B forks are B Rao-Blackwellizations of the same sample, so the
+                # estimator is their average. The main trajectory appears in all B and
+                # therefore carries the MEAN of its per-fork weights -- one scalar, no
+                # conflict. B == 1 collapses to the plain conditional expectation.
+                weights = tb_opd.multifork_branch_weights(
+                    fork_list,
+                    n_slots,
+                    branch_k,
+                    temperature=branch_weight_temp,
+                    floor=branch_weight_floor,
+                )
             # Every sample must carry the column: a per-sample ragged schema silently
             # drops the whole field on the TransferQueue path.
             weights = weights or [1.0] * n_slots
@@ -1183,10 +1167,11 @@ class AgentLoopWorker:
             # still be counted more than once relative to an unbranched trajectory. With
             # the branch copies masked away, the main slot's prefix carries the whole
             # group's prefix and belongs at weight 1.0; only the fork onward is split.
-            # Under multi-fork the main slot is already at 1.0 throughout, so there is
-            # nothing left to split off.
+            # With several forks the earliest one bounds the span no branch replays.
             prefix_len = (
-                int(fork["pos"]) if (dedup_shared_prefix and mode == "branch" and not multi_fork) else 0
+                min(int(f["pos"]) for f in fork_list)
+                if (dedup_shared_prefix and mode == "branch" and fork_list)
+                else 0
             )
             for slot, (raw, w) in enumerate(zip(raw_outputs, weights, strict=True)):
                 n_tok = len(raw.response_ids)

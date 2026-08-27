@@ -359,13 +359,13 @@ class TBOPDConfig(BaseConfig):
         into ``k`` forced alternatives, so ``rollout.n`` should be ``1 + B * k``.
         ``1`` (default) reproduces the single-fork method exactly.
 
-        Raising ``B`` is a strictly better use of a given rollout budget than raising
-        ``k``. RB weights renormalize to sum ``n`` *within one fork*, so at ``B=1``
-        the extra slots compete for a fixed pool: at ``k=6`` the rank-5 and rank-6
-        alternatives land near ``0.1`` while the main trajectory inflates past ``3``,
-        i.e. a full-length rollout is paid for ~1% of the gradient mass. Splitting the
-        same budget across ``B`` distinct fork positions gives every branch its own
-        normalization, so all of them carry usable weight.
+        Raising ``B`` is a better use of a given rollout budget than raising ``k``. RB
+        weights renormalize *within one fork*, so at ``B=1`` the extra slots compete for
+        a fixed pool: at ``k=6`` the rank-5 and rank-6 alternatives land near ``0.1``,
+        i.e. a full-length rollout paid for ~1% of the gradient mass. Splitting the same
+        ``n=7`` budget as ``B=3, k=2`` gives every fork its own normalization and lifts
+        the weakest branch from ``0.09`` to ``0.46`` -- ~5x more usable signal for the
+        same generation cost.
     fork_min_gap (int):
         Minimum token distance between two fork positions when ``num_forks > 1``.
         Without it the top-``B`` ranked positions are typically adjacent, and the
@@ -398,17 +398,16 @@ class TBOPDConfig(BaseConfig):
         student was to emit it. Only applies to ``branch_mode="forced_topk"``;
         ``"resample"`` branches are already drawn from ``pi_theta`` and stay uniform.
 
-        The estimator necessarily differs between ``num_forks == 1`` and ``> 1``:
-
-        - ``B == 1``: the exact conditional expectation. Normalization runs over
-          ``{main} + k`` alternatives, so the main trajectory's post-fork span carries
-          its own ``pi_theta(a_0)`` weight.
-        - ``B > 1``: the main trajectory sits in ``B`` fork groups at once and a single
-          scalar per token cannot carry ``B`` weights. It is therefore pinned at ``1.0``
-          -- the same "count it once" accounting as ``dedup_shared_prefix`` -- and each
-          fork's ``k`` forced branches are normalized among themselves to total mass
-          ``k``. The weights still sum to ``1 + B * k = n``, so the mean stays 1 and the
-          effective learning rate is unchanged.
+        With ``num_forks > 1`` the same estimator extends without a special case. B
+        forks on one trajectory are not a joint expectation over B tokens -- that would
+        need a ``k**B`` tree -- but B separate Rao-Blackwellizations of the same sample,
+        so the estimator is their average ``(1/B) * sum_b g_b``. The main trajectory
+        appears in every ``g_b`` and therefore carries the *mean* of its per-fork
+        weights: a single scalar, which is what resolves the apparent need for B
+        weights on one row. Each branch appears in one ``g_b`` only and carries
+        ``w_j / B``. An average of unbiased estimators is unbiased, weights are
+        rescaled to sum ``n`` so the effective learning rate is unchanged, and ``B == 1``
+        reduces to the plain conditional expectation byte for byte.
     branch_weight_temp (float):
         Temperature on the RB weights. ``1.0`` is the exact estimator; larger values
         interpolate towards uniform.

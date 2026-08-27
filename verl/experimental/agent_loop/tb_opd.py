@@ -158,6 +158,68 @@ def branch_weights(
     return [x * n for x in w]
 
 
+def multifork_branch_weights(
+    forks: list[dict],
+    n_slots: int,
+    k: int,
+    *,
+    temperature: float = 1.0,
+    floor: float = 0.0,
+) -> Optional[list[float]]:
+    """Combine ``B`` per-fork Rao-Blackwell estimators into one weight per slot.
+
+    B forks on a single trajectory are *not* a joint expectation over B tokens -- that
+    would need a ``k**B`` tree, not ``1 + B*k`` rows. They are B separate
+    Rao-Blackwellizations of the same sample, so the estimator is their average
+    ``(1/B) * sum_b g_b``, where each ``g_b`` is exactly the single-fork estimator.
+
+    Averaging is what dissolves the apparent conflict of the main trajectory "needing B
+    weights at once": it appears in every ``g_b``, so it carries the *mean* of its
+    per-fork weights -- a single scalar. A branch appears in one ``g_b`` only, so it
+    carries ``w_j / B``. Pinning the main slot at 1.0 instead would hand its share to
+    the forced branches, i.e. reintroduce exactly the off-policy bias RB exists to
+    remove.
+
+    Weights are rescaled to sum to ``n_slots`` so the mean stays 1 and the effective
+    learning rate is unchanged. At ``B == 1`` the scale is exactly 1 and this reduces
+    to the plain conditional expectation, byte for byte.
+
+    Returns ``None`` if any fork lacks the logprobs needed to weight it, which leaves
+    the caller on the uniform fallback.
+    """
+    if not forks or n_slots < 1:
+        return None
+    k = max(1, int(k))
+    b_count = len(forks)
+
+    main_acc = 0.0
+    per_fork: list[list[float]] = []
+    for fk in forks:
+        lps = fk.get("cand_logprobs") or []
+        if not lps:
+            return None
+        slot_lps = [fk.get("main_logprob")] + [lps[j % len(lps)] for j in range(k)]
+        w = branch_weights(slot_lps, temperature=temperature, floor=floor)
+        if w is None:
+            return None
+        main_acc += w[0]
+        per_fork.append(w[1:])
+
+    out = [main_acc / b_count]
+    for slot in range(1, n_slots):
+        b, j = slot_fork_index(slot, k, b_count)
+        out.append(per_fork[b][j] / b_count)
+
+    # Renormalize rather than applying n/(k+1) directly: when rollout.n != 1 + B*k the
+    # modulo repeats some (fork, candidate) pairs, and only rescaling by the realized
+    # total keeps the mean at 1. With a matching n the two are identical.
+    total = sum(out)
+    if not math.isfinite(total) or total <= 0.0:
+        return None
+    scale = float(n_slots) / total
+    return [x * scale for x in out]
+
+
 def slot_fork_index(slot: int, k: int, n_forks: int) -> tuple[int, int]:
     """Map a rollout slot to ``(fork_index, candidate_index)``.
 
