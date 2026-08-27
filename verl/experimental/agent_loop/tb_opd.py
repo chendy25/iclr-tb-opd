@@ -220,10 +220,18 @@ def multifork_branch_weights(
         key = slot_fork_index(slot, k, b_count)
         counts[key] = counts.get(key, 0) + 1
 
-    out = [sum(w[0] for w in per_fork) / b_count]
+    # Average only over forks that actually own slots. When rollout.n < 1 + B*k the
+    # trailing forks never get generated, and letting them into the mean would raise the
+    # main trajectory's weight on the strength of branches that do not exist.
+    active = sorted({b for b, _ in counts})
+    if not active:
+        return None
+    b_active = len(active)
+
+    out = [sum(per_fork[b][0] for b in active) / b_active]
     for slot in range(1, n_slots):
         b, j = slot_fork_index(slot, k, b_count)
-        out.append(per_fork[b][1 + j] / (b_count * counts[(b, j)]))
+        out.append(per_fork[b][1 + j] / (b_active * counts[(b, j)]))
 
     # Rescale by the realized total rather than a closed-form n/(k+1): the two agree
     # when n == 1 + B*k, and only the realized total keeps the mean at 1 when it does not.
