@@ -20,13 +20,13 @@ accumulates the full transcript, so the model already sees prior turns. We
 therefore only render:
   - an instruction-bearing initial user turn (task + first observation), and
   - a compact follow-up user turn carrying the new observation each step.
-The answer contract is ATOD's ``<action>`` block. ATOD also asks for a ``<think>``
-block, but we run with ``enable_thinking=False``, under which Qwen3's chat template
-pre-fills an empty ``<think></think>`` into the generation prompt: the model is
-already "done thinking" before it emits a token, so asking it to think again is
-self-contradictory and no ``<think>`` can ever appear in the generated text. Restore
-the request here only together with real thinking (drop the ``enable_thinking`` kwarg)
-and a much larger per-turn / per-episode token budget.
+
+The answer contract matches ATOD: a ``<think>`` block then an ``<action>``
+block. Training / eval pass ``enable_thinking=True`` (or omit the kwarg) so
+Qwen3's chat template does **not** pre-fill an empty ``<think></think>``;
+the model has to emit the tags itself. The previous no-think protocol
+(``enable_thinking=False`` + "Output nothing else") is snapshotted under
+``iclr/logs/_backup_alfworld_nothink_20260831/``.
 """
 
 from typing import List
@@ -36,14 +36,15 @@ Your current observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-Choose exactly one action from the admissible actions above and present it within <action> </action> tags.
-Output nothing else."""
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
 ALFWORLD_FOLLOWUP_TEMPLATE = """Your new observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
 Now it's your turn to take an action.
-Choose exactly one admissible action and present it within <action> </action> tags."""
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
 
 def _format_admissible(admissible_actions: List[str]) -> str:

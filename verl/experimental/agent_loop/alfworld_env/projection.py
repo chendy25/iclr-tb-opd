@@ -32,15 +32,9 @@ def alfworld_projection(text_action: str) -> tuple[str, int]:
     Returns:
         (action, valid): ``action`` is the lowercased command to send to the env
         (a best-effort tail slice when no valid ``<action>`` block is found);
-        ``valid`` is 1 when a well-formed ``<action>`` block without Chinese
-        characters was produced, else 0.
-
-    ATOD additionally requires a ``<think>`` block here. That check is dropped
-    because we run with ``enable_thinking=False``, which makes Qwen3's template
-    pre-fill an empty ``<think></think>`` into the prompt -- the tag can never
-    appear in generated text, so the check would pin ``valid`` to 0 always and
-    hide whether ``<action>`` itself parses. Reinstate it only alongside real
-    thinking (see prompts.py).
+        ``valid`` is 1 when the turn has a well-formed ``<think>`` block, a
+        well-formed ``<action>`` block, and no Chinese characters; else 0.
+        Matches ATOD ``env_package/alfworld/projection.py``.
     """
     original_str = text_action
     lowered = text_action.lower()
@@ -56,6 +50,11 @@ def alfworld_projection(text_action: str) -> tuple[str, int]:
     else:
         action = lowered[start_idx + len(start_tag) : end_idx].strip().lower()
         valid = 1
+
+    think_start = original_str.find("<think>")
+    think_end = original_str.find("</think>")
+    if think_start == -1 or think_end == -1 or think_end <= think_start:
+        valid = 0
 
     # Reject Chinese characters (matches ATOD).
     if re.search(r"[\u4e00-\u9fff]", original_str):
