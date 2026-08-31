@@ -871,6 +871,8 @@ def select_fork_turn(
     normalize: str = "rank",
     max_forks: int = 1,
     min_turn_gap: int = 1,
+    select: str = "argmax",
+    topk_positions: int = 20,
 ) -> dict:
     """Pick fork point(s) in a multi-turn trajectory.
 
@@ -895,6 +897,12 @@ def select_fork_turn(
     ``reasoning`` inside the thinking span, ``action`` inside the tool-call / env
     action span, ``all`` for no positional prior. ``action``/``reasoning`` need
     ``action_spans``.
+
+    ``select`` mirrors the token path's ``fork_select``: ``argmax`` always takes the
+    top-scoring candidate, ``topk_uniform`` draws uniformly among the top
+    ``topk_positions``. Note the two paths' scores are not on the same scale -- the
+    token path ranks single positions, this one ranks span means -- so a candidate
+    "rank" means the same thing but the underlying value does not.
 
     ``min_uncertainty`` (the token path's ``fork_min_entropy``) drops candidates
     whose *raw* ``U`` is below it, so a trajectory the student was confident all the
@@ -1007,6 +1015,9 @@ def select_fork_turn(
     for c, s in zip(cands, signals):
         c["signal"] = float(s)
 
+    if select not in ("argmax", "topk_uniform"):
+        return {"pos": None, "none_reason": f"unknown_select:{select}"}
+
     order = sorted(range(len(cands)), key=lambda i: signals[i], reverse=True)
     if fuse == "union" and use_teacher and len(cands) > 1:
         # Keep the top half by each signal separately, then rank that union. Blending
@@ -1016,6 +1027,18 @@ def select_fork_turn(
         pool = set(sorted(range(len(cands)), key=lambda i: u_raw[i], reverse=True)[:half])
         pool |= set(sorted(range(len(cands)), key=lambda i: d_raw[i], reverse=True)[:half])
         order = [i for i in order if i in pool]
+
+    # CURE-style exploration, the token path's fork_select: instead of always taking
+    # the argmax, draw uniformly among the top-N candidates. Always forking the single
+    # most uncertain turn makes the branch distribution a deterministic function of the
+    # student, so the same few turns get explored every epoch. Shuffling only the
+    # top-N leaves the tail as fallback order, which matters when the gap constraint
+    # below rejects the whole pool.
+    if select == "topk_uniform" and len(order) > 1:
+        n_pool = min(len(order), max(1, int(topk_positions)))
+        pool_ids = order[:n_pool]
+        random.shuffle(pool_ids)
+        order = pool_ids + order[n_pool:]
 
     # Greedy pick under a turn-gap constraint so B>1 does not stack every fork on
     # one turn (the over-branching AEPO warns about).

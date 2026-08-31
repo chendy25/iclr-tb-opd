@@ -143,7 +143,10 @@ tb_opd:
   correct_threshold: 1.0
 
   # Fork-position selection among filtered candidates: "argmax" or "topk_uniform".
-  fork_select: argmax
+  # topk_uniform (= the math reference arm): draw uniformly among the top
+  # fork_topk_positions candidates instead of always taking the argmax, so the branch
+  # distribution is not a deterministic function of the student.
+  fork_select: topk_uniform
 
   # Number of most-uncertain positions kept before uniform sampling (topk_uniform only).
   fork_topk_positions: 20

@@ -841,7 +841,7 @@ class AgentLoopWorker:
         topk_logprobs = int(cfg.get("topk_logprobs", 20))
         branch_min_tokens = int(cfg.get("branch_min_tokens", 8))
         correct_threshold = float(cfg.get("correct_threshold", 1.0))
-        fork_select = str(cfg.get("fork_select", "argmax"))
+        fork_select = str(cfg.get("fork_select", "topk_uniform"))
         fork_topk_positions = int(cfg.get("fork_topk_positions", 20))
         fork_skip_first = int(cfg.get("fork_skip_first", 1))
         fork_min_token_strip_len = int(cfg.get("fork_min_token_strip_len", 1))
@@ -1084,6 +1084,8 @@ class AgentLoopWorker:
         disagreement_signed = bool(cfg.get("disagreement_signed", True))
         max_branches = int(cfg.get("max_branches_per_traj", 1))
         min_turn_gap = int(cfg.get("fork_min_turn_gap", 1))
+        fork_select = str(cfg.get("fork_select", "topk_uniform"))
+        fork_topk_positions = int(cfg.get("fork_topk_positions", 20))
         dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
         branch_weight_mode = str(cfg.get("branch_weight_mode", "rb"))
         branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
@@ -1154,6 +1156,8 @@ class AgentLoopWorker:
                     normalize=fork_normalize,
                     max_forks=max_branches,
                     min_turn_gap=min_turn_gap,
+                    select=fork_select,
+                    topk_positions=fork_topk_positions,
                 )
 
         has_fork = fork.get("pos") is not None
@@ -1207,6 +1211,12 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_fork_pos"] = float(fork["pos"])
             main_out.extra_fields["tb_opd_fork_turn"] = float(fork.get("turn_index", -1))
             main_out.extra_fields["tb_opd_fork_signal"] = float(fork.get("signal", 0.0))
+            # Raw U of the chosen fork, *before* normalization -- the only quantity on
+            # the same scale as fork_min_entropy, so it is what the gate has to be
+            # calibrated against. tb_opd_fork_signal cannot serve: rank/minmax both map
+            # the best candidate to 1.0 by construction.
+            main_out.extra_fields["tb_opd_fork_uncertainty"] = float(fork.get("uncertainty", 0.0))
+            main_out.extra_fields["tb_opd_fork_disagreement"] = float(fork.get("disagreement", 0.0))
             main_out.extra_fields["tb_opd_num_turns"] = float(fork.get("num_turns", 0))
             main_out.extra_fields["tb_opd_fork_kind"] = str(fork.get("kind", "turn_open"))
             main_out.extra_fields["tb_opd_fork_eligibility"] = str(fork.get("eligibility", ""))

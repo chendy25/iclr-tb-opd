@@ -675,6 +675,49 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
             for reason in set(reasons):
                 metrics[f"tb_opd/none_reason/{reason}"] = float(reasons.count(reason)) / total
 
+    # Where the forks landed. Under fork_eligibility=all a turn contributes candidates
+    # of every kind (turn_open / reasoning / action), so this is the answer to "does
+    # the selector branch the thinking or the tool call" -- and it is measured, not
+    # assumed, which matters because nothing in the scoring biases it either way.
+    # Read off main slots, one vote per group; with max_branches_per_traj > 1 the vote
+    # is the top-ranked fork's kind, not all B of them.
+    if "tb_opd_fork_kind" in ntb:
+        kinds = [
+            str(k)
+            for k, s in zip(ntb["tb_opd_fork_kind"], ntb.get("tb_opd_score", []))
+            if k is not None and s is not None  # main slots carry a non-None score
+        ]
+        if kinds:
+            total = float(len(kinds))
+            for kind in set(kinds):
+                metrics[f"tb_opd/fork_kind/{kind}"] = float(kinds.count(kind)) / total
+
+    # Which uncertainty estimator ran. The turn path falls back to a mean-NLL proxy
+    # when the rollout carried no per-position top-k, and the proxy is a different
+    # statistic on a different scale -- so a fork_min_entropy tuned under one is
+    # meaningless under the other. Anything other than a clean 1.0 on one estimator
+    # means the threshold is being applied to two different quantities.
+    if "tb_opd_fork_estimator" in ntb:
+        ests = [str(e) for e in ntb["tb_opd_fork_estimator"] if e is not None and str(e)]
+        if ests:
+            total = float(len(ests))
+            for est in set(ests):
+                metrics[f"tb_opd/fork_estimator/{est}"] = float(ests.count(est)) / total
+
+    # Raw (pre-normalization) U and D of the chosen fork. These are what
+    # fork_min_entropy is compared against, so the percentiles are the calibration
+    # data for it: a floor above the bulk of this distribution silently disables
+    # branching, and one below its floor never fires.
+    unc = _floats("tb_opd_fork_uncertainty")
+    if unc:
+        metrics["tb_opd/fork_uncertainty/mean"] = float(np.mean(unc))
+        metrics["tb_opd/fork_uncertainty/p10"] = float(np.percentile(unc, 10))
+        metrics["tb_opd/fork_uncertainty/p50"] = float(np.percentile(unc, 50))
+        metrics["tb_opd/fork_uncertainty/p90"] = float(np.percentile(unc, 90))
+    disagree = _floats("tb_opd_fork_disagreement")
+    if disagree:
+        metrics["tb_opd/fork_disagreement/mean"] = float(np.mean(disagree))
+
     return metrics
 
 

@@ -107,6 +107,10 @@ tb_branch_weight_mode=${TB_BRANCH_WEIGHT_MODE:-rb}    # rb (= math) | off; resam
 tb_branch_weight_temp=${TB_BRANCH_WEIGHT_TEMP:-1.0}   # >1 flattens toward uniform
 tb_branch_weight_floor=${TB_BRANCH_WEIGHT_FLOOR:-0.0} # >0 keeps rare branches alive
 tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
+# CURE-style exploration: draw the fork uniformly among the top-N candidates instead of
+# always taking the argmax, so the same few turns are not re-explored every epoch.
+tb_fork_select=${TB_FORK_SELECT:-topk_uniform}    # topk_uniform (= math) | argmax
+tb_fork_topk_positions=${TB_FORK_TOPK_POSITIONS:-20}
 tb_turn_first_k=${TB_TURN_FIRST_K:-16}
 tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-False}
 tb_turn_skip_first=${TB_TURN_SKIP_FIRST:-0}
@@ -312,6 +316,8 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     distillation.tb_opd.branch_weight_temp=${tb_branch_weight_temp} \
     distillation.tb_opd.branch_weight_floor=${tb_branch_weight_floor} \
     distillation.tb_opd.fork_min_turn_gap=${tb_fork_min_turn_gap} \
+    distillation.tb_opd.fork_select=${tb_fork_select} \
+    distillation.tb_opd.fork_topk_positions=${tb_fork_topk_positions} \
     distillation.tb_opd.turn_first_k=${tb_turn_first_k} \
     distillation.tb_opd.turn_only_post_tool=${tb_turn_only_post_tool} \
     distillation.tb_opd.turn_skip_first=${tb_turn_skip_first} \

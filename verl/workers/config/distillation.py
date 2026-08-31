@@ -417,7 +417,7 @@ class TBOPDConfig(BaseConfig):
     topk_logprobs: int = 20
     branch_min_tokens: int = 8
     correct_threshold: float = 1.0
-    fork_select: str = "argmax"
+    fork_select: str = "topk_uniform"
     fork_topk_positions: int = 20
     fork_skip_first: int = 1
     fork_min_token_strip_len: int = 1

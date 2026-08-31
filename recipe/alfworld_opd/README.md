@@ -239,6 +239,39 @@ top-k entropy when the rollout carried per-position top-k (which it does here,
 `TB_TOPK_LOGPROBS=20`), otherwise a mean-NLL proxy on a different scale. The dump field
 `tb_opd_fork_estimator` records which one.
 
+It is left at `0.0` rather than copying the math arm's `0.5`, because the two paths do
+not measure the same thing: the token path gates a single position's entropy, this one
+gates a span mean over `turn_first_k=16` tokens, which is systematically lower. The same
+number is therefore a strictly harsher filter here. Set it from
+`tb_opd/fork_uncertainty/*` once a run exists.
+
+### Where did the forks actually land?
+
+`tb_opd/fork_kind/{turn_open,reasoning,action}` reports the mix, one vote per group
+(with `TB_MAX_BRANCHES_PER_TRAJ>1` the vote is the top-ranked fork). Nothing in the
+scoring biases the kind, so this is measured rather than assumed.
+
+**Read it against the candidate counts, not as a preference.** Under
+`fork_eligibility=all` each turn contributes exactly one `turn_open` and one `action`
+candidate, but one `reasoning` candidate every `reasoning_stride=8` tokens of the
+thinking span. A turn with a 30-token think block therefore puts ~3 reasoning
+candidates in the pool against 1 and 1 — about 60% of the pool before any score is
+computed. Under `TB_FORK_SELECT=topk_uniform` that enumeration density feeds straight
+into the draw, so a reasoning-heavy `fork_kind` histogram is the expected null result,
+not evidence that the thinking span is where the uncertainty is.
+
+For an honest reasoning-vs-action comparison run the two forced arms
+(`TB_FORK_ELIGIBILITY=reasoning` and `=action`) and compare their outcomes, rather than
+reading the split out of an `all` run.
+
+`tb_opd/fork_estimator/*` reports which uncertainty estimator ran (`entropy` = truncated
+top-k, `nll` = the fallback proxy) and `tb_opd/fork_uncertainty/{mean,p10,p50,p90}` the
+raw pre-normalization `U` of the chosen fork. Those percentiles are the calibration data
+for `TB_FORK_MIN_ENTROPY`: it is compared against exactly this quantity, so a floor above
+the bulk of the distribution silently disables branching and one below its floor never
+fires. Anything other than a clean `1.0` on a single estimator means the threshold is
+being applied to two different statistics across the batch.
+
 `TB_FORK_ELIGIBILITY=reasoning|action` needs `record_action_spans`, which the wrapper
 turns on. Branches resume by resetting the game and replaying the recorded actions;
 `alfworld_replay_ok` in the dump is `0` for any branch whose replay diverged from the
