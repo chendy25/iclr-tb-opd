@@ -154,13 +154,24 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 # Budget for a whole episode transcript (assistant turns + env observations).
 # NOT comparable to ATOD's max_response_length=512: there one row is a single
 # turn (history re-injected into the prompt), here one row is a whole episode.
-# Sized from measured rollouts: ~294 tokens per env step on average, p90 409, so the
-# 50-step cap needs ~20k to be reachable by ~90% of episodes. At 12288, 45% of episodes
-# were cut off mid-task with ~13 of their 50 steps unused and every one of them scored
-# 0, i.e. the token budget rather than the policy was setting the success rate.
-max_response_length=${MAX_RESPONSE_LENGTH:-20480}
+#
+# Sized so the *policy*, not the budget, decides the outcome. Two measurements, both
+# on 192 episodes, both of which found the budget deciding it instead:
+#   no-think, 12288: 45% of episodes cut off mid-task with ~13 steps unused, all scoring 0.
+#   thinking, 20480: 90% of *losses* were token-bound (median 11 steps unused, all
+#     scoring 0), while wins averaged 6.1k tokens / 13 steps and never exceeded 36
+#     steps. Only 5.7% ever reached the 50-step cap.
+# Real thinking costs ~493 tokens per env step (p90 647) against the no-think ~294, so
+# enabling it consumed the entire headroom the 12288 -> 20480 bump had bought.
+# Trimming the per-turn instruction boilerplate (see alfworld_env/prompts.py) takes
+# ~51 tokens a step back off that, leaving p90 ~597, i.e. ~29.8k for the full 50 steps.
+# 30720 covers 50 steps at up to 614 tokens/step, so p90 episodes now run to the step
+# cap and it is the policy that ends them.
+max_response_length=${MAX_RESPONSE_LENGTH:-30720}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
+# Must exceed max_num_tokens (32769 here) or a single full-length episode cannot form
+# a micro-batch under use_dynamic_bsz -- these two have to move together.
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}
 actor_lr=${ACTOR_LR:-1e-6}
 
 # ---- alfworld env loop ----

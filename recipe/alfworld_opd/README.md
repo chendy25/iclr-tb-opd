@@ -145,7 +145,8 @@ Outputs: `iclr/logs/verl_agent_alfworld_eval/eval_<tag>_<split>/`.
 | `ALFWORLD_VAL_ROWS` | `128` | validation episodes (`valid_unseen` has ~255 games) |
 | `TOTAL_EPOCHS` | `2` | 200 steps total at the defaults |
 | `MAX_PROMPT_LENGTH` | `2048` | initial turn only; agent loop silently left-truncates above this |
-| `MAX_RESPONSE_LENGTH` | `20480` | full episode transcript budget (one row = one episode); sized so 50 steps are reachable |
+| `MAX_RESPONSE_LENGTH` | `30720` | full episode transcript budget (one row = one episode); sized so 50 steps are reachable at the p90 cost/step — see [Sizing the budget](#sizing-the-budget) |
+| `PPO_MAX_TOKEN_LEN_PER_GPU` | `40960` | must stay above `MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1`; move it with the budget |
 | `ALFWORLD_MAX_STEPS` | `50` | max env steps (assistant turns) per episode (ATOD parity) |
 | `ALFWORLD_POOL_SIZE` | `16` | TextWorld envs per rollout process; need ≥ `batch*n/num_workers` |
 | `ALFWORLD_MAX_TURN_TOKENS` | `2048` | per-turn generation cap (raised for real `<think>` blocks) |
@@ -158,6 +159,39 @@ Outputs: `iclr/logs/verl_agent_alfworld_eval/eval_<tag>_<split>/`.
 | `USE_POLICY_GRADIENT` | `True` | KD-as-advantage (native OPD) |
 | `DISTILLATION_TOPK` | `64` | teacher top-k logits |
 | `TEACHER_TP` / `ROLLOUT_TP` | `8` / `2` | teacher / student rollout TP |
+
+### Sizing the budget
+
+One row is a whole episode, so `MAX_RESPONSE_LENGTH` has to cover ~50 assistant turns
+*plus* the env observations interleaved between them. Get it wrong and the token cap,
+not the policy, sets the success rate — which has now happened twice:
+
+| run | budget | symptom |
+| --- | --- | --- |
+| no-think | `12288` | 45% of episodes cut off mid-task, ~13 of 50 steps unused, all scoring 0 |
+| thinking | `20480` | 90% of *losses* were token-bound (median 11 steps unused, all 0); only 5.7% ever reached the step cap |
+
+Enabling real `<think>` raised the cost from ~294 tokens/env-step to ~493 (p90 647),
+which ate the entire headroom the first bump had bought. Two things were done about it:
+
+- **Trimmed the per-turn instruction boilerplate** (`alfworld_env/prompts.py`). The
+  follow-up template restated the full answer contract every turn — 89 tokens × ~50
+  turns = 17.7% of the whole budget spent re-explaining a format the model was already
+  following. The compact form keeps both tag names and "admissible" and saves ~51
+  tokens/step. It is deliberately not removed: empty `<think>` blocks run ~0% over the
+  first third of an episode and climb to ~6% by the last, so the reminder matters most
+  exactly where the transcript is longest.
+- **Raised the budget to `30720`**, which covers 50 steps at up to 614 tokens/step
+  against the trimmed p90 of ~597.
+
+Observations are the bulk of the spend (59.3%), not the model's own output, so trimming
+what the env says back is the cheaper lever. `ALFWORLD_MAX_TURN_TOKENS=2048` is *not*
+binding — p90 turn length is ~315 tokens — so it is the episode budget that needs the
+room, not the per-turn cap. `PPO_MAX_TOKEN_LEN_PER_GPU` must stay above
+`max_prompt + max_response + 1`, or one full-length episode cannot form a micro-batch
+under `use_dynamic_bsz`; the two are raised together.
+
+Do not read success rates across different budgets as comparable.
 
 ## TB-OPD-Turn arm
 
