@@ -88,7 +88,7 @@ tb_enable=${TB_ENABLE:-False}
 tb_k=${TB_K:-2}                                   # branch slots per prompt
 tb_only_fail=${TB_ONLY_FAIL:-False}               # False (= math): branch regardless of outcome
 tb_fork_metric=${TB_FORK_METRIC:-entropy}         # entropy (== ent) | dHtool (ARPO)
-tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
+tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-reasoning}  # reasoning|action|all|turn_open|post_tool
 tb_fork_alpha=${TB_FORK_ALPHA:-0.5}               # 0.5 = math's even U/D blend; 1.0 = pure uncertainty
 tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
 tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (math) | minmax (ATOD)
@@ -97,6 +97,9 @@ tb_disagreement_signed=${TB_DISAGREEMENT_SIGNED:-True}
 tb_fork_min_entropy=${TB_FORK_MIN_ENTROPY:-0.0}   # raw-entropy floor; math arms run 0.5
 tb_branch_mode=${TB_BRANCH_MODE:-forced_topk}     # forced_topk | resample
 tb_topk_logprobs=${TB_TOPK_LOGPROBS:-20}
+# Budget B: how many distinct turns get forked. B>1 needs rollout.n = 1 + B*k (derived
+# below), the same contract the math arms use -- with B=3 k=2 the six branch slots are
+# dealt as three fork points x two forced alternatives each.
 tb_max_branches=${TB_MAX_BRANCHES_PER_TRAJ:-1}
 # Loss-side treatment of the branches. dedup: a branch replays the main trajectory's
 # prefix, so leaving it supervised trains those tokens (1+k) times. rb: weight the k+1
@@ -109,8 +112,13 @@ tb_branch_weight_floor=${TB_BRANCH_WEIGHT_FLOOR:-0.0} # >0 keeps rare branches a
 tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
 # CURE-style exploration: draw the fork uniformly among the top-N candidates instead of
 # always taking the argmax, so the same few turns are not re-explored every epoch.
+# N is 3, not the config default of 20 that the math arms use: the token unit ranks every
+# response position (thousands) so top-20 is a sliver, while the turn unit ranks one
+# candidate per segment per turn -- tens. At 20 the shuffle would swallow the entire pool
+# and the "entropy-selected fork" would in fact be a uniformly random one. Watch
+# tb_opd/fork_select_random_frac; if it approaches 1.0, lower this or use argmax.
 tb_fork_select=${TB_FORK_SELECT:-topk_uniform}    # topk_uniform (= math) | argmax
-tb_fork_topk_positions=${TB_FORK_TOPK_POSITIONS:-20}
+tb_fork_topk_positions=${TB_FORK_TOPK_POSITIONS:-3}
 tb_turn_first_k=${TB_TURN_FIRST_K:-16}
 tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-False}
 tb_turn_skip_first=${TB_TURN_SKIP_FIRST:-0}
@@ -123,11 +131,12 @@ tb_record_action_spans=${TB_RECORD_ACTION_SPANS:-${tb_enable}}
 # Native OPD: advantage is per-token (logπ_T − logπ_S), so there is no group to
 # compare against -> n=1. (n>1 only buys something for GRPO / TB-OPD branching.)
 # Under TB-OPD the group is one fixed-slot fan-out: slot 0 is the main trajectory and
-# the other k are its branches, so n must be 1+k. Branch slots are played *sequentially*
-# after the main slot, so the env pool below does not scale with n -- but wall-clock per
-# step does, roughly by (1+k).
+# the rest are its branches, k per fork point across B fork points, so n must be 1+B*k
+# (k is per-fork, as on the math side -- not a total). Branch slots are played
+# *sequentially* after the main slot, so the env pool below does not scale with n --
+# but wall-clock per step does, roughly by (1+B*k).
 if [[ "${tb_enable}" == "True" ]]; then
-  rollout_n=${ROLLOUT_N:-$(( 1 + tb_k ))}
+  rollout_n=${ROLLOUT_N:-$(( 1 + tb_max_branches * tb_k ))}
 else
   rollout_n=${ROLLOUT_N:-1}
 fi
@@ -194,7 +203,7 @@ DISTILL_NGPUS_PER_NODE=${DISTILL_NGPUS_PER_NODE:-8}
 project_name=${PROJECT_NAME:-verl_agent_alfworld}
 if [[ "${tb_enable}" == "True" ]]; then
   _arm_tag="tbturn_${tb_fork_metric}_a${tb_fork_alpha}_${tb_fork_fuse}_$(
-    [[ "${tb_fork_eligibility}" == "null" ]] && echo all || echo "${tb_fork_eligibility}")_k${tb_k}"
+    [[ "${tb_fork_eligibility}" == "null" ]] && echo reasoning || echo "${tb_fork_eligibility}")_k${tb_k}"
 else
   _arm_tag="opd"
 fi

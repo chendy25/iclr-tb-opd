@@ -7,7 +7,8 @@
 #
 # Selection signal: the same one the math token arms use
 # (iclr_opd_tbopd_rbw_klfork_r16k_e2) -- truncated entropy blended with teacher
-# disagreement at fork_alpha=0.5, rank-normalized, no positional prior. The teacher
+# disagreement at fork_alpha=0.5, rank-normalized, eligibility=reasoning
+# (re-think the turn from its first token). The teacher
 # IS available at rollout time for fork ranking, so the disagreement term costs
 # nothing extra: that forward is needed for the loss regardless.
 #
@@ -15,7 +16,10 @@
 #   ARPO-style   : TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True
 #   pure entropy : TB_FORK_ALPHA=1.0                  # drop the teacher term
 #   ATOD T-DUR   : TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool
-#   fork inside the reasoning / action span: TB_FORK_ELIGIBILITY=reasoning|action
+#   pool both segments / re-act only:
+#                  TB_FORK_ELIGIBILITY=all|action
+#     (default is reasoning: one candidate per turn, fork at the first token,
+#      scored over the whole thinking span. `all` = reasoning + action, pooled 1:1.)
 #
 # Prereqs:
 #   1) python -m recipe.agentic_tbopd.prepare_open_agentrl   # build TIR parquet

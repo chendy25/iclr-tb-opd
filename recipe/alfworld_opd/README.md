@@ -168,14 +168,24 @@ wrapper that sets the arm's defaults.
 
 ```bash
 bash recipe/alfworld_opd/train_inrepo_opd.sh   # baseline (native OPD, n=1)
-bash recipe/alfworld_opd/run_tbopd_turn.sh     # arm       (TB-OPD-Turn, n=1+k)
+bash recipe/alfworld_opd/run_tbopd_turn.sh     # arm       (TB-OPD-Turn, n=1+B*k)
 ```
 
-`rollout.n` is derived as `1+k` automatically, and `experiment_name` encodes the arm
-(`alfworld_inrepo_tbturn_entropy_a0.5_blend_all_k2_...`) so ablations cannot overwrite
+`rollout.n` is derived as `1 + B*k` automatically, where `B = TB_MAX_BRANCHES_PER_TRAJ`
+is how many distinct turns get forked and `k = TB_K` is how many forced alternatives are
+expanded *at each* fork point — the same contract the math arms use, so `TB_K` is
+per-fork rather than a total. Slot 0 is the main trajectory; the remaining `B*k` slots are
+dealt fork-index-fastest, so with `B=3 k=2` slots 1–6 are
+`(fork0,cand0) (fork1,cand0) (fork2,cand0) (fork0,cand1) (fork1,cand1) (fork2,cand1)`.
+`fork_min_turn_gap=1` keeps the `B` fork points on distinct turns. RB branch weights read
+the assignment that was actually generated rather than re-deriving it, so they stay
+correct when the gap filter returns fewer than `B` forks.
+
+`experiment_name` encodes the arm
+(`alfworld_inrepo_tbturn_entropy_a0.5_blend_reasoning_k2_...`) so ablations cannot overwrite
 each other's dumps. Branch slots are played *sequentially* after the main slot, so
-`ALFWORLD_POOL_SIZE` does not need to grow with `k`, but a step costs roughly `(1+k)`
-episodes of wall clock.
+`ALFWORLD_POOL_SIZE` does not need to grow with `n`, but a step costs roughly `(1+B*k)`
+episodes of wall clock — budget `B` and `k` together, not independently.
 
 Every scoring axis defaults to the value used by the math reference arm
 `iclr_opd_tbopd_rbw_klfork_r16k_e2`, so an ALFWorld run and a math run differ only in
@@ -183,13 +193,15 @@ the candidate set. One env var changes one axis:
 
 | Variant | Setting |
 |---|---|
-| default (= math reference arm) | truncated entropy blended with teacher disagreement at `fork_alpha=0.5`, rank-normalized, `blend`, no positional prior, B=1, `only_fail=False`, RB weights |
+| default | truncated entropy blended with teacher disagreement at `fork_alpha=0.5`, rank-normalized, `blend`, `eligibility=reasoning` (re-think the turn from its first token), B=1, `only_fail=False`, RB weights |
 | ARPO-style | `TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True` |
 | pure entropy (no teacher) | `TB_FORK_ALPHA=1.0` |
 | ATOD T-DUR | `TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool` |
-| branch the thinking | `TB_FORK_ELIGIBILITY=reasoning` |
-| branch the action | `TB_FORK_ELIGIBILITY=action` |
-| wider budget | `TB_MAX_BRANCHES_PER_TRAJ=2 TB_K=4` |
+| pool both segments | `TB_FORK_ELIGIBILITY=all` (reasoning + action, 1:1) |
+| re-act on the same thinking | `TB_FORK_ELIGIBILITY=action` (fork the `<action>` block) |
+| more fork points | `TB_MAX_BRANCHES_PER_TRAJ=3 TB_K=2` → `rollout.n = 1 + B*k = 7` |
+| wider fan-out at one fork | `TB_K=4` → `rollout.n = 5` |
+| deterministic selection | `TB_FORK_SELECT=argmax` |
 | branch only failures | `TB_ONLY_FAIL=True` |
 | uniform branch weights | `TB_BRANCH_WEIGHT_MODE=off` |
 | skip confident trajectories | `TB_FORK_MIN_ENTROPY=0.5` (see the scale caveat below) |
@@ -209,8 +221,8 @@ where to fork. Both are shared with the math token arm.
 
 `TB_DEDUP_SHARED_PREFIX` (default `True`) masks a branch's replay of the main
 trajectory out of its own loss. A branch re-emits everything before the fork verbatim,
-so leaving it supervised trains an episode's opening turns `1+k` times and its tail
-once — a length bias that has nothing to do with what the branch explored. The forced
+so leaving it supervised trains an episode's opening turns up to `1+B*k` times and its
+tail once — a length bias that has nothing to do with what the branch explored. The forced
 token and everything after it stay supervised, which is the part the branch actually
 contributes.
 
@@ -241,28 +253,42 @@ top-k entropy when the rollout carried per-position top-k (which it does here,
 
 It is left at `0.0` rather than copying the math arm's `0.5`, because the two paths do
 not measure the same thing: the token path gates a single position's entropy, this one
-gates a span mean over `turn_first_k=16` tokens, which is systematically lower. The same
-number is therefore a strictly harsher filter here. Set it from
-`tb_opd/fork_uncertainty/*` once a run exists.
+gates the mean over an entire segment (the whole thinking span for a `reasoning`
+candidate, the whole `<action>` block for an `action` one). Averaging over a span of
+mostly-confident tokens pulls the value well below any single peak, so the same number is
+a strictly harsher filter here. Set it from `tb_opd/fork_uncertainty/*` once a run exists.
+Note the two kinds have different scales too — action blocks are short and formulaic,
+thinking spans long and varied — so a single floor does not gate them comparably.
 
 ### Where did the forks actually land?
 
 `tb_opd/fork_kind/{turn_open,reasoning,action}` reports the mix, one vote per group
-(with `TB_MAX_BRANCHES_PER_TRAJ>1` the vote is the top-ranked fork). Nothing in the
-scoring biases the kind, so this is measured rather than assumed.
+(with `TB_MAX_BRANCHES_PER_TRAJ>1` the vote is the top-ranked fork). The default
+eligibility is `reasoning`, so this should be almost all `reasoning` (or `turn_open`
+when the action span was missing and the thinking could not be isolated). Anything
+else is a bug, not a preference.
 
-**Read it against the candidate counts, not as a preference.** Under
-`fork_eligibility=all` each turn contributes exactly one `turn_open` and one `action`
-candidate, but one `reasoning` candidate every `reasoning_stride=8` tokens of the
-thinking span. A turn with a 30-token think block therefore puts ~3 reasoning
-candidates in the pool against 1 and 1 — about 60% of the pool before any score is
-computed. Under `TB_FORK_SELECT=topk_uniform` that enumeration density feeds straight
-into the draw, so a reasoning-heavy `fork_kind` histogram is the expected null result,
-not evidence that the thinking span is where the uncertainty is.
+The candidate set is one per *segment* per turn, so under `TB_FORK_ELIGIBILITY=all` a
+turn contributes exactly two: `reasoning` (fork at the turn's first token, scored by
+the mean signal over the whole thinking span) and `action` (fork at the first token of
+the `<action>` block, scored over that block). The pool is therefore balanced 1:1 and
+the histogram is directly readable as "did the selector prefer to re-think the turn or
+to re-act on the same thinking". `all` deliberately omits `turn_open`, which forks the
+same token as `reasoning` and would otherwise enter one physical fork point twice
+under two different scorings; it remains available as its own arm.
 
-For an honest reasoning-vs-action comparison run the two forced arms
-(`TB_FORK_ELIGIBILITY=reasoning` and `=action`) and compare their outcomes, rather than
-reading the split out of an `all` run.
+The forced `action` arm (and an `all` run) are how to compare *outcomes* against the
+default; an `all` run only tells you what the selector picked, not which choice trains
+better.
+
+**Check `tb_opd/fork_select_random_frac` before reading any of this.** It is the fraction
+of the ranking that `TB_FORK_SELECT=topk_uniform` shuffled. The turn pool is one candidate per turn under the default `reasoning` eligibility
+(two under `all`) — tens, not the thousands of positions the math default of
+`fork_topk_positions=20` was sized for — so at 20 the shuffle covers the whole pool and
+the "entropy-selected" fork is in fact uniformly random. The ALFWorld script therefore
+defaults to `TB_FORK_TOPK_POSITIONS=3`. If `fork_select_random_frac` still approaches
+`1.0` (compare against `tb_opd/num_candidates/mean`), lower it further or run
+`TB_FORK_SELECT=argmax`.
 
 `tb_opd/fork_estimator/*` reports which uncertainty estimator ran (`entropy` = truncated
 top-k, `nll` = the fallback proxy) and `tb_opd/fork_uncertainty/{mean,p10,p50,p90}` the

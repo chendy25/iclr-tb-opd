@@ -232,9 +232,10 @@ tb_opd:
   # --- Shared fork scoring axes (apply to both fork units) ---
 
   # Where a turn fork may land: post_tool | turn_open | reasoning | action | all.
-  # null derives it from turn_only_post_tool. reasoning/action need per-turn
-  # action spans from the agent loop (ALFWorld/tool_agent record them).
-  fork_eligibility: null
+  # Default reasoning: fork the turn's first token, scored over the whole thinking
+  # span (the branch re-thinks the turn). reasoning/action need per-turn action
+  # spans from the agent loop (ALFWorld/tool_agent record them).
+  fork_eligibility: reasoning
 
   # Weight on the uncertainty term: score = alpha*U + (1-alpha)*D for fuse=blend.
   # 1.0 is pure uncertainty (no teacher needed); <1 pulls the teacher forward.

@@ -675,12 +675,13 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
             for reason in set(reasons):
                 metrics[f"tb_opd/none_reason/{reason}"] = float(reasons.count(reason)) / total
 
-    # Where the forks landed. Under fork_eligibility=all a turn contributes candidates
-    # of every kind (turn_open / reasoning / action), so this is the answer to "does
-    # the selector branch the thinking or the tool call" -- and it is measured, not
-    # assumed, which matters because nothing in the scoring biases it either way.
-    # Read off main slots, one vote per group; with max_branches_per_traj > 1 the vote
-    # is the top-ranked fork's kind, not all B of them.
+    # Where the forks landed. Default eligibility=reasoning so this should be
+    # almost all reasoning (or turn_open when the action span was missing and the
+    # thinking could not be isolated). Under eligibility=all the mix is the answer
+    # to "did the selector re-think the turn or re-act on the same thinking" --
+    # measured, not assumed, because the pool is 1:1. Read off main slots, one
+    # vote per group; with max_branches_per_traj > 1 the vote is the top-ranked
+    # fork's kind, not all B of them.
     if "tb_opd_fork_kind" in ntb:
         kinds = [
             str(k)
@@ -717,6 +718,20 @@ def compute_tb_opd_metrics(batch: DataProto) -> dict[str, Any]:
     disagree = _floats("tb_opd_fork_disagreement")
     if disagree:
         metrics["tb_opd/fork_disagreement/mean"] = float(np.mean(disagree))
+
+    # Is the selector actually selecting? fork_select=topk_uniform shuffles the top
+    # fork_topk_positions of the ranking, and the turn unit's pool is one candidate per
+    # segment per turn -- tens, against the thousands of positions the token unit's
+    # default of 20 was sized for. At random_frac 1.0 the whole ranking was shuffled and
+    # the arm is a uniform-random-fork ablation wearing an entropy label. Read it with
+    # num_candidates: random_frac ~= min(1, fork_topk_positions / num_candidates).
+    rnd = _floats("tb_opd_fork_select_random_frac")
+    if rnd:
+        metrics["tb_opd/fork_select_random_frac"] = float(np.mean(rnd))
+    ncand = _floats("tb_opd_num_candidates")
+    if ncand:
+        metrics["tb_opd/num_candidates/mean"] = float(np.mean(ncand))
+        metrics["tb_opd/num_candidates/p10"] = float(np.percentile(ncand, 10))
 
     return metrics
 

@@ -228,9 +228,10 @@ class TBOPDConfig(BaseConfig):
     enable (bool):
         Master switch. When False, rollout falls back to standard per-row generation.
     k (int):
-        Number of alternative tokens expanded into full branch continuations at the
-        fork position. With rollout.n = 1 + k, slot 0 is the main trajectory and
-        slots 1..k are the branches.
+        Number of alternative tokens expanded into full branch continuations at
+        *each* fork position. With ``max_branches_per_traj=B`` the group needs
+        rollout.n = 1 + B*k: slot 0 is the main trajectory and the remaining B*k
+        slots are k forced alternatives at each of B fork points.
     only_fail (bool):
         If True, only branch when the main trajectory is judged incorrect by the
         rule-based reward; otherwise the extra slots are filled with plain rollouts.
@@ -255,7 +256,12 @@ class TBOPDConfig(BaseConfig):
         top-``fork_topk_positions`` most uncertain positions; CURE-aligned).
     fork_topk_positions (int):
         Number of highest-uncertainty positions kept before uniform sampling when
-        ``fork_select="topk_uniform"``. Ignored for "argmax".
+        ``fork_select="topk_uniform"``. Ignored for "argmax". The default (20) is
+        sized for the token unit, whose pool is every response position; the turn
+        unit's pool is one or two candidates per turn, so 20 can swallow it whole and
+        make selection uniform-random. ``tb_opd/fork_select_random_frac`` reports the
+        fraction of the ranking that was shuffled -- if it sits near 1.0, either drop
+        this to a few or run ``fork_select=argmax``.
     fork_skip_first (int):
         Number of leading response positions to exclude from forking (CURE skips
         position 0; default 1). Guards against branching on opener boilerplate.
@@ -322,7 +328,10 @@ class TBOPDConfig(BaseConfig):
     turn_first_k (int):
         Number of leading assistant tokens of a turn used to compute its
         uncertainty signal (ARPO measures the entropy spike over the first tokens
-        after a tool response). <=0 uses the whole turn.
+        after a tool response). <=0 uses the whole turn. Applies only to the
+        whole-turn candidate emitted by ``fork_eligibility=turn_open|post_tool``;
+        the ``reasoning`` and ``action`` candidates are scored over the entirety of
+        their own segment, since there the segment is the unit being ranked.
     turn_only_post_tool (bool):
         If True, only turns that immediately follow a tool response are eligible
         fork points (ARPO's "post-tool decision turn"). Default False: the token
@@ -371,13 +380,22 @@ class TBOPDConfig(BaseConfig):
     "use whatever ``fork_metric`` implies", so existing arms are unchanged.
 
     fork_eligibility (str | None):
-        Which candidates exist for ``fork_unit="turn"``: ``post_tool`` (ARPO's
-        decision turn), ``turn_open`` (any turn's first token), ``reasoning``
-        (inside the thinking span), ``action`` (inside the tool-call / env action
-        span), or ``all`` (no positional prior, which is what the token path does).
-        ``reasoning``/``action`` require the agent loop to report per-turn action
-        spans; without them those candidates are skipped. ``None`` derives
-        ``post_tool``/``all`` from ``turn_only_post_tool``.
+        Which candidates exist for ``fork_unit="turn"``. One candidate per segment
+        per turn: ``reasoning`` forks the turn's first token and is scored by the
+        mean signal over the whole thinking span (the branch re-thinks the turn);
+        ``action`` forks the first token of the action block and is scored over that
+        block (the thinking is kept, only the action changes); ``turn_open`` forks
+        the turn's first token but scores the whole turn under ``turn_first_k``, and
+        ``post_tool`` is ``turn_open`` restricted to turns following a tool response
+        (ARPO's decision turn). ``all`` = ``reasoning`` + ``action``, i.e. a pool
+        balanced 1:1 between the two segments and no positional prior, which is the
+        turn-unit analogue of what the token path does. ``all`` deliberately omits
+        ``turn_open``: it forks the same token as ``reasoning``, so including it
+        would enter one physical fork point twice under two scorings.
+        ``reasoning``/``action`` need the agent loop to report per-turn action spans;
+        without them a turn falls back to a single whole-turn candidate. Default
+        ``reasoning``. ``None`` derives ``post_tool`` from ``turn_only_post_tool``
+        and ``reasoning`` otherwise.
     fork_alpha (float):
         Weight on ``U`` in ``fuse="blend"``: ``alpha*U + (1-alpha)*D``. ``1.0`` is
         pure uncertainty -- where the student is *unsure*. ``0.0`` is pure teacher
@@ -444,7 +462,7 @@ class TBOPDConfig(BaseConfig):
 
     # Shared fork scoring axes (both fork units). ``None`` = take the fork_metric
     # preset, so existing arms keep their behavior unless an axis is set explicitly.
-    fork_eligibility: Optional[str] = None
+    fork_eligibility: Optional[str] = "reasoning"
     fork_alpha: float = 0.5
     fork_fuse: str = "blend"
     fork_kl_window: int = 128

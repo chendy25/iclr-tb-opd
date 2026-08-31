@@ -776,22 +776,40 @@ def fuse_signals(
 def turn_fork_candidates(
     turns: list[tuple[int, int, bool]],
     *,
-    eligibility: str,
     skip_first_turns: int,
     turn_first_k: int,
     action_spans: Optional[list] = None,
-    reasoning_stride: int = 8,
+    eligibility: str = "reasoning",
 ) -> list[dict]:
     """Enumerate fork candidates over a segmented multi-turn trajectory.
 
-    A candidate is a ``pos`` (where the branch re-enters) plus the ``[span_start,
-    span_end)`` window that ``U`` and ``D`` are averaged over. Keeping the two
-    separate is what lets one scorer serve both "fork at the turn opening" (ARPO)
-    and "fork inside the tool call".
+    One candidate == one *segment* of a turn. A candidate carries ``pos`` (the token
+    the branch re-enters at), the ``[span_start, span_end)`` window whose mean ``U``
+    and ``D`` score it, and ``first_k`` (how much of that window to average, ``0`` =
+    all of it). Separating ``pos`` from the span is what lets one scorer rank "fork
+    at the turn opening" (ARPO) against "fork at the tool call".
+
+    Each turn contributes at most one candidate per kind:
+
+      ``reasoning``  fork at the turn's first token, scored over the whole thinking
+                     span. The branch re-thinks the turn from scratch.
+      ``action``     fork at the first token of the action / tool-call block, scored
+                     over that block. The thinking is kept verbatim and only the
+                     action changes.
+      ``turn_open``  fork at the turn's first token, scored over the whole turn
+                     (thinking *and* action), with ARPO's first-``turn_first_k``
+                     window. Same fork point as ``reasoning``, coarser score.
+
+    ``turn_open`` and ``reasoning`` fork at the *same* token, so emitting both under
+    ``all`` would put one physical fork point in the pool twice and simply take the
+    max of two scorings of it. ``all`` therefore emits ``reasoning`` + ``action`` --
+    one candidate per segment, so the pool is balanced 1:1 between "change the
+    thinking" and "change the action" and a fork_kind histogram means something.
+    ``turn_open`` is what the explicit ``turn_open`` / ``post_tool`` (ARPO) arms use.
 
     ``action_spans[i]`` is the ``(start, end)`` response-coordinate range of turn
-    ``i``'s action / tool-call tokens, or ``None`` when unknown. Candidates that
-    need it are simply not emitted when it is missing.
+    ``i``'s action tokens, or ``None`` when unknown. Without it thinking and action
+    cannot be told apart, so the turn falls back to a single whole-turn candidate.
     """
     cands: list[dict] = []
     for ti, (start, end, post_tool) in enumerate(turns):
@@ -803,18 +821,41 @@ def turn_fork_candidates(
             if start <= a_start < a_end <= end:
                 span = (a_start, a_end)
 
-        want_open = eligibility in ("post_tool", "turn_open", "all")
-        if want_open and not (eligibility == "post_tool" and not post_tool):
+        if eligibility in ("post_tool", "turn_open") and not (
+            eligibility == "post_tool" and not post_tool
+        ):
             cands.append(
                 {
                     "pos": start,
                     "span_start": start,
                     "span_end": end,
+                    "first_k": turn_first_k,
                     "turn_index": ti,
                     "post_tool": post_tool,
                     "kind": "turn_open",
                 }
             )
+
+        # Emitted in response order (thinking, then action) so that equal scores break
+        # toward the earlier fork point rather than toward whichever kind is listed first.
+        if eligibility in ("reasoning", "all"):
+            r_end = span[0] if span is not None else end
+            if r_end > start:
+                cands.append(
+                    {
+                        "pos": start,
+                        "span_start": start,
+                        "span_end": r_end,
+                        # Mean over the entire thinking span, not a leading window:
+                        # the segment is the unit being ranked.
+                        "first_k": 0,
+                        "turn_index": ti,
+                        "post_tool": post_tool,
+                        # Without an action span this covers the whole turn, so call
+                        # it what it is rather than claiming the thinking was isolated.
+                        "kind": "reasoning" if span is not None else "turn_open",
+                    }
+                )
 
         if eligibility in ("action", "all") and span is not None:
             cands.append(
@@ -822,30 +863,13 @@ def turn_fork_candidates(
                     "pos": span[0],
                     "span_start": span[0],
                     "span_end": span[1],
+                    # The action block IS the segment, so score all of it.
+                    "first_k": 0,
                     "turn_index": ti,
                     "post_tool": post_tool,
                     "kind": "action",
                 }
             )
-
-        if eligibility in ("reasoning", "all"):
-            # Reasoning = the turn before its action span (the whole turn when the
-            # action span is unknown but the turn is not itself pure action).
-            r_end = span[0] if span is not None else end
-            stride = max(1, int(reasoning_stride))
-            for p in range(start, r_end, stride):
-                if p == start and want_open:
-                    continue  # already emitted as turn_open
-                cands.append(
-                    {
-                        "pos": p,
-                        "span_start": p,
-                        "span_end": min(r_end, p + max(1, turn_first_k)),
-                        "turn_index": ti,
-                        "post_tool": post_tool,
-                        "kind": "reasoning",
-                    }
-                )
     return cands
 
 
@@ -892,11 +916,12 @@ def select_fork_turn(
     and the teacher is consulted exactly when the token path would consult it:
     ``fork_fuse in ("max", "union", "soft_or") or fork_alpha < 1.0``.
 
-    ``eligibility`` (default derived from ``only_post_tool``) decides *where* a
-    fork may land -- ``post_tool``/``turn_open`` at a turn's first token,
-    ``reasoning`` inside the thinking span, ``action`` inside the tool-call / env
-    action span, ``all`` for no positional prior. ``action``/``reasoning`` need
-    ``action_spans``.
+    ``eligibility`` decides *where* a fork may land. Default ``reasoning``: fork
+    at the turn's first token, scored over the whole thinking span (the branch
+    re-thinks the turn). ``action`` keeps the thinking and forks the tool-call /
+    env action; ``all`` pools both 1:1; ``turn_open``/``post_tool`` score the
+    whole turn (ARPO). ``None`` derives ``post_tool`` from ``only_post_tool`` and
+    ``reasoning`` otherwise. ``action``/``reasoning`` need ``action_spans``.
 
     ``select`` mirrors the token path's ``fork_select``: ``argmax`` always takes the
     top-scoring candidate, ``topk_uniform`` draws uniformly among the top
@@ -925,7 +950,7 @@ def select_fork_turn(
     use_teacher = want_teacher and teacher_logprobs is not None
 
     if eligibility is None:
-        eligibility = "post_tool" if only_post_tool else "all"
+        eligibility = "post_tool" if only_post_tool else "reasoning"
     if eligibility not in TURN_ELIGIBILITY:
         return {"pos": None, "none_reason": f"unknown_eligibility:{eligibility}"}
 
@@ -947,14 +972,14 @@ def select_fork_turn(
     # one-sample NLL proxy. Reported so runs are not silently comparing estimators.
     have_topk = bool(topk_logprobs)
 
-    def _u(start: int, end: int) -> float:
+    def _u(start: int, end: int, first_k: int) -> float:
         if have_topk:
-            return _span_entropy(topk_logprobs, start, end, turn_first_k)
-        return _turn_nll_proxy(response_logprobs, start, end, turn_first_k)
+            return _span_entropy(topk_logprobs, start, end, first_k)
+        return _turn_nll_proxy(response_logprobs, start, end, first_k)
 
     base = 0.0
     if use_baseline == "first_turn":
-        base = _u(turns[0][0], turns[0][1])
+        base = _u(turns[0][0], turns[0][1], turn_first_k)
 
     signed_d = (
         disagreement_window(response_logprobs, teacher_logprobs, fork_kl_window)
@@ -967,7 +992,7 @@ def select_fork_turn(
     # candidate to 1.0 by construction, so a gate on the *normalized* score can
     # never fire no matter how certain the student was.
     for c in cands:
-        c["uncertainty"] = float(_u(c["span_start"], c["span_end"]))
+        c["uncertainty"] = float(_u(c["span_start"], c["span_end"], c["first_k"]))
     if min_uncertainty > 0.0:
         gated = [c for c in cands if c["uncertainty"] >= min_uncertainty]
         if not gated:
@@ -983,15 +1008,15 @@ def select_fork_turn(
 
     u_raw, d_raw = [], []
     for c in cands:
-        s, e = c["span_start"], c["span_end"]
+        s, e, fk = c["span_start"], c["span_end"], c["first_k"]
         val = c["uncertainty"]
         u_raw.append(max(0.0, val - base) if use_baseline == "first_turn" else val)
         if not use_teacher:
             d_raw.append(0.0)
         elif signed_d is not None:
-            d_raw.append(_span_mean(signed_d, s, e, turn_first_k))
+            d_raw.append(_span_mean(signed_d, s, e, fk))
         else:
-            d_raw.append(_turn_disagreement(response_logprobs, teacher_logprobs, s, e, turn_first_k))
+            d_raw.append(_turn_disagreement(response_logprobs, teacher_logprobs, s, e, fk))
         c["disagreement"] = float(d_raw[-1])
 
     signals = fuse_signals(
@@ -1002,13 +1027,21 @@ def select_fork_turn(
         normalize=normalize,
     )
 
-    # AEPO-style consecutive high-signal penalty: if the preceding candidate is also
-    # above-median, down-weight to curb over-branching along one chain.
+    # AEPO-style consecutive high-signal penalty: if the preceding *turn* is also
+    # above-median, down-weight to curb over-branching along one chain. It has to
+    # look back by turn, not by list position -- a turn contributes several
+    # candidates (thinking, action), so comparing against index i-1 would mostly
+    # penalize a turn's action span for its own thinking being uncertain.
     if consecutive_penalty and len(signals) > 1:
         med = sorted(signals)[len(signals) // 2]
+        best_by_turn: dict[int, float] = {}
+        for c, s in zip(cands, signals):
+            ti = int(c["turn_index"])
+            best_by_turn[ti] = max(best_by_turn.get(ti, float("-inf")), s)
         penalized = list(signals)
-        for i in range(1, len(signals)):
-            if signals[i - 1] >= med:
+        for i, c in enumerate(cands):
+            prev = best_by_turn.get(int(c["turn_index"]) - 1)
+            if prev is not None and prev >= med:
                 penalized[i] = signals[i] * float(consecutive_penalty_weight)
         signals = penalized
 
@@ -1034,8 +1067,16 @@ def select_fork_turn(
     # student, so the same few turns get explored every epoch. Shuffling only the
     # top-N leaves the tail as fallback order, which matters when the gap constraint
     # below rejects the whole pool.
+    #
+    # Watch the scale: the token path draws from thousands of positions, so top-20 is
+    # a narrow slice of it. Here the pool is one or two candidates per turn, i.e. tens,
+    # so topk_positions=20 can cover all of it and turn selection into a coin flip.
+    # select_random_frac reports how much of the ranking got shuffled -- 1.0 means the
+    # scoring did nothing and the arm is a uniform-random-fork ablation.
+    select_random_frac = 0.0
     if select == "topk_uniform" and len(order) > 1:
         n_pool = min(len(order), max(1, int(topk_positions)))
+        select_random_frac = n_pool / len(order)
         pool_ids = order[:n_pool]
         random.shuffle(pool_ids)
         order = pool_ids + order[n_pool:]
@@ -1068,6 +1109,7 @@ def select_fork_turn(
         "eligibility": eligibility,
         "used_teacher": bool(use_teacher),
         "uncertainty_estimator": "entropy" if have_topk else "nll",
+        "select_random_frac": float(select_random_frac),
     }
 
 

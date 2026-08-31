@@ -122,22 +122,29 @@ tb_consec_penalty=${TB_CONSEC_PENALTY:-False}
 tb_consec_weight=${TB_CONSEC_WEIGHT:-0.5}
 
 # ---- Shared fork-scoring axes (same knobs and defaults as the math token arms) ----
-tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
+tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-reasoning}  # reasoning|action|all|turn_open|post_tool
 tb_fork_alpha=${TB_FORK_ALPHA:-0.5}               # 0.5 = math's even U/D blend; 1.0 = pure uncertainty
 tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
 tb_fork_kl_window=${TB_FORK_KL_WINDOW:-128}
 tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (token path) | minmax (ATOD)
 tb_disagreement_signed=${TB_DISAGREEMENT_SIGNED:-True}
 tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
+# Exploration width. 3, not the config default of 20 the math arms use: the token unit
+# ranks thousands of response positions so top-20 is a sliver, while the turn unit ranks
+# one candidate per segment per turn -- tens. At 20 the shuffle covers the whole pool and
+# the fork is uniformly random despite the entropy label. See tb_opd/fork_select_random_frac.
+tb_fork_select=${TB_FORK_SELECT:-topk_uniform}    # topk_uniform | argmax
+tb_fork_topk_positions=${TB_FORK_TOPK_POSITIONS:-3}
 
 # ---- B-A1 turn-level loss reweighting (reweight-only; independent of TB_ENABLE) ----
 tb_turn_reweight=${TB_TURN_REWEIGHT:-False}
 tb_reweight_alpha=${TB_REWEIGHT_ALPHA:-1.0}
 tb_reweight_metric=${TB_REWEIGHT_METRIC:-ent}     # ent | dHtool
 
-# rollout.n: TB-OPD-Turn uses 1 (main) + k (branches); baseline uses GRPO group size.
+# rollout.n: TB-OPD-Turn uses 1 (main) + B*k (k branches at each of B fork points, so k
+# is per-fork as on the math side); baseline uses GRPO group size.
 if [[ "${tb_enable}" == "True" ]]; then
-  rollout_n=${ROLLOUT_N:-$((1 + tb_k))}
+  rollout_n=${ROLLOUT_N:-$((1 + tb_max_branches * tb_k))}
 else
   rollout_n=${ROLLOUT_N:-5}
 fi
@@ -268,6 +275,8 @@ if [[ "${tb_enable}" == "True" ]]; then
     distillation.tb_opd.fork_normalize=${tb_fork_normalize}
     distillation.tb_opd.disagreement_signed=${tb_disagreement_signed}
     distillation.tb_opd.fork_min_turn_gap=${tb_fork_min_turn_gap}
+    distillation.tb_opd.fork_select=${tb_fork_select}
+    distillation.tb_opd.fork_topk_positions=${tb_fork_topk_positions}
   )
 else
   TB_ARGS+=(distillation.tb_opd.enable=False)

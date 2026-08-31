@@ -43,7 +43,7 @@ a math run differ only in the candidate set unless you deliberately change a kno
 | `D` | `fork_kl_window`, `disagreement_signed` | `128`, signed `logp_student - logp_teacher` | `disagreement_signed=False` for ATOD's unsigned `|Δ|` |
 | `Fuse` | `fork_fuse`, `fork_alpha` | `blend`, `α=1.0` (pure uncertainty, no teacher) | `α<1` blends in `D`; `max`, `union`, `soft_or` (ATOD T-DUR) |
 | `norm` | `fork_normalize` | `rank` | `minmax` (ATOD) |
-| Eligibility | `fork_eligibility` | `all` — no positional prior, as on the token path | `post_tool` (ARPO), `turn_open`, `reasoning`, `action` |
+| Eligibility | `fork_eligibility` | `reasoning` — fork the turn's first token, scored over the thinking span | `all` (reasoning + action, 1:1), `action`, `post_tool` (ARPO), `turn_open` |
 | Budget B | `max_branches_per_traj`, `fork_min_turn_gap` | `1` | slots are dealt round-robin across up to B fork points, kept ≥`fork_min_turn_gap` turns apart |
 
 The teacher is consulted at fork time under exactly the token path's condition:

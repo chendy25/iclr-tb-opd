@@ -10,14 +10,16 @@
 # "math vs agentic" differs only in the candidate set (assistant turns / spans instead
 # of individual tokens):
 #   truncated top-k entropy, rank-normalized, fork_alpha=0.5 (even U/D blend),
-#   blend fusion, no positional prior, B=1, only_fail=False, RB branch weights.
+#   blend fusion, eligibility=reasoning (re-think the turn from its first token),
+#   B=1, only_fail=False, RB branch weights.
 #
 # Variants (each changes exactly one axis):
 #   ARPO-style       TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True
 #   pure entropy     TB_FORK_ALPHA=1.0                    # drop the teacher term
 #   ATOD T-DUR       TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool
-#   branch the think TB_FORK_ELIGIBILITY=reasoning
-#   branch the act   TB_FORK_ELIGIBILITY=action
+#   pool both segs   TB_FORK_ELIGIBILITY=all              # reasoning + action, 1:1
+#   re-act only      TB_FORK_ELIGIBILITY=action           # keep the thinking, fork <action>
+#   more fork points  TB_MAX_BRANCHES_PER_TRAJ=3 TB_K=2   # -> rollout.n = 1 + B*k = 7
 #   wider budget     TB_MAX_BRANCHES_PER_TRAJ=2 TB_K=4
 #   skip confident   TB_FORK_MIN_ENTROPY=0.5              # see README on the scale caveat
 #   only failures    TB_ONLY_FAIL=True

@@ -1075,7 +1075,7 @@ class AgentLoopWorker:
         consec_penalty = bool(cfg.get("consecutive_high_entropy_penalty", False))
         consec_weight = float(cfg.get("consecutive_penalty_weight", 0.5))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
-        eligibility = cfg.get("fork_eligibility", None)
+        eligibility = cfg.get("fork_eligibility", "reasoning")
         eligibility = None if eligibility is None else str(eligibility)
         fork_alpha = float(cfg.get("fork_alpha", 0.5))
         fork_fuse = str(cfg.get("fork_fuse", "blend"))
@@ -1223,6 +1223,13 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_fork_used_teacher"] = float(fork.get("used_teacher", False))
             main_out.extra_fields["tb_opd_fork_estimator"] = str(fork.get("uncertainty_estimator", ""))
             main_out.extra_fields["tb_opd_num_fork_points"] = float(len(fork_points))
+            # How much of the ranking topk_uniform randomized. The turn pool is tens of
+            # candidates, not thousands of token positions, so fork_topk_positions can
+            # cover all of it -- at 1.0 the scoring is decorative.
+            main_out.extra_fields["tb_opd_fork_select_random_frac"] = float(
+                fork.get("select_random_frac", 0.0)
+            )
+            main_out.extra_fields["tb_opd_num_candidates"] = float(fork.get("num_eligible", 0))
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
         # (fork index, candidate index) each branch slot actually forced, recorded rather
