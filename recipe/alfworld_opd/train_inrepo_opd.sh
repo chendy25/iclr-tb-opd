@@ -98,6 +98,14 @@ tb_fork_min_entropy=${TB_FORK_MIN_ENTROPY:-0.0}   # raw-entropy floor; math arms
 tb_branch_mode=${TB_BRANCH_MODE:-forced_topk}     # forced_topk | resample
 tb_topk_logprobs=${TB_TOPK_LOGPROBS:-20}
 tb_max_branches=${TB_MAX_BRANCHES_PER_TRAJ:-1}
+# Loss-side treatment of the branches. dedup: a branch replays the main trajectory's
+# prefix, so leaving it supervised trains those tokens (1+k) times. rb: weight the k+1
+# continuations by the student's own probability of the token each was forced to take --
+# uniform averaging over forced top-k alternatives is what makes branch-OPD off-policy.
+tb_dedup_shared_prefix=${TB_DEDUP_SHARED_PREFIX:-True}
+tb_branch_weight_mode=${TB_BRANCH_WEIGHT_MODE:-off}   # off | rb
+tb_branch_weight_temp=${TB_BRANCH_WEIGHT_TEMP:-1.0}   # >1 flattens toward uniform
+tb_branch_weight_floor=${TB_BRANCH_WEIGHT_FLOOR:-0.0} # >0 keeps rare branches alive
 tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
 tb_turn_first_k=${TB_TURN_FIRST_K:-16}
 tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-False}
@@ -299,6 +307,10 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     distillation.tb_opd.branch_mode=${tb_branch_mode} \
     distillation.tb_opd.topk_logprobs=${tb_topk_logprobs} \
     distillation.tb_opd.max_branches_per_traj=${tb_max_branches} \
+    distillation.tb_opd.dedup_shared_prefix=${tb_dedup_shared_prefix} \
+    distillation.tb_opd.branch_weight_mode=${tb_branch_weight_mode} \
+    distillation.tb_opd.branch_weight_temp=${tb_branch_weight_temp} \
+    distillation.tb_opd.branch_weight_floor=${tb_branch_weight_floor} \
     distillation.tb_opd.fork_min_turn_gap=${tb_fork_min_turn_gap} \
     distillation.tb_opd.turn_first_k=${tb_turn_first_k} \
     distillation.tb_opd.turn_only_post_tool=${tb_turn_only_post_tool} \

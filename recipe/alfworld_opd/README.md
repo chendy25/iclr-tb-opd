@@ -190,6 +190,34 @@ run differ only in the candidate set. One env var changes one axis:
 | branch the action | `TB_FORK_ELIGIBILITY=action` |
 | wider budget | `TB_MAX_BRANCHES_PER_TRAJ=2 TB_K=4` |
 | skip confident trajectories | `TB_FORK_MIN_ENTROPY=0.5` (the math arms' floor) |
+| unbiased branch loss | `TB_BRANCH_WEIGHT_MODE=rb` |
+
+### How the branches enter the loss
+
+Two knobs decide what a branch contributes, and they are about the *loss*, not about
+where to fork. Both are shared with the math token arm.
+
+`TB_DEDUP_SHARED_PREFIX` (default `True`) masks a branch's replay of the main
+trajectory out of its own loss. A branch re-emits everything before the fork verbatim,
+so leaving it supervised trains an episode's opening turns `1+k` times and its tail
+once — a length bias that has nothing to do with what the branch explored. The forced
+token and everything after it stay supervised, which is the part the branch actually
+contributes.
+
+`TB_BRANCH_WEIGHT_MODE=rb` (default `off`) weights the `k+1` continuations of a fork by
+the student's own probability of the token each one was forced to take. This is what
+makes forced-`topk` branching unbiased: under uniform averaging a rank-5 token the
+student would emit ~1% of the time carries the same gradient mass as the token it
+actually chose, so the loss is no longer an estimate of anything the student's policy
+would produce. The weights have mean 1 within a group, so the aggregate loss scale —
+and the effective learning rate — is unchanged from uniform. `TB_BRANCH_WEIGHT_TEMP>1`
+flattens toward uniform and `TB_BRANCH_WEIGHT_FLOOR>0` keeps rare branches from
+vanishing entirely; both trade bias back for variance. RB requires
+`TB_BRANCH_MODE=forced_topk` and is rejected at config time under `resample`, whose
+branches are already on-policy.
+
+Watch `distillation/branch_weight_mean` (should sit near 1) and
+`distillation/branch_weight_max` (a large value means one slot is dominating its group).
 
 `TB_FORK_MIN_ENTROPY` is a floor on the **raw** entropy, applied before normalization —
 a floor on the normalized score cannot work, since rank and min-max both map the best
