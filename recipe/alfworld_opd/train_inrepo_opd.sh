@@ -86,10 +86,10 @@ fi
 # only in which candidates exist (assistant turns / spans instead of tokens).
 tb_enable=${TB_ENABLE:-False}
 tb_k=${TB_K:-2}                                   # branch slots per prompt
-tb_only_fail=${TB_ONLY_FAIL:-True}                # branch only trajectories that lost
+tb_only_fail=${TB_ONLY_FAIL:-False}               # False (= math): branch regardless of outcome
 tb_fork_metric=${TB_FORK_METRIC:-entropy}         # entropy (== ent) | dHtool (ARPO)
 tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
-tb_fork_alpha=${TB_FORK_ALPHA:-1.0}               # 1.0 = pure uncertainty; <1 pulls in the teacher
+tb_fork_alpha=${TB_FORK_ALPHA:-0.5}               # 0.5 = math's even U/D blend; 1.0 = pure uncertainty
 tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
 tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (math) | minmax (ATOD)
 tb_fork_kl_window=${TB_FORK_KL_WINDOW:-128}
@@ -103,7 +103,7 @@ tb_max_branches=${TB_MAX_BRANCHES_PER_TRAJ:-1}
 # continuations by the student's own probability of the token each was forced to take --
 # uniform averaging over forced top-k alternatives is what makes branch-OPD off-policy.
 tb_dedup_shared_prefix=${TB_DEDUP_SHARED_PREFIX:-True}
-tb_branch_weight_mode=${TB_BRANCH_WEIGHT_MODE:-off}   # off | rb
+tb_branch_weight_mode=${TB_BRANCH_WEIGHT_MODE:-rb}    # rb (= math) | off; resample needs off
 tb_branch_weight_temp=${TB_BRANCH_WEIGHT_TEMP:-1.0}   # >1 flattens toward uniform
 tb_branch_weight_floor=${TB_BRANCH_WEIGHT_FLOOR:-0.0} # >0 keeps rare branches alive
 tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}

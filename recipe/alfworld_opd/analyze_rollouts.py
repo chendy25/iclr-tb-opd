@@ -196,7 +196,7 @@ def tb_stats(rows: list[dict]) -> Optional[dict[str, Any]]:
     forked_groups = 0
     branch_rows = 0
     branch_wins = 0
-    squandered = 0           # main won yet branches were still spent
+    squandered = 0           # main won yet branches were still spent (expected iff only_fail=False)
     fork_kind: Counter = Counter()
     estimator: Counter = Counter()
     branch_mode: Counter = Counter()
@@ -260,9 +260,11 @@ def tb_stats(rows: list[dict]) -> Optional[dict[str, Any]]:
         "forked_pct": pct(forked_groups, n_groups),
         "branch_rows": branch_rows,
         "branch_success_pct": pct(branch_wins, branch_rows),
-        # only_fail should keep this at 0; anything else means slots were burned on
-        # episodes that had already succeeded.
-        "squandered_pct": pct(squandered, n_groups),
+        # Share of groups that spent branches on an episode the main slot already won.
+        # Read it against only_fail: under only_fail=True (the default is False) it is a
+        # bug indicator and should be 0; under only_fail=False it is expected and simply
+        # tracks the success rate, since every trajectory is forked regardless of outcome.
+        "branched_after_win_pct": pct(squandered, n_groups),
         "fork_depth_mean": mean(rel_depth),
         "replay_diverged_pct": pct(replay_bad, replay_seen),
         "fork_kind": dict(fork_kind.most_common()),
@@ -312,7 +314,7 @@ TB_ROWS = [
     ("any_success_pct", "any-slot success %"),
     ("forked_pct", "groups forked %"),
     ("branch_success_pct", "branch success %"),
-    ("squandered_pct", "squandered (main won) %"),
+    ("branched_after_win_pct", "branched after win %"),
     ("fork_depth_mean", "fork depth (frac of episode)"),
     ("replay_diverged_pct", "replay diverged %"),
     ("estimator", "U estimator"),

@@ -5,16 +5,16 @@
 #   (tool tokens masked out).
 # Teacher SOD-GRPO_teacher-4B -> Student Qwen3-1.7B on Open-AgentRL TIR.
 #
-# Selection signal: the same one the math token arms use -- truncated entropy,
-# rank-normalized, fork_alpha=1.0 (pure uncertainty), no positional prior. The
-# teacher IS now available at rollout time for fork ranking, so the disagreement
-# variants below are a matter of setting fork_alpha/fork_fuse rather than a
-# missing capability.
+# Selection signal: the same one the math token arms use
+# (iclr_opd_tbopd_rbw_klfork_r16k_e2) -- truncated entropy blended with teacher
+# disagreement at fork_alpha=0.5, rank-normalized, no positional prior. The teacher
+# IS available at rollout time for fork ranking, so the disagreement term costs
+# nothing extra: that forward is needed for the loss regardless.
 #
 # Variants (each changes one axis):
-#   ARPO-style : TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True
-#   KL-fork    : TB_FORK_ALPHA=0.5                  # blend entropy with disagreement
-#   ATOD T-DUR : TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool
+#   ARPO-style   : TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True
+#   pure entropy : TB_FORK_ALPHA=1.0                  # drop the teacher term
+#   ATOD T-DUR   : TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool
 #   fork inside the reasoning / action span: TB_FORK_ELIGIBILITY=reasoning|action
 #
 # Prereqs:
@@ -24,9 +24,9 @@ set -xeuo pipefail
 export TB_ENABLE=True
 export TB_FORK_UNIT=turn
 export TB_K=${TB_K:-2}
-export TB_ONLY_FAIL=${TB_ONLY_FAIL:-True}
+export TB_ONLY_FAIL=${TB_ONLY_FAIL:-False}
 export TB_FORK_METRIC=${TB_FORK_METRIC:-entropy}
-export TB_FORK_ALPHA=${TB_FORK_ALPHA:-1.0}
+export TB_FORK_ALPHA=${TB_FORK_ALPHA:-0.5}
 export TB_FORK_FUSE=${TB_FORK_FUSE:-blend}
 export TB_FORK_NORMALIZE=${TB_FORK_NORMALIZE:-rank}
 export TB_BRANCH_MODE=${TB_BRANCH_MODE:-forced_topk}

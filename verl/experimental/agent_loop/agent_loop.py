@@ -836,7 +836,7 @@ class AgentLoopWorker:
         from verl.experimental.agent_loop import tb_opd
 
         cfg = self.tb_opd_cfg
-        only_fail = bool(cfg.get("only_fail", True))
+        only_fail = bool(cfg.get("only_fail", False))
         fork_metric = str(cfg.get("fork_metric", "entropy"))
         topk_logprobs = int(cfg.get("topk_logprobs", 20))
         branch_min_tokens = int(cfg.get("branch_min_tokens", 8))
@@ -855,7 +855,7 @@ class AgentLoopWorker:
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
         dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
-        branch_weight_mode = str(cfg.get("branch_weight_mode", "off"))
+        branch_weight_mode = str(cfg.get("branch_weight_mode", "rb"))
         branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
         branch_weight_floor = float(cfg.get("branch_weight_floor", 0.0))
 
@@ -1063,7 +1063,7 @@ class AgentLoopWorker:
         from verl.experimental.agent_loop import tb_opd
 
         cfg = self.tb_opd_cfg
-        only_fail = bool(cfg.get("only_fail", True))
+        only_fail = bool(cfg.get("only_fail", False))
         fork_metric = str(cfg.get("fork_metric", "hybrid"))
         correct_threshold = float(cfg.get("correct_threshold", 1.0))
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
@@ -1077,7 +1077,7 @@ class AgentLoopWorker:
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
         eligibility = cfg.get("fork_eligibility", None)
         eligibility = None if eligibility is None else str(eligibility)
-        fork_alpha = float(cfg.get("fork_alpha", 1.0))
+        fork_alpha = float(cfg.get("fork_alpha", 0.5))
         fork_fuse = str(cfg.get("fork_fuse", "blend"))
         fork_kl_window = int(cfg.get("fork_kl_window", 128))
         fork_normalize = str(cfg.get("fork_normalize", "rank"))
@@ -1085,7 +1085,7 @@ class AgentLoopWorker:
         max_branches = int(cfg.get("max_branches_per_traj", 1))
         min_turn_gap = int(cfg.get("fork_min_turn_gap", 1))
         dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
-        branch_weight_mode = str(cfg.get("branch_weight_mode", "off"))
+        branch_weight_mode = str(cfg.get("branch_weight_mode", "rb"))
         branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
         branch_weight_floor = float(cfg.get("branch_weight_floor", 0.0))
 

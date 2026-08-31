@@ -864,7 +864,7 @@ def select_fork_turn(
     eligibility: Optional[str] = None,
     action_spans: Optional[list] = None,
     topk_logprobs: Optional[list] = None,
-    fork_alpha: float = 1.0,
+    fork_alpha: float = 0.5,
     fork_fuse: str = "blend",
     fork_kl_window: int = 128,
     disagreement_signed: bool = True,

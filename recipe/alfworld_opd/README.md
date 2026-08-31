@@ -172,25 +172,35 @@ bash recipe/alfworld_opd/run_tbopd_turn.sh     # arm       (TB-OPD-Turn, n=1+k)
 ```
 
 `rollout.n` is derived as `1+k` automatically, and `experiment_name` encodes the arm
-(`alfworld_inrepo_tbturn_entropy_a1.0_blend_all_k2_...`) so ablations cannot overwrite
+(`alfworld_inrepo_tbturn_entropy_a0.5_blend_all_k2_...`) so ablations cannot overwrite
 each other's dumps. Branch slots are played *sequentially* after the main slot, so
 `ALFWORLD_POOL_SIZE` does not need to grow with `k`, but a step costs roughly `(1+k)`
 episodes of wall clock.
 
-Every scoring axis defaults to the math token arm's value, so an ALFWorld run and a math
-run differ only in the candidate set. One env var changes one axis:
+Every scoring axis defaults to the value used by the math reference arm
+`iclr_opd_tbopd_rbw_klfork_r16k_e2`, so an ALFWorld run and a math run differ only in
+the candidate set. One env var changes one axis:
 
 | Variant | Setting |
 |---|---|
-| default (= math token arm) | truncated entropy, rank-normalized, `fork_alpha=1.0`, `blend`, no positional prior, B=1 |
+| default (= math reference arm) | truncated entropy blended with teacher disagreement at `fork_alpha=0.5`, rank-normalized, `blend`, no positional prior, B=1, `only_fail=False`, RB weights |
 | ARPO-style | `TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True` |
-| KL-fork | `TB_FORK_ALPHA=0.5` (blends in teacher disagreement) |
+| pure entropy (no teacher) | `TB_FORK_ALPHA=1.0` |
 | ATOD T-DUR | `TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool` |
 | branch the thinking | `TB_FORK_ELIGIBILITY=reasoning` |
 | branch the action | `TB_FORK_ELIGIBILITY=action` |
 | wider budget | `TB_MAX_BRANCHES_PER_TRAJ=2 TB_K=4` |
-| skip confident trajectories | `TB_FORK_MIN_ENTROPY=0.5` (the math arms' floor) |
-| unbiased branch loss | `TB_BRANCH_WEIGHT_MODE=rb` |
+| branch only failures | `TB_ONLY_FAIL=True` |
+| uniform branch weights | `TB_BRANCH_WEIGHT_MODE=off` |
+| skip confident trajectories | `TB_FORK_MIN_ENTROPY=0.5` (see the scale caveat below) |
+
+`only_fail=False` means every trajectory is forked, not just the ones that lost. That
+matches the math arm and is the more defensible default: the fork point is chosen by
+uncertainty and teacher disagreement, which are just as informative on an episode that
+happened to win, and gating on the outcome would make the branch distribution depend on
+the reward in a way the KD loss itself does not. It also removes a confound from the
+recovery-rate comparison, since every group now has the same branch budget. The cost is
+real but small here — ALFWorld success is low, so most groups were branching anyway.
 
 ### How the branches enter the loss
 
@@ -204,7 +214,8 @@ once — a length bias that has nothing to do with what the branch explored. The
 token and everything after it stay supervised, which is the part the branch actually
 contributes.
 
-`TB_BRANCH_WEIGHT_MODE=rb` (default `off`) weights the `k+1` continuations of a fork by
+`TB_BRANCH_WEIGHT_MODE` (default `rb`, as on the math arm) weights the `k+1`
+continuations of a fork by
 the student's own probability of the token each one was forced to take. This is what
 makes forced-`topk` branching unbiased: under uniform averaging a rank-5 token the
 student would emit ~1% of the time carries the same gradient mass as the token it
@@ -214,7 +225,9 @@ and the effective learning rate — is unchanged from uniform. `TB_BRANCH_WEIGHT
 flattens toward uniform and `TB_BRANCH_WEIGHT_FLOOR>0` keeps rare branches from
 vanishing entirely; both trade bias back for variance. RB requires
 `TB_BRANCH_MODE=forced_topk` and is rejected at config time under `resample`, whose
-branches are already on-policy.
+branches are already on-policy — so the resample ablation must be launched as
+`TB_BRANCH_MODE=resample TB_BRANCH_WEIGHT_MODE=off`. The rejection is deliberate: a
+silently ignored weighting mode is how an ablation ends up mislabelled.
 
 Watch `distillation/branch_weight_mean` (should sit near 1) and
 `distillation/branch_weight_max` (a large value means one slot is dominating its group).
@@ -257,13 +270,15 @@ main slot lost, the share a branch rescued. Run three arms and read the two gaps
 | arm | how to produce | isolates |
 |---|---|---|
 | `fork` | `TB_BRANCH_MODE=forced_topk` (default) | branch diverges at the *selected* turn |
-| `resample` | `TB_BRANCH_MODE=resample` | same fork point, no forced token |
+| `resample` | `TB_BRANCH_MODE=resample TB_BRANCH_WEIGHT_MODE=off` | same fork point, no forced token |
 | `continue` | `TB_ENABLE=False ROLLOUT_N=3` | independent episodes, no shared prefix |
 
 `fork` vs `resample` isolates *where* the branch diverges; `resample` vs `continue`
-isolates the shared prefix from simply drawing more samples. `squandered %` should stay
-at 0 under `only_fail`, and `replay diverged %` should stay at 0 — anything else means
-branches resumed into an env state that does not match their token prefix.
+isolates the shared prefix from simply drawing more samples. `replay diverged %` should
+stay at 0 — anything else means branches resumed into an env state that does not match
+their token prefix. `branched after win %` is only a fault signal under
+`TB_ONLY_FAIL=True`; at the default `False` every group is forked regardless of outcome,
+so it just tracks the success rate.
 
 ## Relation to ATOD's ALFWorld config
 

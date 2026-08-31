@@ -106,7 +106,7 @@ distillation_topk=${DISTILLATION_TOPK:-64}
 tb_enable=${TB_ENABLE:-True}
 tb_fork_unit=${TB_FORK_UNIT:-turn}
 tb_k=${TB_K:-2}
-tb_only_fail=${TB_ONLY_FAIL:-True}
+tb_only_fail=${TB_ONLY_FAIL:-False}
 tb_fork_metric=${TB_FORK_METRIC:-entropy}         # entropy (== ent) | dHtool (ARPO baseline)
 tb_correct_threshold=${TB_CORRECT_THRESHOLD:-1.0}
 tb_branch_mode=${TB_BRANCH_MODE:-forced_topk}     # forced_topk (M) | resample
@@ -123,7 +123,7 @@ tb_consec_weight=${TB_CONSEC_WEIGHT:-0.5}
 
 # ---- Shared fork-scoring axes (same knobs and defaults as the math token arms) ----
 tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
-tb_fork_alpha=${TB_FORK_ALPHA:-1.0}               # 1.0 = pure uncertainty; <1 needs teacher
+tb_fork_alpha=${TB_FORK_ALPHA:-0.5}               # 0.5 = math's even U/D blend; 1.0 = pure uncertainty
 tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
 tb_fork_kl_window=${TB_FORK_KL_WINDOW:-128}
 tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (token path) | minmax (ATOD)

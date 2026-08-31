@@ -234,6 +234,10 @@ class TBOPDConfig(BaseConfig):
     only_fail (bool):
         If True, only branch when the main trajectory is judged incorrect by the
         rule-based reward; otherwise the extra slots are filled with plain rollouts.
+        Default False, matching the math token arm: a fork point is chosen by
+        uncertainty / disagreement, which is informative on a trajectory that
+        happened to land on the right answer too, and gating on the outcome makes
+        the branch distribution depend on the reward in a way the KD loss does not.
     fork_metric (str):
         How to score fork uncertainty at each response position: "entropy"
         (truncated top-k entropy) or "topk_gap" (top1-top2 logprob margin).
@@ -341,7 +345,10 @@ class TBOPDConfig(BaseConfig):
         (Rao-Blackwell -- proportional to the student's own probability of the token
         each slot took at the fork). Uniform averaging over *forced* top-k alternatives
         is off-policy: it lets a token the student would emit ~1% of the time carry the
-        same gradient mass as the one it actually chose.
+        same gradient mass as the one it actually chose. Default ``rb``, as on the
+        math token arms. Requires ``branch_mode="forced_topk"``; under ``resample``
+        the branches are already on-policy and ``rb`` is rejected rather than
+        silently ignored, so set ``branch_weight_mode=off`` for that ablation.
     branch_weight_temp (float):
         Temperature on the RB weights; ``1.0`` is exact, larger tends to uniform.
     branch_weight_floor (float):
@@ -372,10 +379,11 @@ class TBOPDConfig(BaseConfig):
         spans; without them those candidates are skipped. ``None`` derives
         ``post_tool``/``all`` from ``turn_only_post_tool``.
     fork_alpha (float):
-        Weight on ``U`` in ``fuse="blend"``: ``alpha*U + (1-alpha)*D``. ``1.0``
-        (default, as on the token path) is pure uncertainty -- where the student is
-        *unsure*. ``0.0`` is pure teacher disagreement -- where it is *wrong*
-        relative to the teacher, i.e. where the OPD signal lives. Below 1.0 the fork
+        Weight on ``U`` in ``fuse="blend"``: ``alpha*U + (1-alpha)*D``. ``1.0`` is
+        pure uncertainty -- where the student is *unsure*. ``0.0`` is pure teacher
+        disagreement -- where it is *wrong* relative to the teacher, i.e. where the
+        OPD signal lives. Default ``0.5``, the even blend the math token arms run.
+        Below 1.0 the fork
         depends on the teacher, so the main trajectory's teacher forward is issued
         before fork selection (needed for the loss regardless, so it costs nothing).
     fork_fuse (str):
@@ -404,7 +412,7 @@ class TBOPDConfig(BaseConfig):
 
     enable: bool = False
     k: int = 2
-    only_fail: bool = True
+    only_fail: bool = False
     fork_metric: str = "entropy"
     topk_logprobs: int = 20
     branch_min_tokens: int = 8
@@ -428,7 +436,7 @@ class TBOPDConfig(BaseConfig):
     turn_skip_first: int = 0
     max_branches_per_traj: int = 1
     dedup_shared_prefix: bool = True
-    branch_weight_mode: str = "off"
+    branch_weight_mode: str = "rb"
     branch_weight_temp: float = 1.0
     branch_weight_floor: float = 0.0
     consecutive_high_entropy_penalty: bool = False
@@ -437,7 +445,7 @@ class TBOPDConfig(BaseConfig):
     # Shared fork scoring axes (both fork units). ``None`` = take the fork_metric
     # preset, so existing arms keep their behavior unless an axis is set explicitly.
     fork_eligibility: Optional[str] = None
-    fork_alpha: float = 1.0
+    fork_alpha: float = 0.5
     fork_fuse: str = "blend"
     fork_kl_window: int = 128
     fork_normalize: str = "rank"

@@ -125,7 +125,10 @@ tb_opd:
   k: 2
 
   # Only branch when the main trajectory is judged incorrect; otherwise fill extra slots with plain rollouts.
-  only_fail: true
+  # False (the math token arms' setting): the fork point is chosen by uncertainty /
+  # disagreement, which is just as informative on a trajectory that happened to land on
+  # the right answer.
+  only_fail: false
 
   # Fork uncertainty metric: "entropy" (truncated top-k entropy) or "topk_gap" (top1-top2 margin).
   fork_metric: entropy
@@ -204,7 +207,8 @@ tb_opd:
   # Weighting of the k+1 continuations of a fork: "off" (uniform) or "rb"
   # (Rao-Blackwell: proportional to the student's own probability of the forced token).
   # Uniform averaging over forced top-k alternatives is off-policy.
-  branch_weight_mode: "off"
+  # Requires branch_mode=forced_topk; the resample ablation must set this back to "off".
+  branch_weight_mode: "rb"
 
   # Temperature on the RB weights; 1.0 = exact, larger -> uniform.
   branch_weight_temp: 1.0
@@ -231,7 +235,8 @@ tb_opd:
 
   # Weight on the uncertainty term: score = alpha*U + (1-alpha)*D for fuse=blend.
   # 1.0 is pure uncertainty (no teacher needed); <1 pulls the teacher forward.
-  fork_alpha: 1.0
+  # 0.5 = the even blend the math token arms run (the "klfork" arms).
+  fork_alpha: 0.5
 
   # How U and D combine: blend | max | union | soft_or (ATOD). Everything except
   # blend with alpha=1 requires a teacher signal.
