@@ -151,7 +151,9 @@ tb_opd:
   # Skip a candidate unless its decoded token, stripped of whitespace, is longer than this.
   fork_min_token_strip_len: 1
 
-  # Minimum fork uncertainty (entropy metric only); below this no fork is emitted. 0 disables.
+  # Floor on a fork candidate's RAW uncertainty, applied before normalization; below
+  # this no fork is emitted and the extra slots degrade to plain rollouts. 0 disables.
+  # Used by both fork units (turn unit: units follow the active estimator).
   fork_min_entropy: 0.0
 
   # Exclude the main-sampled token from the expanded candidate set.
@@ -184,23 +186,54 @@ tb_opd:
   # (ARPO's post-tool entropy spike window). <=0 uses the whole turn.
   turn_first_k: 16
 
-  # Only turns immediately following a tool response are eligible fork points.
-  turn_only_post_tool: true
+  # Only turns immediately following a tool response are eligible fork points (ARPO).
+  # Off by default: the token path imposes no positional prior.
+  turn_only_post_tool: false
 
-  # Number of leading assistant turns to exclude from forking.
-  turn_skip_first: 1
+  # Number of leading assistant turns to exclude from forking. 0 mirrors the token
+  # path, whose fork_skip_first=1 skips a single token rather than a whole turn.
+  turn_skip_first: 0
 
   # Budget B: max number of turns forked per trajectory (Phase 1' uses 1).
   max_branches_per_traj: 1
 
-  # Absolute floor on the normalized turn signal; below this no fork is emitted.
-  min_fork_signal: 0.0
+  # (Retired: the turn unit now gates raw uncertainty via the shared fork_min_entropy
+  # above. A floor on the *normalized* signal could never fire -- both rank and min-max
+  # map the best candidate to 1.0.)
 
   # AEPO-style penalty on consecutive high-signal turns to curb over-branching.
   consecutive_high_entropy_penalty: false
 
   # Penalty multiplier applied when the preceding turn is also high-signal.
   consecutive_penalty_weight: 0.5
+
+  # --- Shared fork scoring axes (apply to both fork units) ---
+
+  # Where a turn fork may land: post_tool | turn_open | reasoning | action | all.
+  # null derives it from turn_only_post_tool. reasoning/action need per-turn
+  # action spans from the agent loop (ALFWorld/tool_agent record them).
+  fork_eligibility: null
+
+  # Weight on the uncertainty term: score = alpha*U + (1-alpha)*D for fuse=blend.
+  # 1.0 is pure uncertainty (no teacher needed); <1 pulls the teacher forward.
+  fork_alpha: 1.0
+
+  # How U and D combine: blend | max | union | soft_or (ATOD). Everything except
+  # blend with alpha=1 requires a teacher signal.
+  fork_fuse: blend
+
+  # Forward window (tokens) for the signed teacher/student disagreement D.
+  fork_kl_window: 128
+
+  # Per-trajectory normalization before fusing: rank (token path) or minmax (ATOD).
+  fork_normalize: rank
+
+  # Signed D = logp_student - logp_teacher (isolates student over-confidence).
+  # false uses the unsigned |delta| of the original ATOD formulation.
+  disagreement_signed: true
+
+  # Minimum turn distance between two fork points when max_branches_per_traj > 1.
+  fork_min_turn_gap: 1
 
   # --- Turn-level loss reweighting (B-A1, reweight-only; no branch expansion) ---
 

@@ -97,6 +97,32 @@ def score_solution(tokenizer, response_ids: list[int], kwargs: dict, threshold: 
     return score, score >= threshold
 
 
+# Environment-provided success flags, checked before falling back to rule-based
+# scoring of the decoded text. An agentic task's outcome is decided by the env, not
+# by anything recoverable from the transcript.
+_ENV_OUTCOME_KEYS = ("alfworld_won", "env_success")
+
+
+def score_trajectory(tokenizer, output, kwargs: dict, threshold: float) -> tuple[float, bool]:
+    """Success of a rollout, preferring an environment-provided outcome.
+
+    ``score_solution`` answers "does the decoded text match the ground truth", which
+    is meaningless for an env task: ALFWorld rows carry no ``reward_model``, so it
+    would report every episode as a failure and ``only_fail`` would branch even on
+    episodes that already won. When the agent loop reports the env outcome, use it.
+    """
+    extra = getattr(output, "extra_fields", None) or {}
+    for key in _ENV_OUTCOME_KEYS:
+        if extra.get(key) is not None:
+            score = float(extra[key])
+            return score, score >= threshold
+    reward = getattr(output, "reward_score", None)
+    if reward is not None and normalize_ground_truth(kwargs.get("reward_model")) is None:
+        score = float(reward)
+        return score, score >= threshold
+    return score_solution(tokenizer, list(output.response_ids), kwargs, threshold)
+
+
 # Single-character math tokens are genuine arithmetic fork points and must never
 # be dropped by a length filter. Digits, operators, comparators, brackets, and the
 # decimal point all qualify.
@@ -328,12 +354,45 @@ async def select_fork(
 
 
 # ---------------------------------------------------------------------------
-# Turn-level branching (TB-OPD-Turn). Fork at the start of a high-uncertainty
-# assistant turn in a multi-turn tool-use trajectory. Signals borrow from ARPO
-# (ΔH_post-tool: entropy spike after a tool response) and ATOD (T-DUR: Soft-OR of
-# teacher-student disagreement and student uncertainty, using the NLL proxy
-# mean(-logp) as the per-turn entropy估计). See docs/proposals/agentic_tb_opd_research.md.
+# Turn-level branching (TB-OPD-Turn).
+#
+# Token- and turn-level forks are scored by the same functional
+#
+#     score(c) = Fuse( norm(U(c)), norm(D(c)) )    over candidates c in Eligibility
+#
+# and differ only in which candidates exist and over which span U and D are
+# averaged. ``U`` is student uncertainty: truncated top-k entropy when the rollout
+# carried per-position top-k, else the mean-NLL proxy mean(-log p) of the sampled
+# tokens; optionally minus a per-trajectory baseline (ARPO's ΔH_post-tool, whose
+# baseline is the *first* assistant turn, not the preceding one). ``D`` is
+# teacher-student disagreement, by default the same signed forward-window
+# log-ratio the token path uses.
+#
+# Provenance: ARPO (entropy rises right after a tool response, so that is the
+# natural decision point), ATOD (Soft-OR of disagreement and uncertainty beats
+# entropy alone), AEPO (penalize branching on consecutive high-signal turns).
+# See docs/proposals/agentic_tb_opd_research.md.
 # ---------------------------------------------------------------------------
+
+# Where a turn fork may land. ``post_tool``/``turn_open`` fork at a turn's first
+# token (ARPO); ``reasoning`` and ``action`` need per-turn action spans and fork
+# inside the turn, which is what separates "branch the thinking" from "branch the
+# tool call / env action". ``all`` imposes no positional prior, which is what the
+# token path does.
+TURN_ELIGIBILITY = ("post_tool", "turn_open", "reasoning", "action", "all")
+
+# Uncertainty statistic for a turn candidate. Parallel to the token path's
+# ``entropy | topk_gap``: the metric names *only* how U is measured. How U and the
+# teacher-disagreement D combine is the independent ``fork_alpha`` / ``fork_fuse``
+# pair, exactly as on the token path -- collapsing all of that into one enum is what
+# made ``hybrid`` silently mean three things at once.
+# ``entropy`` is the token path's spelling of the same statistic and is accepted as
+# an alias, so one ``fork_metric`` value is valid for both fork units.
+TURN_METRICS = ("ent", "entropy", "dHtool")
+
+# Fusions shared with the token path, plus ATOD's Soft-OR. All except ``blend`` with
+# ``alpha == 1`` need a teacher signal.
+TURN_FUSES = ("blend", "max", "union", "soft_or")
 
 
 def segment_assistant_turns(response_mask: list[int]) -> list[tuple[int, int, bool]]:
@@ -363,7 +422,12 @@ def segment_assistant_turns(response_mask: list[int]) -> list[tuple[int, int, bo
 
 
 def _turn_nll_proxy(logprobs: list[float], start: int, end: int, first_k: int) -> float:
-    """Mean(-logp) over the first ``first_k`` tokens of ``[start, end)`` (ATOD h_k)."""
+    """Mean(-logp) over the first ``first_k`` tokens of ``[start, end)`` (ATOD h_k).
+
+    A one-sample estimate of the cross-entropy at each position: cheap, but biased
+    and noisy next to the true decoding entropy. Used only when the rollout did not
+    carry per-position top-k (see ``_span_entropy``).
+    """
     hi = end if first_k <= 0 else min(end, start + first_k)
     vals = [logprobs[i] for i in range(start, hi) if i < len(logprobs)]
     if not vals:
@@ -371,15 +435,84 @@ def _turn_nll_proxy(logprobs: list[float], start: int, end: int, first_k: int) -
     return sum(-lp for lp in vals) / len(vals)
 
 
+def _span_entropy(topk_logprobs: list, start: int, end: int, first_k: int) -> float:
+    """Mean truncated top-k entropy over the first ``first_k`` tokens of ``[start, end)``.
+
+    Same estimator the token path uses (``_truncated_entropy``), so turn and token
+    forks are ranked by the same quantity rather than by two different proxies.
+    """
+    hi = end if first_k <= 0 else min(end, start + first_k)
+    vals = []
+    for i in range(start, hi):
+        if i >= len(topk_logprobs):
+            break
+        row = topk_logprobs[i]
+        if not row:
+            continue
+        row = [x for x in row if x is not None]
+        if len(row) >= 2:
+            vals.append(_truncated_entropy(row))
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
+def disagreement_window(
+    student_logprobs: list[float],
+    teacher_logprobs: list[float],
+    window: int,
+) -> list[float]:
+    """Forward-looking teacher/student disagreement per response position.
+
+    ``D(t) = log pi_theta(a_t) - log pi_T(a_t)`` is the per-token surprise the OPD
+    loss already uses as the (negated) reward. A good fork point is one where the
+    *upcoming* span is where the student and teacher part ways, so each position is
+    scored by the mean ``D`` over the next ``window`` tokens rather than by ``D(t)``
+    alone -- a single token's disagreement is far too noisy to rank on.
+
+    Positive values mean the student is over-confident relative to the teacher,
+    which is exactly the region worth spending branches on. Ported verbatim from
+    the token path so both granularities share one definition.
+    """
+    n = min(len(student_logprobs), len(teacher_logprobs))
+    if n == 0:
+        return []
+    d = [student_logprobs[i] - teacher_logprobs[i] for i in range(n)]
+    # Suffix sums so each window mean is O(1).
+    suffix = [0.0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + d[i]
+    w = max(1, int(window))
+    out = [0.0] * n
+    for i in range(n):
+        j = min(n, i + w)
+        out[i] = (suffix[i] - suffix[j]) / (j - i)
+    return out
+
+
 def _turn_disagreement(
     student_lp: list[float], teacher_lp: list[float], start: int, end: int, first_k: int
 ) -> float:
-    """Mean |teacher_logp - student_logp| over the first ``first_k`` turn tokens (ATOD d_k)."""
+    """Mean |teacher_logp - student_logp| over the first ``first_k`` turn tokens (ATOD d_k).
+
+    Unsigned variant; kept for the ``disagreement_signed=False`` ablation. The
+    signed form is preferred because ``student - teacher > 0`` isolates the
+    "student is over-confident here" direction, whereas the absolute value merges
+    it with "student is needlessly timid".
+    """
     hi = end if first_k <= 0 else min(end, start + first_k)
     vals = []
     for i in range(start, hi):
         if i < len(student_lp) and i < len(teacher_lp):
             vals.append(abs(teacher_lp[i] - student_lp[i]))
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
+def _span_mean(values: list[float], start: int, end: int, first_k: int) -> float:
+    hi = end if first_k <= 0 else min(end, start + first_k)
+    vals = [values[i] for i in range(start, hi) if i < len(values)]
     if not vals:
         return 0.0
     return sum(vals) / len(vals)
@@ -394,85 +527,276 @@ def _minmax(xs: list[float]) -> list[float]:
     return [(x - lo) / (hi - lo) for x in xs]
 
 
+def _normalized_ranks(values: list[float]) -> list[float]:
+    """Map values to their rank in ``[0, 1]`` (1.0 == largest). Ties broken by index."""
+    n = len(values)
+    if n <= 1:
+        return [1.0] * n
+    order = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    for r, i in enumerate(order):
+        ranks[i] = r / (n - 1)
+    return ranks
+
+
+def fuse_signals(
+    uncertainty: list[float],
+    disagreement: Optional[list[float]],
+    *,
+    alpha: float,
+    fuse: str,
+    normalize: str = "rank",
+) -> list[float]:
+    """Combine uncertainty and disagreement into one ranking score.
+
+    ``normalize`` picks the per-trajectory scale: ``rank`` (the token path's choice)
+    is robust to the two signals living on different scales; ``minmax`` keeps ATOD's
+    Soft-OR interpretable as a probability-like value.
+
+    ``fuse``:
+      - ``blend``   : ``alpha * u + (1 - alpha) * d`` -- a candidate must do well on
+                      both (alpha=1 -> uncertainty only, no teacher needed)
+      - ``max``     : ``max(u, d)`` -- either extreme survives
+      - ``union``   : scored like ``max``; the *pool* restriction happens in the
+                      caller, which keeps the top half by each signal separately
+      - ``soft_or`` : ``1 - (1 - u)(1 - d)`` (ATOD T-DUR)
+    """
+    norm = _normalized_ranks if normalize == "rank" else _minmax
+    u = norm(uncertainty)
+    if disagreement is None:
+        return u
+    d = norm(disagreement)
+    if fuse == "soft_or":
+        return [1.0 - (1.0 - ui) * (1.0 - di) for ui, di in zip(u, d)]
+    if fuse in ("max", "union"):
+        return [max(ui, di) for ui, di in zip(u, d)]
+    a = float(alpha)
+    return [a * ui + (1.0 - a) * di for ui, di in zip(u, d)]
+
+
+def turn_fork_candidates(
+    turns: list[tuple[int, int, bool]],
+    *,
+    eligibility: str,
+    skip_first_turns: int,
+    turn_first_k: int,
+    action_spans: Optional[list] = None,
+    reasoning_stride: int = 8,
+) -> list[dict]:
+    """Enumerate fork candidates over a segmented multi-turn trajectory.
+
+    A candidate is a ``pos`` (where the branch re-enters) plus the ``[span_start,
+    span_end)`` window that ``U`` and ``D`` are averaged over. Keeping the two
+    separate is what lets one scorer serve both "fork at the turn opening" (ARPO)
+    and "fork inside the tool call".
+
+    ``action_spans[i]`` is the ``(start, end)`` response-coordinate range of turn
+    ``i``'s action / tool-call tokens, or ``None`` when unknown. Candidates that
+    need it are simply not emitted when it is missing.
+    """
+    cands: list[dict] = []
+    for ti, (start, end, post_tool) in enumerate(turns):
+        if ti < skip_first_turns:
+            continue
+        span = None
+        if action_spans is not None and ti < len(action_spans) and action_spans[ti]:
+            a_start, a_end = int(action_spans[ti][0]), int(action_spans[ti][1])
+            if start <= a_start < a_end <= end:
+                span = (a_start, a_end)
+
+        want_open = eligibility in ("post_tool", "turn_open", "all")
+        if want_open and not (eligibility == "post_tool" and not post_tool):
+            cands.append(
+                {
+                    "pos": start,
+                    "span_start": start,
+                    "span_end": end,
+                    "turn_index": ti,
+                    "post_tool": post_tool,
+                    "kind": "turn_open",
+                }
+            )
+
+        if eligibility in ("action", "all") and span is not None:
+            cands.append(
+                {
+                    "pos": span[0],
+                    "span_start": span[0],
+                    "span_end": span[1],
+                    "turn_index": ti,
+                    "post_tool": post_tool,
+                    "kind": "action",
+                }
+            )
+
+        if eligibility in ("reasoning", "all"):
+            # Reasoning = the turn before its action span (the whole turn when the
+            # action span is unknown but the turn is not itself pure action).
+            r_end = span[0] if span is not None else end
+            stride = max(1, int(reasoning_stride))
+            for p in range(start, r_end, stride):
+                if p == start and want_open:
+                    continue  # already emitted as turn_open
+                cands.append(
+                    {
+                        "pos": p,
+                        "span_start": p,
+                        "span_end": min(r_end, p + max(1, turn_first_k)),
+                        "turn_index": ti,
+                        "post_tool": post_tool,
+                        "kind": "reasoning",
+                    }
+                )
+    return cands
+
+
 def select_fork_turn(
     response_mask: list[int],
     response_logprobs: list[float],
     *,
-    metric: str = "hybrid",
+    metric: str = "entropy",
     teacher_logprobs: Optional[list[float]] = None,
     turn_first_k: int = 16,
-    only_post_tool: bool = True,
-    skip_first_turns: int = 1,
-    min_fork_signal: float = 0.0,
+    only_post_tool: bool = False,
+    skip_first_turns: int = 0,
+    min_uncertainty: float = 0.0,
     consecutive_penalty: bool = False,
     consecutive_penalty_weight: float = 0.5,
+    eligibility: Optional[str] = None,
+    action_spans: Optional[list] = None,
+    topk_logprobs: Optional[list] = None,
+    fork_alpha: float = 1.0,
+    fork_fuse: str = "blend",
+    fork_kl_window: int = 128,
+    disagreement_signed: bool = True,
+    normalize: str = "rank",
+    max_forks: int = 1,
+    min_turn_gap: int = 1,
 ) -> dict:
-    """Pick the highest-uncertainty assistant turn to fork.
+    """Pick fork point(s) in a multi-turn trajectory.
 
     Operates purely on the main trajectory's per-token student ``response_logprobs``
-    (and optionally aligned ``teacher_logprobs``); no extra generation. Returns a
-    dict with ``pos`` = the response-coordinate index of the chosen turn's first
-    token (the breakpoint from which E4 re-enters the tool loop), plus diagnostics.
-    On failure ``pos`` is ``None`` with a ``none_reason``.
+    (plus optional aligned ``teacher_logprobs`` and per-position ``topk_logprobs``);
+    no extra generation. Returns a dict with ``pos`` = the response-coordinate index
+    the branch re-enters at, ``forks`` = all selected fork dicts (length
+    ``<= max_forks``), plus diagnostics. On failure ``pos`` is ``None`` with a
+    ``none_reason``.
 
-    metric:
-      - ``ent``     : student NLL proxy mean(-logp) over the turn (ARPO uncertainty).
-      - ``dHtool``  : ΔH_post-tool = turn entropy − first-turn (pre-tool) entropy.
-      - ``disagree``: teacher-student |Δlogp| over the turn (needs teacher_logprobs).
-      - ``hybrid``  : Soft-OR(norm(dHtool), norm(disagree)) (ATOD T-DUR; recommended).
-                      Falls back to norm(dHtool) when teacher_logprobs is None.
+    The knobs mirror the token path one-for-one. ``metric`` names only how ``U`` is
+    measured:
+      - ``ent`` / ``entropy``: the turn's uncertainty (same statistic, and the same
+        spelling the token path uses).
+      - ``dHtool``: ARPO ΔH_post-tool, i.e. ``ent`` minus the first turn's value.
+    How ``U`` and the teacher term ``D`` combine is ``fork_alpha`` / ``fork_fuse``,
+    and the teacher is consulted exactly when the token path would consult it:
+    ``fork_fuse in ("max", "union", "soft_or") or fork_alpha < 1.0``.
+
+    ``eligibility`` (default derived from ``only_post_tool``) decides *where* a
+    fork may land -- ``post_tool``/``turn_open`` at a turn's first token,
+    ``reasoning`` inside the thinking span, ``action`` inside the tool-call / env
+    action span, ``all`` for no positional prior. ``action``/``reasoning`` need
+    ``action_spans``.
+
+    ``min_uncertainty`` (the token path's ``fork_min_entropy``) drops candidates
+    whose *raw* ``U`` is below it, so a trajectory the student was confident all the
+    way through emits no fork and its extra slots degrade to plain rollouts. Note
+    the threshold is in the units of whichever estimator ran: truncated entropy when
+    ``topk_logprobs`` is supplied, otherwise the mean-NLL proxy, which is on a
+    different scale. ``uncertainty_estimator`` in the result says which.
     """
     if not response_mask or not response_logprobs:
         return {"pos": None, "none_reason": "empty_response"}
+
+    if metric not in TURN_METRICS:
+        return {"pos": None, "none_reason": f"unknown_metric:{metric}"}
+    if fork_fuse not in TURN_FUSES:
+        return {"pos": None, "none_reason": f"unknown_fuse:{fork_fuse}"}
+    use_baseline = "first_turn" if metric == "dHtool" else "none"
+    fuse = str(fork_fuse)
+    alpha = float(fork_alpha)
+    want_teacher = fuse in ("max", "union", "soft_or") or alpha < 1.0
+    use_teacher = want_teacher and teacher_logprobs is not None
+
+    if eligibility is None:
+        eligibility = "post_tool" if only_post_tool else "all"
+    if eligibility not in TURN_ELIGIBILITY:
+        return {"pos": None, "none_reason": f"unknown_eligibility:{eligibility}"}
 
     turns = segment_assistant_turns(response_mask)
     if not turns:
         return {"pos": None, "none_reason": "no_assistant_turns"}
 
-    # Baseline (initial) entropy = first assistant turn's NLL proxy (ARPO H_init).
-    base_ent = _turn_nll_proxy(response_logprobs, turns[0][0], turns[0][1], turn_first_k)
-
-    # Eligible turns: skip the first ``skip_first_turns`` and (optionally) require
-    # the turn to follow a tool response.
-    eligible: list[int] = []
-    for ti, (start, end, post_tool) in enumerate(turns):
-        if ti < skip_first_turns:
-            continue
-        if only_post_tool and not post_tool:
-            continue
-        eligible.append(ti)
-    if not eligible:
+    cands = turn_fork_candidates(
+        turns,
+        eligibility=eligibility,
+        skip_first_turns=skip_first_turns,
+        turn_first_k=turn_first_k,
+        action_spans=action_spans,
+    )
+    if not cands:
         return {"pos": None, "none_reason": "no_eligible_turns", "num_turns": len(turns)}
 
-    ent_raw, dh_raw, dis_raw = [], [], []
-    for ti in eligible:
-        start, end, _ = turns[ti]
-        e = _turn_nll_proxy(response_logprobs, start, end, turn_first_k)
-        ent_raw.append(e)
-        dh_raw.append(max(0.0, e - base_ent))
-        if teacher_logprobs is not None:
-            dis_raw.append(_turn_disagreement(response_logprobs, teacher_logprobs, start, end, turn_first_k))
-        else:
-            dis_raw.append(0.0)
+    # Uncertainty: truncated top-k entropy when the rollout carried top-k, else the
+    # one-sample NLL proxy. Reported so runs are not silently comparing estimators.
+    have_topk = bool(topk_logprobs)
 
-    if metric == "ent":
-        signals = _minmax(ent_raw)
-    elif metric == "dHtool":
-        signals = _minmax(dh_raw)
-    elif metric == "disagree":
-        if teacher_logprobs is None:
-            return {"pos": None, "none_reason": "disagree_requires_teacher", "num_turns": len(turns)}
-        signals = _minmax(dis_raw)
-    else:  # hybrid = Soft-OR(norm(dHtool), norm(disagree))
-        a = _minmax(dh_raw)
-        if teacher_logprobs is not None:
-            b = _minmax(dis_raw)
-            signals = [1.0 - (1.0 - ai) * (1.0 - bi) for ai, bi in zip(a, b)]
-        else:
-            signals = a  # graceful degrade to ΔH_post-tool
+    def _u(start: int, end: int) -> float:
+        if have_topk:
+            return _span_entropy(topk_logprobs, start, end, turn_first_k)
+        return _turn_nll_proxy(response_logprobs, start, end, turn_first_k)
 
-    # AEPO-style consecutive high-signal penalty: if a turn's predecessor (in the
-    # eligible list) is also above-median, down-weight to curb over-branching.
+    base = 0.0
+    if use_baseline == "first_turn":
+        base = _u(turns[0][0], turns[0][1])
+
+    signed_d = (
+        disagreement_window(response_logprobs, teacher_logprobs, fork_kl_window)
+        if (use_teacher and disagreement_signed)
+        else None
+    )
+
+    # Raw-uncertainty gate, applied BEFORE normalization -- the token path's
+    # fork_min_entropy. It has to happen here: rank and minmax both map the best
+    # candidate to 1.0 by construction, so a gate on the *normalized* score can
+    # never fire no matter how certain the student was.
+    for c in cands:
+        c["uncertainty"] = float(_u(c["span_start"], c["span_end"]))
+    if min_uncertainty > 0.0:
+        gated = [c for c in cands if c["uncertainty"] >= min_uncertainty]
+        if not gated:
+            return {
+                "pos": None,
+                "none_reason": "below_min_entropy",
+                "num_turns": len(turns),
+                "num_eligible": len(cands),
+                "max_uncertainty": float(max(c["uncertainty"] for c in cands)),
+                "uncertainty_estimator": "entropy" if have_topk else "nll",
+            }
+        cands = gated
+
+    u_raw, d_raw = [], []
+    for c in cands:
+        s, e = c["span_start"], c["span_end"]
+        val = c["uncertainty"]
+        u_raw.append(max(0.0, val - base) if use_baseline == "first_turn" else val)
+        if not use_teacher:
+            d_raw.append(0.0)
+        elif signed_d is not None:
+            d_raw.append(_span_mean(signed_d, s, e, turn_first_k))
+        else:
+            d_raw.append(_turn_disagreement(response_logprobs, teacher_logprobs, s, e, turn_first_k))
+        c["disagreement"] = float(d_raw[-1])
+
+    signals = fuse_signals(
+        u_raw,
+        d_raw if use_teacher else None,
+        alpha=alpha,
+        fuse=fuse,
+        normalize=normalize,
+    )
+
+    # AEPO-style consecutive high-signal penalty: if the preceding candidate is also
+    # above-median, down-weight to curb over-branching along one chain.
     if consecutive_penalty and len(signals) > 1:
         med = sorted(signals)[len(signals) // 2]
         penalized = list(signals)
@@ -481,26 +805,47 @@ def select_fork_turn(
                 penalized[i] = signals[i] * float(consecutive_penalty_weight)
         signals = penalized
 
-    best_local = max(range(len(signals)), key=lambda i: signals[i])
-    best_signal = signals[best_local]
-    if best_signal < min_fork_signal:
-        return {
-            "pos": None,
-            "none_reason": "below_min_fork_signal",
-            "signal": float(best_signal),
-            "num_turns": len(turns),
-        }
+    for c, s in zip(cands, signals):
+        c["signal"] = float(s)
 
-    best_ti = eligible[best_local]
-    start, end, post_tool = turns[best_ti]
+    order = sorted(range(len(cands)), key=lambda i: signals[i], reverse=True)
+    if fuse == "union" and use_teacher and len(cands) > 1:
+        # Keep the top half by each signal separately, then rank that union. Blending
+        # lets a candidate that is merely decent on both outrank one that is extreme
+        # on a single signal; union is the mode where *both* kinds of fork survive.
+        half = max(1, (len(cands) + 1) // 2)
+        pool = set(sorted(range(len(cands)), key=lambda i: u_raw[i], reverse=True)[:half])
+        pool |= set(sorted(range(len(cands)), key=lambda i: d_raw[i], reverse=True)[:half])
+        order = [i for i in order if i in pool]
+
+    # Greedy pick under a turn-gap constraint so B>1 does not stack every fork on
+    # one turn (the over-branching AEPO warns about).
+    picked: list[dict] = []
+    for i in order:
+        c = cands[i]
+        if any(abs(c["turn_index"] - p["turn_index"]) < max(0, min_turn_gap) for p in picked):
+            continue
+        picked.append(c)
+        if len(picked) >= max(1, int(max_forks)):
+            break
+
+    best = picked[0]
+    turn_end = turns[best["turn_index"]][1]
     return {
-        "pos": int(start),
-        "turn_index": int(best_ti),
-        "turn_end": int(end),
-        "post_tool": bool(post_tool),
-        "signal": float(best_signal),
+        "pos": int(best["pos"]),
+        "turn_index": int(best["turn_index"]),
+        "turn_end": int(turn_end),
+        "post_tool": bool(best["post_tool"]),
+        "kind": best["kind"],
+        "signal": float(best["signal"]),
+        "uncertainty": float(best["uncertainty"]),
+        "disagreement": float(best["disagreement"]),
+        "forks": picked,
         "num_turns": len(turns),
-        "num_eligible": len(eligible),
+        "num_eligible": len(cands),
+        "eligibility": eligibility,
+        "used_teacher": bool(use_teacher),
+        "uncertainty_estimator": "entropy" if have_topk else "nll",
     }
 
 

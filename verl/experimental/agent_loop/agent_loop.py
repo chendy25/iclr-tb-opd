@@ -1033,26 +1033,42 @@ class AgentLoopWorker:
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
         topk_logprobs = int(cfg.get("topk_logprobs", 20))
         turn_first_k = int(cfg.get("turn_first_k", 16))
-        only_post_tool = bool(cfg.get("turn_only_post_tool", True))
-        turn_skip_first = int(cfg.get("turn_skip_first", 1))
-        min_fork_signal = float(cfg.get("min_fork_signal", 0.0))
+        only_post_tool = bool(cfg.get("turn_only_post_tool", False))
+        turn_skip_first = int(cfg.get("turn_skip_first", 0))
+        min_uncertainty = float(cfg.get("fork_min_entropy", 0.0))
         consec_penalty = bool(cfg.get("consecutive_high_entropy_penalty", False))
         consec_weight = float(cfg.get("consecutive_penalty_weight", 0.5))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
+        eligibility = cfg.get("fork_eligibility", None)
+        eligibility = None if eligibility is None else str(eligibility)
+        fork_alpha = float(cfg.get("fork_alpha", 1.0))
+        fork_fuse = str(cfg.get("fork_fuse", "blend"))
+        fork_kl_window = int(cfg.get("fork_kl_window", 128))
+        fork_normalize = str(cfg.get("fork_normalize", "rank"))
+        disagreement_signed = bool(cfg.get("disagreement_signed", True))
+        max_branches = int(cfg.get("max_branches_per_traj", 1))
+        min_turn_gap = int(cfg.get("fork_min_turn_gap", 1))
 
         n_slots = len(rows)
         _, _, main_kwargs = rows[0]
         agent_loop = self._make_agent_loop(agent_name)
 
-        # Slot 0: main multi-turn trajectory. Request per-token logprobs so the turn
-        # uncertainty signal (ARPO/ATOD NLL proxy) can be read from this pass alone.
+        # Slot 0: main multi-turn trajectory. Ask for per-position top-k (an integer,
+        # not a bool) so the turn uncertainty is the same truncated entropy the token
+        # path uses rather than the mean-NLL proxy -- the proxy is a different
+        # statistic on a different scale, which the fork_min_entropy gate is sensitive
+        # to. Loops that ignore it degrade to the proxy; the estimator that actually
+        # ran is reported as tb_opd_fork_estimator.
         main_sp = dict(sampling_params)
-        main_sp["logprobs"] = True
+        main_sp["logprobs"] = topk_logprobs
         main_out: AgentLoopOutput = await agent_loop.run(main_sp, **main_kwargs)
 
-        score, is_correct = tb_opd.score_solution(
-            self.tokenizer, list(main_out.response_ids), main_kwargs, correct_threshold
-        )
+        # Consume (and strip) the rollout top-k so the per-token distribution is never
+        # stored or dumped downstream. Mirrors the token path's Scheme B.
+        main_topk = main_out.extra_fields.pop("output_logprobs", None)
+        main_out.extra_fields.pop("output_ids", None)
+
+        score, is_correct = tb_opd.score_trajectory(self.tokenizer, main_out, main_kwargs, correct_threshold)
         do_branch = (not only_fail) or (not is_correct)
 
         response_logprobs = list(main_out.response_logprobs) if main_out.response_logprobs else []
@@ -1061,37 +1077,73 @@ class AgentLoopWorker:
             if not response_logprobs:
                 fork = {"pos": None, "none_reason": "no_response_logprobs"}
             else:
+                # Entropy alone says where the student is *unsure*, which is not where
+                # it is *wrong*. Pull the teacher forward for the metrics that use the
+                # disagreement term; _compute_teacher_logprobs is idempotent, so this
+                # only reorders work that post-processing would do anyway.
+                teacher_lp = None
+                need_teacher = fork_fuse in ("max", "union", "soft_or") or fork_alpha < 1.0
+                if need_teacher:
+                    await self._compute_teacher_logprobs(
+                        main_out,
+                        prompt_ids=main_out.prompt_ids,
+                        response_ids=main_out.response_ids,
+                        validate=False,
+                        sample_kwargs=main_kwargs,
+                    )
+                    teacher_lp = self._tb_teacher_token_logprobs(main_out, len(main_out.prompt_ids))
+
                 fork = tb_opd.select_fork_turn(
                     list(main_out.response_mask),
                     response_logprobs,
                     metric=fork_metric,
-                    teacher_logprobs=None,  # Phase 1': student-side signal (hybrid->ΔH_post-tool)
+                    teacher_logprobs=teacher_lp,
                     turn_first_k=turn_first_k,
                     only_post_tool=only_post_tool,
                     skip_first_turns=turn_skip_first,
-                    min_fork_signal=min_fork_signal,
+                    min_uncertainty=min_uncertainty,
                     consecutive_penalty=consec_penalty,
                     consecutive_penalty_weight=consec_weight,
+                    eligibility=eligibility,
+                    action_spans=main_out.extra_fields.get("action_spans"),
+                    topk_logprobs=main_topk,
+                    fork_alpha=fork_alpha,
+                    fork_fuse=fork_fuse,
+                    fork_kl_window=fork_kl_window,
+                    disagreement_signed=disagreement_signed,
+                    normalize=fork_normalize,
+                    max_forks=max_branches,
+                    min_turn_gap=min_turn_gap,
                 )
 
         has_fork = fork.get("pos") is not None
         mode = "branch" if has_fork else "plain"
 
-        # forced_topk: fetch alternative first tokens for the forked turn once.
-        cand_tokens: list[int] = []
+        # Budget B: the selector returns up to ``max_branches_per_traj`` fork points,
+        # and the k-1 branch slots are dealt round-robin across them, so B>1 spends
+        # the same slot budget on several turns instead of stacking on one.
+        fork_points: list[dict] = fork.get("forks") or ([fork] if has_fork else [])
+        fork_points = fork_points[: max(1, max_branches)] if fork_points else []
+
+        # forced_topk: fetch alternative first tokens for each forked position once.
+        cand_tokens_per_fork: list[list[int]] = []
         if has_fork and branch_mode == "forced_topk":
-            pos = int(fork["pos"])
-            main_tok = int(main_out.response_ids[pos]) if pos < len(main_out.response_ids) else None
-            cand_tokens = await tb_opd.topk_candidates_at(
-                self.llm_client,
-                list(main_out.prompt_ids),
-                list(main_out.response_ids[:pos]),
-                topk=topk_logprobs,
-                dedup_token=main_tok,
-            )
-            if not cand_tokens:
-                # No usable alternative -> degrade to resample for the branches.
+            for fp in fork_points:
+                pos = int(fp["pos"])
+                main_tok = int(main_out.response_ids[pos]) if pos < len(main_out.response_ids) else None
+                cand_tokens_per_fork.append(
+                    await tb_opd.topk_candidates_at(
+                        self.llm_client,
+                        list(main_out.prompt_ids),
+                        list(main_out.response_ids[:pos]),
+                        topk=topk_logprobs,
+                        dedup_token=main_tok,
+                    )
+                )
+            if not any(cand_tokens_per_fork):
+                # No usable alternative anywhere -> degrade to resample for the branches.
                 branch_mode = "resample"
+                cand_tokens_per_fork = []
 
         # Diagnostics on the main slot.
         main_out.extra_fields["tb_opd_slot"] = 0
@@ -1109,17 +1161,27 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_fork_turn"] = float(fork.get("turn_index", -1))
             main_out.extra_fields["tb_opd_fork_signal"] = float(fork.get("signal", 0.0))
             main_out.extra_fields["tb_opd_num_turns"] = float(fork.get("num_turns", 0))
+            main_out.extra_fields["tb_opd_fork_kind"] = str(fork.get("kind", "turn_open"))
+            main_out.extra_fields["tb_opd_fork_eligibility"] = str(fork.get("eligibility", ""))
+            main_out.extra_fields["tb_opd_fork_used_teacher"] = float(fork.get("used_teacher", False))
+            main_out.extra_fields["tb_opd_fork_estimator"] = str(fork.get("uncertainty_estimator", ""))
+            main_out.extra_fields["tb_opd_num_fork_points"] = float(len(fork_points))
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
         for slot in range(1, n_slots):
             if mode == "branch":
+                fi = (slot - 1) % len(fork_points)
+                fp = fork_points[fi]
                 forced_token = None
-                if branch_mode == "forced_topk" and cand_tokens:
-                    forced_token = int(cand_tokens[(slot - 1) % len(cand_tokens)])
+                if branch_mode == "forced_topk" and cand_tokens_per_fork:
+                    cands = cand_tokens_per_fork[fi]
+                    if cands:
+                        # Slots sharing a fork point must force *different* tokens.
+                        forced_token = int(cands[((slot - 1) // len(fork_points)) % len(cands)])
                 branch_out = await self._tb_generate_branch_turn(
                     agent_loop,
                     main_out,
-                    int(fork["pos"]),
+                    int(fp["pos"]),
                     forced_token,
                     dict(sampling_params),
                     main_kwargs,
@@ -1130,6 +1192,9 @@ class AgentLoopWorker:
                 branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
                 branch_out.extra_fields["tb_opd_mode_branch"] = 1.0
                 branch_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+                branch_out.extra_fields["tb_opd_fork_pos"] = float(fp["pos"])
+                branch_out.extra_fields["tb_opd_fork_turn"] = float(fp.get("turn_index", -1))
+                branch_out.extra_fields["tb_opd_fork_kind"] = str(fp.get("kind", "turn_open"))
                 raw_outputs.append(branch_out)
             else:
                 _, _, slot_kwargs = rows[slot]
@@ -1143,6 +1208,35 @@ class AgentLoopWorker:
         for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
             results.append(await self._agent_loop_postprocess(raw, traj["validate"], **kwargs))
         return results
+
+    @staticmethod
+    def _tb_teacher_token_logprobs(output: AgentLoopOutput, prompt_len: int) -> Optional[list[float]]:
+        """Teacher logprob of each token the student actually emitted, per response position.
+
+        Reads the raw (unpadded) ``(S, K)`` teacher tensors left on ``extra_fields`` by
+        ``_compute_teacher_logprobs``; sequence index ``prompt_len + p`` holds the
+        distribution that produced response token ``p``. With the ``k1`` loss ``K == 1``
+        and the single column is the sampled token; the id lookup keeps this correct for
+        top-k teacher modes too.
+        """
+        teacher_ids = output.extra_fields.get("teacher_ids")
+        teacher_logprobs = output.extra_fields.get("teacher_logprobs")
+        if teacher_ids is None or teacher_logprobs is None:
+            return None
+        total = int(teacher_logprobs.shape[0])
+        out: list[float] = []
+        for p, tok in enumerate(output.response_ids):
+            idx = prompt_len + p
+            if idx >= total:
+                break
+            row_ids, row_lp = teacher_ids[idx], teacher_logprobs[idx]
+            if int(row_ids[0]) == int(tok):
+                out.append(float(row_lp[0]))
+                continue
+            hit = (row_ids == int(tok)).nonzero()
+            # Token outside the teacher's top-k: bound it by the least likely one kept.
+            out.append(float(row_lp[int(hit[0][0])]) if hit.numel() else float(row_lp.min()))
+        return out
 
     async def _tb_generate_branch_turn(
         self,
@@ -1181,6 +1275,10 @@ class AgentLoopWorker:
             prefix_response_mask=prefix_mask,
             prefix_response_logprobs=prefix_lp,
             forced_first_token=forced_token,
+            # Non-resumable environments (ALFWorld) rebuild their state by replaying
+            # the main trajectory's recorded actions; loops that can resume directly
+            # ignore this.
+            prefix_extra_fields=main_out.extra_fields,
             **row_kwargs,
         )
         return branch_out
@@ -1616,7 +1714,14 @@ class AgentLoopWorker:
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Compute teacher logprobs for single sample."""
+        """Compute teacher logprobs for single sample.
+
+        Idempotent: TB-OPD fork ranking needs the main trajectory's teacher logprobs
+        *before* branching, so it calls this early; the guard keeps post-processing
+        from issuing a second (identical) teacher forward.
+        """
+        if "teacher_logprobs" in output.extra_fields and "teacher_ids" in output.extra_fields:
+            return
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:

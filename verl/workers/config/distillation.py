@@ -260,6 +260,14 @@ class TBOPDConfig(BaseConfig):
         whitespace, is strictly longer than this (CURE uses >1). Filters
         punctuation / single-char / whitespace high-entropy noise.
     fork_min_entropy (float):
+        Shared by both fork units: a floor on the *raw* uncertainty of a fork
+        candidate, applied before any normalization. Gating a normalized score is
+        impossible -- rank and min-max both send the best candidate to 1.0 -- so this
+        is the only knob that can actually suppress forking on a trajectory the
+        student was confident throughout. For ``fork_unit="turn"`` the threshold is
+        in the units of whichever estimator ran (truncated entropy, or the mean-NLL
+        proxy when the rollout carried no top-k); ``tb_opd_fork_estimator`` reports
+        which one. Original (token-path) meaning follows:
         Minimum fork uncertainty (only applied when ``fork_metric="entropy"``);
         if the best filtered position scores below this, no fork is emitted and
         the extra slots degrade to plain rollouts. 0.0 disables the gate.
@@ -313,17 +321,16 @@ class TBOPDConfig(BaseConfig):
         after a tool response). <=0 uses the whole turn.
     turn_only_post_tool (bool):
         If True, only turns that immediately follow a tool response are eligible
-        fork points (ARPO's "post-tool decision turn"), excluding the opening
-        assistant turn.
+        fork points (ARPO's "post-tool decision turn"). Default False: the token
+        path imposes no such positional prior, and whether the post-tool prior helps
+        is one of the things the fork experiments are meant to measure. Superseded
+        by ``fork_eligibility`` when that is set explicitly.
     turn_skip_first (int):
-        Number of leading assistant turns to exclude from forking (guards against
-        forking on the opening turn / boilerplate).
+        Number of leading assistant turns to exclude from forking. Default 0, to
+        match the token path's ``fork_skip_first=1`` (which skips a single *token*,
+        not a whole turn's worth of candidates).
     max_branches_per_traj (int):
         Budget B: maximum number of turns forked per trajectory. Phase 1' uses 1.
-    min_fork_signal (float):
-        Absolute floor on the (min-max normalized within-trajectory) turn signal;
-        below this no fork is emitted and the extra slots degrade to plain
-        rollouts. Suppresses forking on uniformly low-uncertainty trajectories.
     consecutive_high_entropy_penalty (bool):
         AEPO-style guard: down-weight a turn's fork signal when the immediately
         preceding turn was also high-signal, to avoid over-branching on a run of
@@ -331,6 +338,52 @@ class TBOPDConfig(BaseConfig):
     consecutive_penalty_weight (float):
         Multiplicative penalty applied to a turn signal when the preceding turn is
         also above the median signal (only when the penalty is enabled).
+
+    -- Shared fork scoring axes --
+
+    Both fork units rank candidates by ``Fuse(norm(U), norm(D))``: ``U`` is student
+    uncertainty, ``D`` is teacher-student disagreement. The axes below expose that
+    functional so the two granularities are one operator with different candidate
+    sets, rather than two separately-tuned heuristics. Each defaults to ``None`` =
+    "use whatever ``fork_metric`` implies", so existing arms are unchanged.
+
+    fork_eligibility (str | None):
+        Which candidates exist for ``fork_unit="turn"``: ``post_tool`` (ARPO's
+        decision turn), ``turn_open`` (any turn's first token), ``reasoning``
+        (inside the thinking span), ``action`` (inside the tool-call / env action
+        span), or ``all`` (no positional prior, which is what the token path does).
+        ``reasoning``/``action`` require the agent loop to report per-turn action
+        spans; without them those candidates are skipped. ``None`` derives
+        ``post_tool``/``all`` from ``turn_only_post_tool``.
+    fork_alpha (float):
+        Weight on ``U`` in ``fuse="blend"``: ``alpha*U + (1-alpha)*D``. ``1.0``
+        (default, as on the token path) is pure uncertainty -- where the student is
+        *unsure*. ``0.0`` is pure teacher disagreement -- where it is *wrong*
+        relative to the teacher, i.e. where the OPD signal lives. Below 1.0 the fork
+        depends on the teacher, so the main trajectory's teacher forward is issued
+        before fork selection (needed for the loss regardless, so it costs nothing).
+    fork_fuse (str):
+        ``blend`` (default) averages the two ranks, so a candidate must do well on
+        both. ``max`` keeps the larger rank, so either extreme survives. ``union``
+        keeps the top half by each signal separately and ranks that union, which is
+        the mode where both kinds of fork actually get chosen. ``soft_or`` is ATOD's
+        ``1-(1-U)(1-D)``. Everything except ``blend`` with ``alpha=1`` needs a
+        teacher signal.
+    fork_kl_window (int):
+        Forward window over which the signed disagreement is averaged. A single
+        token's ``D`` is too noisy to rank on; the fork is worth taking where the
+        *upcoming* span diverges.
+    fork_normalize (str):
+        Per-trajectory normalization before fusing: ``rank`` (default, matching the
+        token path -- robust to the two signals living on different scales) or
+        ``minmax`` (ATOD's choice, which keeps Soft-OR probability-like).
+    disagreement_signed (bool):
+        ``True`` scores ``logp_student - logp_teacher``, isolating the "student is
+        over-confident here" direction. ``False`` uses ATOD's unsigned ``|delta|``,
+        which merges over-confidence with needless timidity.
+    fork_min_turn_gap (int):
+        Minimum turn distance between two selected fork points when
+        ``max_branches_per_traj > 1``, so the budget spreads over the trajectory.
     """
 
     enable: bool = False
@@ -355,12 +408,21 @@ class TBOPDConfig(BaseConfig):
     # Turn-level branching (TB-OPD-Turn).
     fork_unit: str = "token"
     turn_first_k: int = 16
-    turn_only_post_tool: bool = True
-    turn_skip_first: int = 1
+    turn_only_post_tool: bool = False
+    turn_skip_first: int = 0
     max_branches_per_traj: int = 1
-    min_fork_signal: float = 0.0
     consecutive_high_entropy_penalty: bool = False
     consecutive_penalty_weight: float = 0.5
+
+    # Shared fork scoring axes (both fork units). ``None`` = take the fork_metric
+    # preset, so existing arms keep their behavior unless an axis is set explicitly.
+    fork_eligibility: Optional[str] = None
+    fork_alpha: float = 1.0
+    fork_fuse: str = "blend"
+    fork_kl_window: int = 128
+    fork_normalize: str = "rank"
+    disagreement_signed: bool = True
+    fork_min_turn_gap: int = 1
 
     # -- Turn-level loss reweighting (B-A1, ATOD T-DUR style; no branch expansion) --
     # Independent of ``enable``: emphasize the KD token loss on high-uncertainty
@@ -375,8 +437,19 @@ class TBOPDConfig(BaseConfig):
 
     # Fork metrics valid per granularity.
     _TOKEN_METRICS = ("entropy", "topk_gap")
-    _TURN_METRICS = ("ent", "dHtool", "disagree", "hybrid")
+    # ``entropy`` is the token path's spelling of ``ent``; accepting both means the
+    # shared ``fork_metric`` default is valid whichever fork unit is selected.
+    _TURN_METRICS = ("ent", "entropy", "dHtool")
     _REWEIGHT_METRICS = ("ent", "dHtool")
+    _ELIGIBILITY = ("post_tool", "turn_open", "reasoning", "action", "all")
+    _FUSE = ("blend", "max", "union", "soft_or")
+    # Removed metric values and the axes that now express them. Each conflated the
+    # uncertainty statistic with the fusion, which is why fork_metric=hybrid could
+    # silently drop the disagreement term when no teacher was wired up.
+    _RETIRED_TURN_METRICS = {
+        "disagree": "fork_metric=ent fork_alpha=0.0",
+        "hybrid": "fork_metric=dHtool fork_alpha=0.5 fork_fuse=soft_or fork_normalize=minmax",
+    }
 
     def __post_init__(self):
         # Loss-side reweighting is validated independently of the rollout switch
@@ -399,6 +472,12 @@ class TBOPDConfig(BaseConfig):
                 f"tb_opd.branch_mode must be 'forced_topk' or 'resample', got {self.branch_mode}"
             )
         if self.fork_unit == "turn":
+            if self.fork_metric in self._RETIRED_TURN_METRICS:
+                raise ValueError(
+                    f"tb_opd.fork_metric='{self.fork_metric}' was retired: fork_metric now names only "
+                    f"the uncertainty statistic (as on the token path), and fusion is set independently. "
+                    f"Use {self._RETIRED_TURN_METRICS[self.fork_metric]} instead."
+                )
             if self.fork_metric not in self._TURN_METRICS:
                 raise ValueError(
                     f"tb_opd.fork_metric for fork_unit='turn' must be one of {self._TURN_METRICS}, "
@@ -410,6 +489,12 @@ class TBOPDConfig(BaseConfig):
                 )
             if self.turn_skip_first < 0:
                 raise ValueError(f"tb_opd.turn_skip_first must be >= 0, got {self.turn_skip_first}")
+            if self.fork_eligibility is not None and self.fork_eligibility not in self._ELIGIBILITY:
+                raise ValueError(
+                    f"tb_opd.fork_eligibility must be one of {self._ELIGIBILITY}, got {self.fork_eligibility}"
+                )
+            if self.fork_min_turn_gap < 0:
+                raise ValueError(f"tb_opd.fork_min_turn_gap must be >= 0, got {self.fork_min_turn_gap}")
         else:
             if self.fork_metric not in self._TOKEN_METRICS:
                 raise ValueError(
@@ -428,6 +513,14 @@ class TBOPDConfig(BaseConfig):
             raise ValueError(f"tb_opd.fork_topk_positions must be >= 1, got {self.fork_topk_positions}")
         if self.fork_skip_first < 0:
             raise ValueError(f"tb_opd.fork_skip_first must be >= 0, got {self.fork_skip_first}")
+        if self.fork_fuse not in self._FUSE:
+            raise ValueError(f"tb_opd.fork_fuse must be one of {self._FUSE}, got {self.fork_fuse}")
+        if not 0.0 <= self.fork_alpha <= 1.0:
+            raise ValueError(f"tb_opd.fork_alpha must be in [0, 1], got {self.fork_alpha}")
+        if self.fork_normalize not in ("minmax", "rank"):
+            raise ValueError(f"tb_opd.fork_normalize must be 'minmax' or 'rank', got {self.fork_normalize}")
+        if self.fork_kl_window < 1:
+            raise ValueError(f"tb_opd.fork_kl_window must be >= 1, got {self.fork_kl_window}")
 
 
 @dataclass

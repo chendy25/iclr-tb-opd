@@ -121,10 +121,19 @@ Loss     : 整棵 turn 树的 reverse KL（与母方法一致，先不改）
 
 ### 3.2 分叉准则（关键设计，吸取 ATOD 教训）
 
-- **默认主用 `hybrid = Soft-OR(ΔH_post-tool, disagreement)`**，而非纯熵。
+> **实现已偏离本节。** 现在的默认是数学 token 臂那一套（`fork_metric=entropy`、
+> `fork_alpha=1.0`、`fork_fuse=blend`、`fork_normalize=rank`、无位置先验），
+> 好让 token / turn 两种粒度只差在候选集上。下面描述的 `hybrid` 已被拆成
+> `fork_metric` / `fork_alpha` / `fork_fuse` / `fork_normalize` 四个正交轴，
+> 作为消融的一个点而不是默认值；`fork_metric=hybrid` 现在会在配置校验时报错。
+
+- **可选 `Soft-OR(ΔH_post-tool, disagreement)`**（`fork_metric=dHtool fork_alpha=0.5
+  fork_fuse=soft_or fork_normalize=minmax`），而非纯熵。
   - `ΔH_post-tool` 承接 ARPO 的实证：tool 反馈后前 10–50 token 熵尖峰是天然决策点；
   - `disagreement` 承接 ATOD：纯熵会被「student 已漂移导致 gap 被压扁」误导，加分歧更稳。
-- 绝对地板 `min_fork_signal` 抑制均匀噪声高熵 turn；
+- 绝对地板 `fork_min_entropy`（与 token 路径同一个键）在**归一化之前**对原始不确定性设阈，
+  抑制均匀低不确定性轨迹白占分支预算；对归一化后的分数设阈是无效的，因为 rank / minmax
+  都会把最优候选映射成 1.0；
 - **借鉴 AEPO 的 branch penalty**：对**连续**高熵 turn 施加分叉惩罚，避免在同一条链上过度 over-branching（否则预算爆炸 + 多样性反降）。
 
 ### 3.3 展开方式（相对 turn-aware OPD 的硬差异）

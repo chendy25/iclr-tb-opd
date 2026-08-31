@@ -107,18 +107,28 @@ tb_enable=${TB_ENABLE:-True}
 tb_fork_unit=${TB_FORK_UNIT:-turn}
 tb_k=${TB_K:-2}
 tb_only_fail=${TB_ONLY_FAIL:-True}
-tb_fork_metric=${TB_FORK_METRIC:-hybrid}          # ent | dHtool | disagree | hybrid
+tb_fork_metric=${TB_FORK_METRIC:-entropy}         # entropy (== ent) | dHtool (ARPO baseline)
 tb_correct_threshold=${TB_CORRECT_THRESHOLD:-1.0}
 tb_branch_mode=${TB_BRANCH_MODE:-forced_topk}     # forced_topk (M) | resample
 tb_resample_temperature=${TB_RESAMPLE_TEMPERATURE:--1.0}
 tb_topk_logprobs=${TB_TOPK_LOGPROBS:-20}
 tb_turn_first_k=${TB_TURN_FIRST_K:-16}
-tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-True}
-tb_turn_skip_first=${TB_TURN_SKIP_FIRST:-1}
+tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-False}
+tb_turn_skip_first=${TB_TURN_SKIP_FIRST:-0}
 tb_max_branches=${TB_MAX_BRANCHES_PER_TRAJ:-1}
-tb_min_fork_signal=${TB_MIN_FORK_SIGNAL:-0.0}
+# Raw-uncertainty floor, shared with the math token arms (which run 0.5). 0 disables.
+tb_fork_min_entropy=${TB_FORK_MIN_ENTROPY:-0.0}
 tb_consec_penalty=${TB_CONSEC_PENALTY:-False}
 tb_consec_weight=${TB_CONSEC_WEIGHT:-0.5}
+
+# ---- Shared fork-scoring axes (same knobs and defaults as the math token arms) ----
+tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
+tb_fork_alpha=${TB_FORK_ALPHA:-1.0}               # 1.0 = pure uncertainty; <1 needs teacher
+tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
+tb_fork_kl_window=${TB_FORK_KL_WINDOW:-128}
+tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (token path) | minmax (ATOD)
+tb_disagreement_signed=${TB_DISAGREEMENT_SIGNED:-True}
+tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
 
 # ---- B-A1 turn-level loss reweighting (reweight-only; independent of TB_ENABLE) ----
 tb_turn_reweight=${TB_TURN_REWEIGHT:-False}
@@ -171,7 +181,7 @@ mkdir -p "${ckpt_dir}" "${rollout_dir}"
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 need_gpus=$(( TRAINER_NNODES * NGPUS_PER_NODE + DISTILL_NNODES * DISTILL_NGPUS_PER_NODE ))
 
-echo "AGENTIC TB-OPD: tb_enable=${tb_enable} fork_unit=${tb_fork_unit} metric=${tb_fork_metric} branch_mode=${tb_branch_mode} rollout_n=${rollout_n} turn_reweight=${tb_turn_reweight}(${tb_reweight_metric},a=${tb_reweight_alpha})"
+echo "AGENTIC TB-OPD: tb_enable=${tb_enable} fork_unit=${tb_fork_unit} metric=${tb_fork_metric} alpha=${tb_fork_alpha} fuse=${tb_fork_fuse} norm=${tb_fork_normalize} elig=${tb_fork_eligibility} branch_mode=${tb_branch_mode} rollout_n=${rollout_n} turn_reweight=${tb_turn_reweight}(${tb_reweight_metric},a=${tb_reweight_alpha})"
 echo "sandbox_backend=${SANDBOX_BACKEND} tool_config=${TOOL_CONFIG} max_turns=${max_assistant_turns}"
 echo "student=${STUDENT_MODEL} teacher=${TEACHER_MODEL}"
 echo "train=${train_files} val=${val_files}"
@@ -248,9 +258,16 @@ if [[ "${tb_enable}" == "True" ]]; then
     distillation.tb_opd.resample_temperature=${tb_resample_temperature}
     distillation.tb_opd.topk_logprobs=${tb_topk_logprobs}
     distillation.tb_opd.max_branches_per_traj=${tb_max_branches}
-    distillation.tb_opd.min_fork_signal=${tb_min_fork_signal}
+    distillation.tb_opd.fork_min_entropy=${tb_fork_min_entropy}
     distillation.tb_opd.consecutive_high_entropy_penalty=${tb_consec_penalty}
     distillation.tb_opd.consecutive_penalty_weight=${tb_consec_weight}
+    distillation.tb_opd.fork_eligibility=${tb_fork_eligibility}
+    distillation.tb_opd.fork_alpha=${tb_fork_alpha}
+    distillation.tb_opd.fork_fuse=${tb_fork_fuse}
+    distillation.tb_opd.fork_kl_window=${tb_fork_kl_window}
+    distillation.tb_opd.fork_normalize=${tb_fork_normalize}
+    distillation.tb_opd.disagreement_signed=${tb_disagreement_signed}
+    distillation.tb_opd.fork_min_turn_gap=${tb_fork_min_turn_gap}
   )
 else
   TB_ARGS+=(distillation.tb_opd.enable=False)

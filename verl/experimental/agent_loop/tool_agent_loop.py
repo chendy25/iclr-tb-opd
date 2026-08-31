@@ -223,6 +223,7 @@ class ToolAgentLoop(AgentLoopBase):
         prefix_response_mask: list[int],
         prefix_response_logprobs: Optional[list[float]] = None,
         forced_first_token: Optional[int] = None,
+        prefix_extra_fields: Optional[dict[str, Any]] = None,  # noqa: ARG002 - env-replay hook
         **kwargs,
     ) -> AgentLoopOutput:
         """Resume the multi-turn tool loop from a mid-trajectory turn boundary.

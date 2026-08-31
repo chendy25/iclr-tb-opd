@@ -14,13 +14,77 @@ proposal (§9 execution plan).
 | Code tool — SandboxFusion backend | `verl/tools/sandbox_fusion_tools.py` (`SandboxFusionTool`, `CustomSandboxFusionTool`) |
 | Tool configs | `config/e2b_tool_config.yaml`, `config/sandbox_fusion_tool_config.yaml` |
 | Turn config (`fork_unit=turn`, hybrid metric, budget B, AEPO penalty) | `verl/workers/config/distillation.py` (`TBOPDConfig`), `verl/trainer/config/distillation/distillation.yaml` |
-| Turn fork selection (ATOD Soft-OR + ARPO ΔH_post-tool, NLL proxy) | `verl/experimental/agent_loop/tb_opd.py` (`select_fork_turn`, `segment_assistant_turns`, `topk_candidates_at`) |
+| Turn fork selection (shared `Fuse(norm(U), norm(D))` scorer) | `verl/experimental/agent_loop/tb_opd.py` (`select_fork_turn`, `turn_fork_candidates`, `fuse_signals`, `disagreement_window`, `segment_assistant_turns`, `topk_candidates_at`) |
+| Env-outcome success gating for `only_fail` | `verl/experimental/agent_loop/tb_opd.py` (`score_trajectory`) |
 | Breakpoint resume through the tool loop (E4) | `verl/experimental/agent_loop/tool_agent_loop.py` (`ToolAgentLoop.run_from_prefix`) |
+| Breakpoint resume for ALFWorld (reset + action replay) | `verl/experimental/agent_loop/alfworld_agent_loop.py` (`AlfWorldAgentLoop.run_from_prefix`, `_play`) |
 | Worker fan-out for turn branches | `verl/experimental/agent_loop/agent_loop.py` (`_run_tb_opd_group_turn`, `_tb_generate_branch_turn`) |
 | Tool-token loss mask (E5) | inherited: tool tokens have `response_mask=0`; `verl/trainer/distillation/losses.py` masks by `response_mask` |
 | Turn-reweight OPD (B-A1, reweight-only) | `verl/trainer/distillation/turn_reweight.py` (`compute_turn_reweight`), injected in `losses.py::distillation_loss` |
 | Data prep | `prepare_open_agentrl.py` |
 | Training arms | `run_phase1_B-A0.sh`, `run_phase1_B-A1.sh`, `run_phase1_M.sh`, `train_agentic_tbopd.sh` |
+
+## One fork operator, two granularities
+
+Token- and turn-level forks are the *same* scoring functional over different
+candidate sets, so an ablation changes one axis rather than swapping heuristics:
+
+```
+score(c) = Fuse( norm(U(c)), norm(D(c)) )    over candidates c in Eligibility
+```
+
+**Every shared axis defaults to the math token arm's value**, so an agentic run and
+a math run differ only in the candidate set unless you deliberately change a knob.
+
+| Axis | Config key | Default (= math) | Other values |
+|---|---|---|---|
+| `U` estimator | (automatic) | truncated top-k entropy when the rollout carried top-k | falls back to the one-sample proxy `mean(-log p)`; which one ran is logged as `tb_opd_fork_estimator` |
+| `U` baseline | `fork_metric` | `entropy` (alias `ent`) — no baseline | `dHtool` subtracts the first turn (ARPO ΔH_post-tool) |
+| `D` | `fork_kl_window`, `disagreement_signed` | `128`, signed `logp_student - logp_teacher` | `disagreement_signed=False` for ATOD's unsigned `|Δ|` |
+| `Fuse` | `fork_fuse`, `fork_alpha` | `blend`, `α=1.0` (pure uncertainty, no teacher) | `α<1` blends in `D`; `max`, `union`, `soft_or` (ATOD T-DUR) |
+| `norm` | `fork_normalize` | `rank` | `minmax` (ATOD) |
+| Eligibility | `fork_eligibility` | `all` — no positional prior, as on the token path | `post_tool` (ARPO), `turn_open`, `reasoning`, `action` |
+| Budget B | `max_branches_per_traj`, `fork_min_turn_gap` | `1` | slots are dealt round-robin across up to B fork points, kept ≥`fork_min_turn_gap` turns apart |
+
+The teacher is consulted at fork time under exactly the token path's condition:
+`fork_fuse in ("max","union","soft_or") or fork_alpha < 1.0`.
+
+`fork_metric` names *only* the uncertainty statistic, as it does on the token path.
+The old turn-only values `hybrid` and `disagree` bundled the statistic, the fusion,
+the normalization and whether a teacher was used into one enum — which is how
+`hybrid` came to silently drop its disagreement half. They now raise at config time
+with the replacement spelled out (`hybrid` → `fork_metric=dHtool fork_alpha=0.5
+fork_fuse=soft_or fork_normalize=minmax`).
+
+Two things this fixed rather than added. The turn path previously passed
+`teacher_logprobs=None` at the call site, so `hybrid` silently degraded to
+ΔH_post-tool and the disagreement half of ATOD's Soft-OR never ran; the teacher is
+now pulled forward at rollout time for the metrics that need it
+(`_compute_teacher_logprobs` is idempotent, so this reorders work rather than
+adding a forward). And `only_fail` gated on `score_solution`, which asks whether
+the decoded text matches a ground truth — ALFWorld rows have none, so every
+episode read as a failure and branches were spent even on episodes that won;
+`score_trajectory` now reads the env outcome (`alfworld_won`) when present.
+
+`reasoning`/`action` eligibility needs per-turn `<action>` spans. ALFWorld records
+them under `+alfworld.record_action_spans=True` (off by default: locating the span
+costs a few short decodes per turn).
+
+## ALFWorld branch resume: replay, not snapshot
+
+TextWorld has no snapshot/restore, so an ALFWorld branch cannot continue from the
+main trajectory's env state. `run_from_prefix` instead resets with the same seed
+(the game is a deterministic function of the seed) and re-issues the recorded
+actions up to the fork. The number of actions to replay is the number of
+observation blocks in the prefix — one env step produced each — which is correct
+both for forks at a turn boundary and for forks *inside* a turn, whose action never
+executed. Forking inside an `<action>` block leaves its opening tag in the prefix,
+so the first resumed projection is fed the carried-over partial turn.
+
+Replay is verified, not assumed: the main trajectory stores an observation
+fingerprint per step and the branch compares as it replays. A mismatch sets
+`alfworld_replay_ok=0` and logs, so a branch whose env state disagrees with its own
+token prefix is visible in the dumps instead of quietly poisoning the KD loss.
 
 ## Provenance (borrowed, verified)
 

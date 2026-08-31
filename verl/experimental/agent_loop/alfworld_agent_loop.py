@@ -57,6 +57,21 @@ def _stable_seed(key: str) -> int:
     return int(digest[:8], 16) & 0x7FFFFFFF
 
 
+def _count_assistant_turns(response_mask: list[int]) -> int:
+    """Number of maximal runs of 1s (one per assistant turn)."""
+    return sum(1 for i, m in enumerate(response_mask) if m == 1 and (i == 0 or response_mask[i - 1] != 1))
+
+
+def _count_observation_blocks(response_mask: list[int]) -> int:
+    """Number of maximal runs of 0s == number of env steps already executed.
+
+    Each env step appends exactly one observation block, so this counts how many
+    actions a branch has to replay to reach the fork point -- correct both for forks
+    at a turn boundary and for forks inside a turn whose action never ran.
+    """
+    return sum(1 for i, m in enumerate(response_mask) if m == 0 and (i == 0 or response_mask[i - 1] != 0))
+
+
 def _to_py(value: Any) -> Any:
     """Normalize numpy 0-d/objects from non_tensor_batch to plain python."""
     if value is None:
@@ -102,6 +117,42 @@ class AlfWorldAgentLoop(AgentLoopBase):
         )
         # Per-turn generation cap keeps a single turn from consuming the whole budget.
         self.max_turn_tokens = int(_cfg("max_turn_tokens", 512))
+        # TB-OPD-Turn with fork_eligibility=reasoning/action needs to know where each
+        # turn's <action> block starts. Locating it costs a few tail decodes per turn,
+        # so it is opt-in.
+        self.record_action_spans = bool(_cfg("record_action_spans", False))
+
+    def _char_to_token(self, ids: list[int], char_idx: int) -> int:
+        """Smallest ``t`` with ``len(decode(ids[:t])) >= char_idx`` (binary search)."""
+        lo, hi = 0, len(ids)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if len(self.tokenizer.decode(ids[:mid], skip_special_tokens=True)) >= char_idx:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _action_span(self, ids: list[int]) -> Optional[tuple[int, int]]:
+        """Token range of the ``<action>`` block within one assistant turn.
+
+        ALFWorld's protocol puts the action last, so the block always runs to the end
+        of the turn and only its start has to be located. Searching an expanding tail
+        keeps this to a handful of short decodes instead of scanning the whole turn.
+        """
+        n = len(ids)
+        if n == 0:
+            return None
+        for k in (64, 128, 256, 512, n):
+            k = min(k, n)
+            tail = ids[n - k :]
+            text = self.tokenizer.decode(tail, skip_special_tokens=True)
+            idx = text.rfind("<action>")
+            if idx != -1:
+                return (n - k + self._char_to_token(tail, idx), n)
+            if k == n:
+                break
+        return None
 
     def _game_seed(self, kwargs: dict) -> int:
         # Prefer the dataset index: it makes the game a reproducible function of the
@@ -119,28 +170,153 @@ class AlfWorldAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], validate: bool = False, **kwargs) -> AgentLoopOutput:
+        split = self.eval_split if validate else self.train_eval
+        return await self._play(sampling_params, split=split, kwargs=kwargs)
+
+    @rollout_trace_op
+    async def run_from_prefix(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        base_prompt_ids: list[int],
+        prefix_response_ids: list[int],
+        prefix_response_mask: list[int],
+        prefix_response_logprobs: Optional[list[float]] = None,
+        forced_first_token: Optional[int] = None,
+        prefix_extra_fields: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        """Resume an episode from a mid-trajectory fork point (TB-OPD-Turn E4).
+
+        ALFWorld's backend is a TextWorld process with no snapshot/restore, so the
+        branch cannot simply continue from the main trajectory's env state. Instead
+        the episode is *replayed*: reset with the same seed (the game is a
+        deterministic function of the seed, see ``_game_seed``) and re-issue the
+        actions the main trajectory already took before the fork. Replay is exact
+        because the env is deterministic given (seed, action sequence); a mismatch
+        would show up as ``alfworld_replay_ok=0``.
+
+        The number of actions to replay is the number of observation blocks in the
+        prefix: one env step produced each of them. That rule holds both for forks
+        at a turn boundary and for forks *inside* a turn (where the partial turn's
+        tokens are in the prefix but its action was never executed).
+        """
+        prefix_extra_fields = prefix_extra_fields or {}
+        split = str(prefix_extra_fields.get("alfworld_split") or self.train_eval)
+        replay_n = _count_observation_blocks(prefix_response_mask)
+        actions = list(prefix_extra_fields.get("alfworld_actions") or [])
+        fingerprints = list(prefix_extra_fields.get("alfworld_obs_fingerprints") or [])
+        return await self._play(
+            sampling_params,
+            split=split,
+            kwargs=kwargs,
+            base_prompt_ids=base_prompt_ids,
+            prefix_response_ids=prefix_response_ids,
+            prefix_response_mask=prefix_response_mask,
+            prefix_response_logprobs=prefix_response_logprobs,
+            forced_first_token=forced_first_token,
+            replay_actions=actions[:replay_n],
+            expected_fingerprints=fingerprints[:replay_n],
+        )
+
+    async def _play(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        split: str,
+        kwargs: dict[str, Any],
+        base_prompt_ids: Optional[list[int]] = None,
+        prefix_response_ids: Optional[list[int]] = None,
+        prefix_response_mask: Optional[list[int]] = None,
+        prefix_response_logprobs: Optional[list[float]] = None,
+        forced_first_token: Optional[int] = None,
+        replay_actions: Optional[list[str]] = None,
+        expected_fingerprints: Optional[list[int]] = None,
+    ) -> AgentLoopOutput:
+        """One episode, optionally resumed from a shared prefix (see run_from_prefix)."""
         metrics: dict[str, Any] = {}
         seed = self._game_seed(kwargs)
-        split = self.eval_split if validate else self.train_eval
         pool = get_env_pool(self.config_path, split, self.pool_size)
+        resumed = base_prompt_ids is not None
+        expected_fingerprints = list(expected_fingerprints or [])
 
         handle = await pool.acquire()
         won = False
         num_env_steps = 0
         invalid_actions = 0
         gamefile = None
+        replay_ok = True
+        env_actions: list[str] = []
+        obs_fingerprints: list[int] = []
+        action_spans: list[Optional[tuple[int, int]]] = []
+        # Tokens of a partially-generated turn carried over from the prefix, so the
+        # first resumed projection sees the whole turn (see continuing_turn below).
+        carry_ids: list[int] = []
         try:
             obs = await pool.reset(handle, seed)
             gamefile = obs.get("gamefile")
 
-            # Initial user turn: task + first observation.
-            user_text = build_initial_user_text(obs["observation"], obs["admissible_commands"])
-            running_ids = await self.apply_chat_template([{"role": "user", "content": user_text}])
+            if resumed:
+                # Fast-forward the env to the fork point, then splice the shared
+                # prefix back in so the branch's tokens line up with the main slot.
+                for i, act in enumerate(replay_actions or []):
+                    step = await pool.step(handle, act)
+                    num_env_steps += 1
+                    env_actions.append(act)
+                    fp = _stable_seed(str(step.get("observation", "")))
+                    obs_fingerprints.append(fp)
+                    if step.get("gamefile") is not None:
+                        gamefile = step.get("gamefile")
+                    # A branch whose env state does not match its own token prefix would
+                    # feed the KD loss a transcript the environment never produced, so
+                    # verify rather than assume determinism.
+                    if i < len(expected_fingerprints) and fp != expected_fingerprints[i]:
+                        replay_ok = False
+                        break
+                    if bool(step.get("done", False)) or bool(step.get("won", False)):
+                        # The prefix is supposed to stop short of episode end; if replay
+                        # terminates early the recorded actions did not reproduce.
+                        replay_ok = False
+                        won = bool(step.get("won", False))
+                        break
+                running_ids = list(base_prompt_ids) + list(prefix_response_ids)
+                response_mask = list(prefix_response_mask)
+                response_logprobs = list(prefix_response_logprobs or [0.0] * len(prefix_response_mask))
+                have_logprobs = bool(prefix_response_logprobs)
+                # The prefix's top-k was consumed by fork selection on the main slot
+                # and is not carried across; branches never re-select a fork, so empty
+                # rows here only keep the index alignment.
+                response_topk = [[] for _ in prefix_response_mask]
+                have_topk = False
+                assistant_turns = _count_assistant_turns(prefix_response_mask)
+                # A fork inside a turn leaves that turn's opening tokens in the
+                # prefix, so the next generation *finishes* it rather than starting
+                # a new one; only a fork at a turn boundary adds a turn.
+                continuing_turn = bool(prefix_response_mask) and prefix_response_mask[-1] == 1
+                if forced_first_token is not None:
+                    running_ids = running_ids + [int(forced_first_token)]
+                    response_mask = response_mask + [1]
+                    response_logprobs = response_logprobs + [0.0]
+                if continuing_turn:
+                    # A fork inside the <action> block leaves the opening tag in the
+                    # prefix, so projecting the continuation alone would not parse.
+                    # Carry the partial turn's tokens into the first projection.
+                    n_partial = 0
+                    while n_partial < len(prefix_response_mask) and prefix_response_mask[-1 - n_partial] == 1:
+                        n_partial += 1
+                    carry_ids = list(running_ids[-(n_partial + (forced_first_token is not None)) :])
+            else:
+                # Initial user turn: task + first observation.
+                user_text = build_initial_user_text(obs["observation"], obs["admissible_commands"])
+                running_ids = await self.apply_chat_template([{"role": "user", "content": user_text}])
 
-            response_mask: list[int] = []
-            response_logprobs: list[float] = []
-            have_logprobs = False
-            assistant_turns = 0
+                response_mask = []
+                response_logprobs = []
+                response_topk = []
+                have_logprobs = False
+                have_topk = False
+                assistant_turns = 0
+                continuing_turn = False
 
             turn_sampling = dict(sampling_params)
             turn_sampling["max_tokens"] = min(
@@ -148,7 +324,10 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 self.max_turn_tokens,
             )
 
-            for _ in range(self.max_steps):
+            remaining_steps = max(0, self.max_steps - num_env_steps)
+            if resumed and not replay_ok:
+                remaining_steps = 0
+            for _ in range(remaining_steps):
                 # ---- assistant turn ----
                 with simple_timer("generate_sequences", metrics):
                     output: TokenOutput = await self.server_manager.generate(
@@ -162,6 +341,9 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 assistant_ids = output.token_ids
                 if not assistant_ids:
                     break
+                turn_start = len(response_mask) - len(carry_ids)
+                turn_ids = carry_ids + assistant_ids
+                carry_ids = []
                 running_ids = running_ids + assistant_ids
                 response_mask += [1] * len(assistant_ids)
                 if output.log_probs:
@@ -169,17 +351,39 @@ class AlfWorldAgentLoop(AgentLoopBase):
                     response_logprobs += list(output.log_probs)
                 else:
                     response_logprobs += [0.0] * len(assistant_ids)
-                assistant_turns += 1
+                # Per-position top-k, present only when the caller asked for an integer
+                # ``logprobs``. Needed for truncated-entropy fork scoring; without it the
+                # turn selector silently falls back to the mean-NLL proxy, which is a
+                # different statistic on a different scale.
+                turn_topk = output.extra_fields.get("output_logprobs") if output.extra_fields else None
+                if turn_topk and len(turn_topk) == len(assistant_ids):
+                    have_topk = True
+                    response_topk += list(turn_topk)
+                else:
+                    response_topk += [[] for _ in assistant_ids]
+                if continuing_turn:
+                    continuing_turn = False
+                else:
+                    assistant_turns += 1
 
-                assistant_text = self.tokenizer.decode(assistant_ids, skip_special_tokens=True)
+                assistant_text = self.tokenizer.decode(turn_ids, skip_special_tokens=True)
                 action, valid = alfworld_projection(assistant_text)
                 if not valid:
                     invalid_actions += 1
+                if self.record_action_spans:
+                    local = self._action_span(turn_ids)
+                    action_spans.append(
+                        (turn_start + local[0], turn_start + local[1]) if local else None
+                    )
 
                 # ---- environment step ----
                 with simple_timer("tool_calls", metrics):
                     step = await pool.step(handle, action)
                 num_env_steps += 1
+                # Recorded so a branch can rebuild this env state by replay; the
+                # projected action (not the raw text) is what the env actually saw.
+                env_actions.append(action)
+                obs_fingerprints.append(_stable_seed(str(step.get("observation", ""))))
                 won = bool(step.get("won", False))
                 done = bool(step.get("done", False))
                 if step.get("gamefile") is not None:
@@ -201,6 +405,7 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 running_ids = running_ids + obs_ids
                 response_mask += [0] * len(obs_ids)
                 response_logprobs += [0.0] * len(obs_ids)
+                response_topk += [[] for _ in obs_ids]
         finally:
             pool.release(handle)
 
@@ -244,8 +449,38 @@ class AlfWorldAgentLoop(AgentLoopBase):
             "turn_scores": [],
             "tool_rewards": [],
             "reward_extra_info": diagnostics,
+            # Replay tape for TB-OPD-Turn branches: the exact projected actions the
+            # env executed, in order. Without it a branch cannot rebuild env state.
+            "alfworld_actions": env_actions,
+            # Per-step observation fingerprints, so a branch can verify that replaying
+            # those actions really landed in the same state its token prefix describes.
+            "alfworld_obs_fingerprints": obs_fingerprints,
             **diagnostics,
         }
+        if self.record_action_spans:
+            # Response-coordinate <action> spans, one entry per assistant turn, so
+            # fork selection can distinguish the reasoning span from the action span.
+            # Prefix turns of a resumed episode were not re-decoded, so they are None
+            # placeholders that keep the list aligned with segment_assistant_turns().
+            prefix_turns = _count_assistant_turns(prefix_response_mask) if resumed else 0
+            extra_fields["action_spans"] = [None] * prefix_turns + action_spans
+        if resumed:
+            extra_fields["alfworld_replay_ok"] = float(replay_ok)
+            extra_fields["alfworld_replay_steps"] = float(len(replay_actions or []))
+            if not replay_ok:
+                logger.warning(
+                    "[alfworld] branch replay diverged (seed=%d, split=%s, replayed=%d/%d); "
+                    "branch env state does not match its token prefix",
+                    seed,
+                    split,
+                    num_env_steps,
+                    len(replay_actions or []),
+                )
+        if have_topk:
+            # Aligned 1:1 with response_ids (observation positions carry empty rows).
+            # TB-OPD pops this before the batch is materialized -- storing a per-token
+            # top-k distribution for a 20k-token episode would dwarf the episode itself.
+            extra_fields["output_logprobs"] = response_topk[: self.response_length]
         if gamefile is not None:
             extra_fields["alfworld_gamefile"] = str(gamefile)
 
