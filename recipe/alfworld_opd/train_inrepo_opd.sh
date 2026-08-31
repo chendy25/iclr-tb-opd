@@ -164,9 +164,11 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 # Real thinking costs ~493 tokens per env step (p90 647) against the no-think ~294, so
 # enabling it consumed the entire headroom the 12288 -> 20480 bump had bought.
 # Trimming the per-turn instruction boilerplate (see alfworld_env/prompts.py) takes
-# ~51 tokens a step back off that, leaving p90 ~597, i.e. ~29.8k for the full 50 steps.
-# 30720 covers 50 steps at up to 614 tokens/step, so p90 episodes now run to the step
-# cap and it is the policy that ends them.
+# ~38 tokens a step back off that. 30720 covers 50 steps at up to 614 tokens/step.
+# Measured after the change, same 192-episode window: 455.6 tokens/step (p90 604.8),
+# token-bound losses 88.3% -> 11.9%, episodes reaching the 50-step cap 5.7% -> 39.6%.
+# p90 now sits just under the 614 capacity, which is the intended design point --
+# the step cap, not the token cap, is what ends a long episode.
 max_response_length=${MAX_RESPONSE_LENGTH:-30720}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 # Must exceed max_num_tokens (32769 here) or a single full-length episode cannot form

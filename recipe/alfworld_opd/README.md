@@ -177,12 +177,26 @@ which ate the entire headroom the first bump had bought. Two things were done ab
 - **Trimmed the per-turn instruction boilerplate** (`alfworld_env/prompts.py`). The
   follow-up template restated the full answer contract every turn — 89 tokens × ~50
   turns = 17.7% of the whole budget spent re-explaining a format the model was already
-  following. The compact form keeps both tag names and "admissible" and saves ~51
+  following. The compact form keeps both tag names and "admissible" and saves ~38
   tokens/step. It is deliberately not removed: empty `<think>` blocks run ~0% over the
   first third of an episode and climb to ~6% by the last, so the reminder matters most
   exactly where the transcript is longest.
-- **Raised the budget to `30720`**, which covers 50 steps at up to 614 tokens/step
-  against the trimmed p90 of ~597.
+- **Raised the budget to `30720`**, which covers 50 steps at up to 614 tokens/step.
+
+Measured after both changes, over the same 192-episode window:
+
+| | `20480` | `30720` + trimmed |
+| --- | --- | --- |
+| losses that were token-bound | 88.3% | **11.9%** |
+| episodes reaching the 50-step cap | 5.7% | **39.6%** |
+| env steps left unused (median, token-bound) | 11 | 4 |
+| tokens per env step (mean / p90) | 493.5 / 647.4 | 455.6 / 604.8 |
+| empty `<think>` | 2.3% | 1.9% |
+
+p90 now sits just under the 614 tokens/step the budget affords, which is the intended
+design point. Note that `ALFWORLD_MAX_STEPS=50` is consequently the binding constraint
+now — that is the goal (the policy ends the episode), but it is the next knob to move
+if the question becomes "could it finish given more steps", not the token budget.
 
 Observations are the bulk of the spend (59.3%), not the model's own output, so trimming
 what the env says back is the cheaper lever. `ALFWORLD_MAX_TURN_TOKENS=2048` is *not*
