@@ -318,6 +318,36 @@ def distillation_loss(
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        # TB-OPD Rao-Blackwell branch weighting: reweights the k+1 continuations of a fork
+        # by the student's own probability of the token each one was forced to take.
+        # Forcing the top-k alternatives and then averaging them uniformly is what makes
+        # branch-OPD off-policy -- a rank-5 token the student would emit ~1% of the time
+        # would otherwise carry the same gradient mass as the token it actually chose.
+        # It rides the importance-weight hook, so it scales the per-token loss but NOT the
+        # token count in the denominator; the weights have mean 1 within a group, which
+        # keeps the aggregate loss scale (and effective LR) identical to uniform weighting.
+        branch_weight = data.get("branch_weight", None)
+        if branch_weight is not None:
+            if branch_weight.is_nested:
+                branch_weight = branch_weight.to_padded_tensor(1.0)
+            branch_weight = branch_weight.to(device=distillation_losses.device, dtype=distillation_losses.dtype)
+            if branch_weight.shape == distillation_losses.shape:
+                rollout_is_weights = (
+                    branch_weight if rollout_is_weights is None else rollout_is_weights * branch_weight
+                )
+                # Weights are per-token, not per-sequence: under dedup_shared_prefix a
+                # branch's replayed prefix is masked out entirely, so summarizing at
+                # position 0 would describe tokens that never reach the loss.
+                with torch.no_grad():
+                    w_mask = response_mask.to(branch_weight.dtype)
+                    n_in_loss = w_mask.sum()
+                    if n_in_loss > 0:
+                        distillation_metrics["distillation/branch_weight_mean"] = (
+                            (branch_weight * w_mask).sum() / n_in_loss
+                        ).item()
+                        distillation_metrics["distillation/branch_weight_max"] = (
+                            branch_weight.masked_fill(w_mask == 0, float("-inf")).max().item()
+                        )
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,

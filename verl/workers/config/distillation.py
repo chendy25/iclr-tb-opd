@@ -331,6 +331,22 @@ class TBOPDConfig(BaseConfig):
         not a whole turn's worth of candidates).
     max_branches_per_traj (int):
         Budget B: maximum number of turns forked per trajectory. Phase 1' uses 1.
+    dedup_shared_prefix (bool):
+        Mask a branch's replay of the main trajectory out of its loss, so the shared
+        prefix is trained once rather than once per slot. Without it the early tokens
+        of a forked episode carry ``1 + k`` times the gradient of the later ones purely
+        because they were regenerated.
+    branch_weight_mode (str):
+        Weighting of the ``k+1`` continuations of a fork: ``off`` (uniform) or ``rb``
+        (Rao-Blackwell -- proportional to the student's own probability of the token
+        each slot took at the fork). Uniform averaging over *forced* top-k alternatives
+        is off-policy: it lets a token the student would emit ~1% of the time carry the
+        same gradient mass as the one it actually chose.
+    branch_weight_temp (float):
+        Temperature on the RB weights; ``1.0`` is exact, larger tends to uniform.
+    branch_weight_floor (float):
+        Minimum per-slot RB weight before renormalization, so a very unlikely branch
+        still contributes something after we paid to generate it. ``0.0`` = exact RB.
     consecutive_high_entropy_penalty (bool):
         AEPO-style guard: down-weight a turn's fork signal when the immediately
         preceding turn was also high-signal, to avoid over-branching on a run of
@@ -411,6 +427,10 @@ class TBOPDConfig(BaseConfig):
     turn_only_post_tool: bool = False
     turn_skip_first: int = 0
     max_branches_per_traj: int = 1
+    dedup_shared_prefix: bool = True
+    branch_weight_mode: str = "off"
+    branch_weight_temp: float = 1.0
+    branch_weight_floor: float = 0.0
     consecutive_high_entropy_penalty: bool = False
     consecutive_penalty_weight: float = 0.5
 
@@ -521,6 +541,20 @@ class TBOPDConfig(BaseConfig):
             raise ValueError(f"tb_opd.fork_normalize must be 'minmax' or 'rank', got {self.fork_normalize}")
         if self.fork_kl_window < 1:
             raise ValueError(f"tb_opd.fork_kl_window must be >= 1, got {self.fork_kl_window}")
+        if self.branch_weight_mode not in ("off", "rb"):
+            raise ValueError(f"tb_opd.branch_weight_mode must be 'off' or 'rb', got {self.branch_weight_mode}")
+        if self.branch_weight_temp <= 0.0:
+            raise ValueError(f"tb_opd.branch_weight_temp must be > 0, got {self.branch_weight_temp}")
+        if not 0.0 <= self.branch_weight_floor < 1.0:
+            raise ValueError(f"tb_opd.branch_weight_floor must be in [0, 1), got {self.branch_weight_floor}")
+        if self.branch_weight_mode == "rb" and self.branch_mode != "forced_topk":
+            # RB weights are the student's probability of the token each slot took at
+            # the fork. Under resample the slots did not take a *chosen* token, so there
+            # is nothing to reweight and the estimator is already on-policy.
+            raise ValueError(
+                "tb_opd.branch_weight_mode='rb' requires branch_mode='forced_topk' "
+                f"(resample branches are already on-policy), got branch_mode={self.branch_mode}"
+            )
 
 
 @dataclass

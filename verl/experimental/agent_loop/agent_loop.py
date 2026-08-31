@@ -166,6 +166,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded attention mask."""
     response_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities for the response tokens."""
+    branch_weight: Optional[torch.Tensor] = None
+    """Padded per-token TB-OPD branch weight (Rao-Blackwell); 1.0 where unweighted."""
     teacher_logprobs: Optional[torch.Tensor] = None
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
@@ -852,6 +854,10 @@ class AgentLoopWorker:
         scheme_b_validate = bool(cfg.get("scheme_b_validate", False))
         branch_mode = str(cfg.get("branch_mode", "forced_topk"))
         resample_temperature = float(cfg.get("resample_temperature", -1.0))
+        dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
+        branch_weight_mode = str(cfg.get("branch_weight_mode", "off"))
+        branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
+        branch_weight_floor = float(cfg.get("branch_weight_floor", 0.0))
 
         # Cache the tokenizer's special-id set once for the CURE-style filter.
         special_ids = getattr(self, "_tb_opd_special_ids", None)
@@ -979,6 +985,10 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_fork_pos_frac"] = float(fork["pos"]) / rl
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
+        # (fork index, candidate index) each branch slot actually forced. Recorded rather
+        # than re-derived: the candidate index wraps on the candidates that survived
+        # dedup, so a formula would not always agree with what was generated.
+        slot_assignments: list[tuple[int, int]] = []
         for slot in range(1, n_slots):
             if mode == "branch":
                 if branch_mode == "resample":
@@ -991,7 +1001,9 @@ class AgentLoopWorker:
                     )
                 else:
                     cands = fork["cand_token_ids"]
-                    cand_token = cands[(slot - 1) % len(cands)]
+                    ci = (slot - 1) % len(cands)
+                    cand_token = cands[ci]
+                    slot_assignments.append((0, ci))
                     branch_out = await self._tb_generate_branch(
                         agent_loop, main_out, fork["pos"], int(cand_token), dict(sampling_params)
                     )
@@ -999,6 +1011,14 @@ class AgentLoopWorker:
                 branch_out.extra_fields["tb_opd_is_fail"] = float(not is_correct)
                 branch_out.extra_fields["tb_opd_mode_branch"] = 1.0
                 branch_out.extra_fields["tb_opd_branch_mode"] = branch_mode
+                if dedup_shared_prefix:
+                    # The branch re-emits main[:pos] verbatim. Left supervised, those
+                    # tokens are trained once per slot, so a prompt's opening would carry
+                    # (1+k) times the gradient of its tail purely because it was
+                    # regenerated. The forked token at pos differs and stays supervised.
+                    branch_out.response_mask = tb_opd.mask_shared_prefix(
+                        list(branch_out.response_mask), int(fork["pos"])
+                    )
                 raw_outputs.append(branch_out)
             else:
                 _, _, slot_kwargs = rows[slot]
@@ -1006,6 +1026,22 @@ class AgentLoopWorker:
                 plain_out.extra_fields["tb_opd_slot"] = slot
                 plain_out.extra_fields["tb_opd_mode_branch"] = 0.0
                 raw_outputs.append(plain_out)
+
+        # Rao-Blackwell weighting over the k+1 continuations of the single fork point.
+        # Forcing top-k alternatives and averaging them uniformly is what makes
+        # branch-OPD off-policy: a rank-5 token the student would emit ~1% of the time
+        # would otherwise carry the same gradient mass as the token it actually chose.
+        if branch_weight_mode == "rb" and mode == "branch" and branch_mode == "forced_topk":
+            weights = tb_opd.multifork_branch_weights(
+                [fork],
+                slot_assignments,
+                temperature=branch_weight_temp,
+                floor=branch_weight_floor,
+            )
+            if weights is not None:
+                for out, w in zip(raw_outputs, weights, strict=False):
+                    out.extra_fields["branch_weight"] = [float(w)] * len(out.response_ids)
+                    out.extra_fields["tb_opd_branch_weight"] = float(w)
 
         results: list[_InternalAgentLoopOutput] = []
         for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
@@ -1048,6 +1084,10 @@ class AgentLoopWorker:
         disagreement_signed = bool(cfg.get("disagreement_signed", True))
         max_branches = int(cfg.get("max_branches_per_traj", 1))
         min_turn_gap = int(cfg.get("fork_min_turn_gap", 1))
+        dedup_shared_prefix = bool(cfg.get("dedup_shared_prefix", True))
+        branch_weight_mode = str(cfg.get("branch_weight_mode", "off"))
+        branch_weight_temp = float(cfg.get("branch_weight_temp", 1.0))
+        branch_weight_floor = float(cfg.get("branch_weight_floor", 0.0))
 
         n_slots = len(rows)
         _, _, main_kwargs = rows[0]
@@ -1126,19 +1166,26 @@ class AgentLoopWorker:
         fork_points = fork_points[: max(1, max_branches)] if fork_points else []
 
         # forced_topk: fetch alternative first tokens for each forked position once.
+        # The candidates' logprobs come back with them so the k+1 continuations can be
+        # Rao-Blackwell weighted instead of averaged uniformly (see branch_weight_mode).
         cand_tokens_per_fork: list[list[int]] = []
         if has_fork and branch_mode == "forced_topk":
             for fp in fork_points:
                 pos = int(fp["pos"])
                 main_tok = int(main_out.response_ids[pos]) if pos < len(main_out.response_ids) else None
-                cand_tokens_per_fork.append(
-                    await tb_opd.topk_candidates_at(
-                        self.llm_client,
-                        list(main_out.prompt_ids),
-                        list(main_out.response_ids[:pos]),
-                        topk=topk_logprobs,
-                        dedup_token=main_tok,
-                    )
+                cands, cand_lps = await tb_opd.topk_candidates_at(
+                    self.llm_client,
+                    list(main_out.prompt_ids),
+                    list(main_out.response_ids[:pos]),
+                    topk=topk_logprobs,
+                    dedup_token=main_tok,
+                )
+                cand_tokens_per_fork.append(cands)
+                fp["cand_logprobs"] = cand_lps
+                # The student's own logprob of the token it took at the fork -- slot 0's
+                # entry in the RB weighting.
+                fp["main_logprob"] = (
+                    float(response_logprobs[pos]) if pos < len(response_logprobs) else None
                 )
             if not any(cand_tokens_per_fork):
                 # No usable alternative anywhere -> degrade to resample for the branches.
@@ -1168,16 +1215,25 @@ class AgentLoopWorker:
             main_out.extra_fields["tb_opd_num_fork_points"] = float(len(fork_points))
 
         raw_outputs: list[AgentLoopOutput] = [main_out]
+        # (fork index, candidate index) each branch slot actually forced, recorded rather
+        # than re-derived: the candidate index wraps on the candidates that survived
+        # dedup, so a formula would not always agree with what was generated.
+        slot_assignments: list[tuple[int, int]] = []
         for slot in range(1, n_slots):
             if mode == "branch":
+                # Fork points cycle fastest so a budget of B spreads over B distinct
+                # turns before any turn gets a second branch.
                 fi = (slot - 1) % len(fork_points)
                 fp = fork_points[fi]
                 forced_token = None
+                ci = 0
                 if branch_mode == "forced_topk" and cand_tokens_per_fork:
                     cands = cand_tokens_per_fork[fi]
                     if cands:
                         # Slots sharing a fork point must force *different* tokens.
-                        forced_token = int(cands[((slot - 1) // len(fork_points)) % len(cands)])
+                        ci = ((slot - 1) // len(fork_points)) % len(cands)
+                        forced_token = int(cands[ci])
+                slot_assignments.append((fi, ci))
                 branch_out = await self._tb_generate_branch_turn(
                     agent_loop,
                     main_out,
@@ -1195,6 +1251,15 @@ class AgentLoopWorker:
                 branch_out.extra_fields["tb_opd_fork_pos"] = float(fp["pos"])
                 branch_out.extra_fields["tb_opd_fork_turn"] = float(fp.get("turn_index", -1))
                 branch_out.extra_fields["tb_opd_fork_kind"] = str(fp.get("kind", "turn_open"))
+                if dedup_shared_prefix:
+                    # The branch replays main[:pos] verbatim. Left supervised, those
+                    # tokens are trained once per slot, so the early part of an episode
+                    # would carry (1+k) times the gradient of the later part purely
+                    # because it was regenerated. The forced token at pos differs from
+                    # main's and stays supervised.
+                    branch_out.response_mask = tb_opd.mask_shared_prefix(
+                        list(branch_out.response_mask), int(fp["pos"])
+                    )
                 raw_outputs.append(branch_out)
             else:
                 _, _, slot_kwargs = rows[slot]
@@ -1203,6 +1268,22 @@ class AgentLoopWorker:
                 plain_out.extra_fields["tb_opd_fork_unit"] = "turn"
                 plain_out.extra_fields["tb_opd_mode_branch"] = 0.0
                 raw_outputs.append(plain_out)
+
+        # Rao-Blackwell weighting over the k+1 continuations. Forcing the top-k
+        # alternatives and averaging them uniformly is what makes branch-OPD off-policy:
+        # a rank-5 token the student would emit ~1% of the time would otherwise carry the
+        # same gradient mass as the token it actually chose.
+        if branch_weight_mode == "rb" and mode == "branch" and branch_mode == "forced_topk":
+            weights = tb_opd.multifork_branch_weights(
+                fork_points,
+                slot_assignments,
+                temperature=branch_weight_temp,
+                floor=branch_weight_floor,
+            )
+            if weights is not None:
+                for out, w in zip(raw_outputs, weights, strict=False):
+                    out.extra_fields["branch_weight"] = [float(w)] * len(out.response_ids)
+                    out.extra_fields["tb_opd_branch_weight"] = float(w)
 
         results: list[_InternalAgentLoopOutput] = []
         for (row, traj, kwargs), raw in zip(rows, raw_outputs, strict=True):
@@ -1478,6 +1559,17 @@ class AgentLoopWorker:
             pad_size = self.rollout_config.response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
+        # TB-OPD branch weight, per token so it survives the same padding/reordering as
+        # the rest of the row. Pads with 1.0 rather than 0.0 -- it multiplies the loss, so
+        # the neutral value is one; padding with zero would mute real tokens if the field
+        # ever outlived its mask.
+        branch_weight = None
+        bw = output.extra_fields.pop("branch_weight", None)
+        if bw is not None:
+            bw = list(bw)[: self.rollout_config.response_length]
+            pad_size = self.rollout_config.response_length - len(bw)
+            branch_weight = torch.tensor(bw + [1.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
@@ -1554,6 +1646,7 @@ class AgentLoopWorker:
             response_mask=response_mask,
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
+            branch_weight=branch_weight,
             routed_experts=routed_experts,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
@@ -1755,6 +1848,19 @@ class AgentLoopWorker:
         optional_outputs = {}
         if inputs[0].response_logprobs is not None:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+        # Not keyed off inputs[0]: only forked groups carry a branch weight, so within one
+        # batch some rows have it and some do not. The rows that do not are unweighted,
+        # which is a weight of 1, so they are filled rather than dropping the column.
+        if any(input.branch_weight is not None for input in inputs):
+            optional_outputs["branch_weight"] = torch.cat(
+                [
+                    input.branch_weight
+                    if input.branch_weight is not None
+                    else torch.ones_like(input.response_ids, dtype=torch.float32)
+                    for input in inputs
+                ],
+                dim=0,
+            )
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:

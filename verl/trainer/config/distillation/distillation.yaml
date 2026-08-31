@@ -197,6 +197,21 @@ tb_opd:
   # Budget B: max number of turns forked per trajectory (Phase 1' uses 1).
   max_branches_per_traj: 1
 
+  # Mask a branch's replay of the main trajectory out of its loss, so the shared prefix
+  # is trained once instead of (1 + k) times.
+  dedup_shared_prefix: true
+
+  # Weighting of the k+1 continuations of a fork: "off" (uniform) or "rb"
+  # (Rao-Blackwell: proportional to the student's own probability of the forced token).
+  # Uniform averaging over forced top-k alternatives is off-policy.
+  branch_weight_mode: "off"
+
+  # Temperature on the RB weights; 1.0 = exact, larger -> uniform.
+  branch_weight_temp: 1.0
+
+  # Minimum per-slot RB weight before renormalization; 0.0 = exact RB.
+  branch_weight_floor: 0.0
+
   # (Retired: the turn unit now gates raw uncertainty via the shared fork_min_entropy
   # above. A floor on the *normalized* signal could never fire -- both rank and min-max
   # map the best candidate to 1.0.)

@@ -190,7 +190,10 @@ def _collect_fork_candidates(
     (``select_fork``) and Scheme-B (``select_fork_from_topk``) paths so filtering
     and scoring stay identical; only the source of the per-position top-k differs.
     """
-    cands: list[tuple[float, int, list[int]]] = []
+    # The row's logprobs ride along with its token ids: they are the student's own
+    # probabilities of each candidate, which is exactly what Rao-Blackwell branch
+    # weighting needs. Recovering them later would cost a second forward pass.
+    cands: list[tuple[float, int, list[int], list[float]]] = []
     n_considered = 0
     for p in range(resp_len):
         # Skip opener positions (CURE skips position 0).
@@ -211,7 +214,7 @@ def _collect_fork_candidates(
         ):
             continue
         n_considered += 1
-        cands.append((fork_uncertainty(row_lp, metric), p, row_id))
+        cands.append((fork_uncertainty(row_lp, metric), p, row_id, row_lp))
     return cands, n_considered
 
 
@@ -233,24 +236,35 @@ def _finalize_fork(
     if select == "topk_uniform":
         cands.sort(key=lambda c: c[0], reverse=True)
         pool = cands[: max(1, topk_positions)]
-        best_score, best_pos, best_cands = random.choice(pool)
+        best_score, best_pos, best_cands, best_lps = random.choice(pool)
     else:  # argmax
-        best_score, best_pos, best_cands = max(cands, key=lambda c: c[0])
+        best_score, best_pos, best_cands, best_lps = max(cands, key=lambda c: c[0])
 
     # Entropy gate (only meaningful for the entropy metric).
     if metric == "entropy" and min_entropy > 0.0 and best_score < min_entropy:
         return {"pos": None, "none_reason": "below_min_entropy", "score": float(best_score)}
 
-    # Exclude the main-sampled token so each branch is a genuine alternative.
+    # The student's own logprob of the token it sampled, read off the same top-k row so
+    # it is on the same scale as the candidates'. Stays None when the sampled token fell
+    # outside top-k, which makes RB weighting degrade to uniform for this fork rather
+    # than mixing a logprob from a different distribution into the ratio.
+    main_tok = int(response_ids[best_pos])
+    main_logprob = next((lp for t, lp in zip(best_cands, best_lps, strict=False) if int(t) == main_tok), None)
+
+    # Exclude the main-sampled token so each branch is a genuine alternative. The
+    # logprobs are filtered in lockstep -- dropping only the ids would shift every
+    # candidate's weight onto its neighbour.
     if dedup_main:
-        main_tok = int(response_ids[best_pos])
-        deduped = [t for t in best_cands if int(t) != main_tok]
-        if deduped:
-            best_cands = deduped
+        paired = [(t, lp) for t, lp in zip(best_cands, best_lps, strict=False) if int(t) != main_tok]
+        if paired:
+            best_cands = [t for t, _ in paired]
+            best_lps = [lp for _, lp in paired]
 
     return {
         "pos": best_pos,
         "cand_token_ids": best_cands,
+        "cand_logprobs": best_lps,
+        "main_logprob": main_logprob,
         "score": float(best_score),
         "num_positions": n_considered,
     }
@@ -537,6 +551,191 @@ def _normalized_ranks(values: list[float]) -> list[float]:
     for r, i in enumerate(order):
         ranks[i] = r / (n - 1)
     return ranks
+
+
+# ---------------------------------------------------------------------------
+# Branch weighting and shared-prefix accounting.
+#
+# Ported from the math token arm so both fork units train their branches under
+# the same estimator; the functions are unit-agnostic (they see slots and token
+# positions, not tokens vs turns).
+# ---------------------------------------------------------------------------
+
+
+def branch_weights(
+    logprobs: list[Optional[float]],
+    *,
+    temperature: float = 1.0,
+    floor: float = 0.0,
+) -> Optional[list[float]]:
+    """Rao-Blackwellized weights over the ``k+1`` realized continuations of a fork.
+
+    ``logprobs[j]`` is ``log pi_theta(a_j | s_fork)`` for the token slot ``j`` actually
+    took at the fork: slot 0 is the main rollout's own sampled token, slots ``1..k``
+    are the forced top-k alternatives.
+
+    Forcing the top-k alternatives and then averaging them uniformly is what makes
+    branch-OPD off-policy: the group's gradient estimates ``(1/(k+1)) * sum_j f(a_j)``
+    when the on-policy quantity is ``E_{a ~ pi_theta}[f(a)]``. Reweighting by the
+    renormalized student probability ``pi_theta(a_j) / sum_i pi_theta(a_i)`` turns the
+    sum back into a conditional expectation over the sampled support -- the standard
+    Rao-Blackwell estimator, unbiased for that support and strictly lower-variance than
+    sampling one continuation. Concretely it stops a rank-5 token the student would emit
+    ~1% of the time from carrying the same gradient mass as the token it actually chose.
+
+    Weights are rescaled to sum to ``len(logprobs)`` (mean 1) so the group's total
+    contribution -- and therefore the effective learning rate -- matches the uniform
+    weighting it replaces. Only the *relative* weighting inside the group changes.
+
+    Args:
+        logprobs: per-slot fork-token logprob; ``None`` anywhere disables weighting.
+        temperature: softens the weights (``1.0`` = exact RB, larger -> uniform).
+        floor: minimum weight per slot before renormalization; keeps a very unlikely
+            branch from contributing literally nothing after we paid to generate it.
+
+    Returns:
+        Weights summing to ``len(logprobs)``, or ``None`` if they cannot be computed.
+    """
+    if not logprobs or any(lp is None for lp in logprobs):
+        return None
+    n = len(logprobs)
+    t = max(1e-6, float(temperature))
+    scaled = [float(lp) / t for lp in logprobs]
+    m = max(scaled)
+    probs = [math.exp(s - m) for s in scaled]
+    z = sum(probs)
+    if not math.isfinite(z) or z <= 0.0:
+        return None
+    w = [p / z for p in probs]
+    f = max(0.0, float(floor))
+    if f > 0.0:
+        w = [max(x, f) for x in w]
+        z2 = sum(w)
+        w = [x / z2 for x in w]
+    return [x * n for x in w]
+
+
+def slot_fork_index(slot: int, k: int, n_forks: int) -> tuple[int, int]:
+    """Map a rollout slot to ``(fork_index, candidate_index)``.
+
+    Slot 0 is the main trajectory; slot ``1 + b*k + j`` is the j-th forced alternative
+    at fork ``b``, so ``rollout.n`` should be ``1 + B*k``. The modulo keeps every slot
+    filled when it is not: the minimum-gap filter can return fewer forks than requested,
+    and leaving a slot unassigned would break the fixed ``rollout.n`` row contract.
+    """
+    i = int(slot) - 1
+    k = max(1, int(k))
+    n_forks = max(1, int(n_forks))
+    return (i // k) % n_forks, i % k
+
+
+def multifork_branch_weights(
+    forks: list[dict],
+    assignments: list[tuple[int, int]],
+    *,
+    temperature: float = 1.0,
+    floor: float = 0.0,
+) -> Optional[list[float]]:
+    """Combine ``B`` per-fork Rao-Blackwell estimators into one weight per slot.
+
+    B forks on a single trajectory are *not* a joint expectation over B tokens -- that
+    would need a ``k**B`` tree, not ``1 + B*k`` rows. They are B separate
+    Rao-Blackwellizations of the same sample, so the estimator is their average
+    ``(1/B) * sum_b g_b``, where each ``g_b`` is exactly the single-fork estimator.
+
+    Averaging is what dissolves the apparent conflict of the main trajectory "needing B
+    weights at once": it appears in every ``g_b``, so it carries the *mean* of its
+    per-fork weights -- a single scalar. A branch appears in one ``g_b`` only, so it
+    carries ``w_j / B``. Pinning the main slot at 1.0 instead would hand its share to
+    the forced branches, i.e. reintroduce exactly the off-policy bias RB exists to
+    remove.
+
+    Weights are rescaled to sum to ``n_slots`` so the mean stays 1 and the effective
+    learning rate is unchanged. At ``B == 1`` the scale is exactly 1 and this reduces to
+    the plain conditional expectation.
+
+    Slots that wrap onto the same ``(fork, candidate)`` pair are independent samples of
+    one forced branch and split its weight, so a fork's total mass does not depend on
+    how many slots happened to land on it.
+
+    ``assignments[i]`` is the ``(fork_index, candidate_index)`` that branch slot ``i+1``
+    actually forced. Passing the realized assignment rather than recomputing it from a
+    modulo is deliberate: the candidate index wraps on the number of candidates that
+    survived dedup, which is not necessarily the configured ``k``, so a derived mapping
+    can disagree with what was really generated and silently weight the wrong branch.
+
+    Returns ``None`` only if the weights cannot be normalized at all; a single fork
+    missing its logprobs degrades to uniform rather than disabling the group.
+    """
+    if not forks or not assignments:
+        return None
+    n_slots = len(assignments) + 1
+
+    # Per-fork weight vectors, sized to the candidates that fork actually owns.
+    cand_count: dict[int, int] = {}
+    for b, j in assignments:
+        cand_count[b] = max(cand_count.get(b, 0), int(j) + 1)
+
+    per_fork: dict[int, list[float]] = {}
+    for b, n_cand in cand_count.items():
+        fk = forks[b] if 0 <= b < len(forks) else {}
+        lps = fk.get("cand_logprobs") or []
+        w = None
+        if lps:
+            slot_lps = [fk.get("main_logprob")] + [lps[j % len(lps)] for j in range(n_cand)]
+            w = branch_weights(slot_lps, temperature=temperature, floor=floor)
+        # Degrade one unweightable fork to uniform instead of dropping RB for the whole
+        # group: with B forks a single missing logprob would otherwise cost all of them,
+        # and the odds of hitting one scale with B.
+        per_fork[b] = w if w is not None else [1.0] * (n_cand + 1)
+
+    # A (fork, candidate) pair owns several slots whenever the slot budget does not
+    # divide evenly. Those slots are independent samples of the SAME forced branch, so
+    # they must split that branch's weight -- leaving each at full weight multiplies the
+    # fork's mass by its slot count, and after renormalization that drags the main
+    # trajectory down, inverting the very thing RB is for.
+    counts: dict[tuple[int, int], int] = {}
+    for key in assignments:
+        counts[key] = counts.get(key, 0) + 1
+
+    # Average only over forks that actually own slots: a fork that never got generated
+    # must not raise the main trajectory's weight on the strength of branches that do
+    # not exist.
+    active = sorted(per_fork)
+    if not active:
+        return None
+    b_active = len(active)
+
+    out = [sum(per_fork[b][0] for b in active) / b_active]
+    for b, j in assignments:
+        out.append(per_fork[b][1 + j] / (b_active * counts[(b, j)]))
+
+    # Rescale by the realized total rather than a closed form: the two agree when the
+    # budget divides evenly, and only the realized total keeps the mean at 1 when it
+    # does not.
+    total = sum(out)
+    if not math.isfinite(total) or total <= 0.0:
+        return None
+    scale = float(n_slots) / total
+    return [x * scale for x in out]
+
+
+def mask_shared_prefix(response_mask: list[int], prefix_len: int) -> list[int]:
+    """Drop a branch's replay of the main trajectory from the loss.
+
+    A branch is generated as ``main[:fork] + forced_token + continuation``, so the first
+    ``prefix_len`` tokens are byte-identical to the main trajectory. Left unmasked they
+    are trained once per slot, which up-weights early tokens by the number of slots.
+    Zeroing them leaves the prefix supervised exactly once, by the main slot.
+
+    On the turn path the prefix is a whole prefix of the episode, so this also zeroes
+    the environment-observation tokens inside it -- which were already masked, making
+    the operation idempotent there.
+    """
+    if prefix_len <= 0:
+        return list(response_mask)
+    n = min(int(prefix_len), len(response_mask))
+    return [0] * n + list(response_mask[n:])
 
 
 def fuse_signals(
@@ -856,13 +1055,18 @@ async def topk_candidates_at(
     *,
     topk: int,
     dedup_token: Optional[int] = None,
-) -> list[int]:
-    """Top-k candidate token ids for the next token after ``prompt+prefix``.
+) -> tuple[list[int], list[float]]:
+    """Top-k candidate token ids -- and their logprobs -- after ``prompt+prefix``.
 
     Used by forced-topk turn branching to obtain alternative first tokens for the
     forked turn. Runs a single ``max_tokens=1`` generation with
     ``prompt_logprobs=topk`` and reads the distribution for the position that would
     produce the next token (the last extracted prompt-logprob row).
+
+    The logprobs are returned alongside because Rao-Blackwell branch weighting needs
+    ``log pi_theta(a_j | s_fork)`` per slot; without them the k forced continuations
+    would be averaged uniformly, which is what makes forced-topk branching off-policy.
+    They stay index-aligned with the ids through the dedup filter.
     """
     seq = list(prompt_ids) + list(response_prefix_ids)
     sampling_params = {
@@ -880,12 +1084,22 @@ async def topk_candidates_at(
     )
     pid = out.extra_fields.get("prompt_ids")
     if not pid:
-        # Fall back to the single greedily-generated next token.
-        return list(out.token_ids)[:1]
-    cand = [int(x) for x in pid[-1] if x is not None]
+        # Fall back to the single greedily-generated next token; no distribution, so no
+        # RB weights either (multifork_branch_weights degrades that fork to uniform).
+        return list(out.token_ids)[:1], []
+    plp = out.extra_fields.get("prompt_logprobs")
+    row_ids = pid[-1]
+    row_lps = plp[-1] if plp else [None] * len(row_ids)
+    pairs = [
+        (int(i), float(lp))
+        for i, lp in zip(row_ids, row_lps)
+        if i is not None and lp is not None
+    ]
     if dedup_token is not None:
-        cand = [t for t in cand if t != int(dedup_token)]
-    return cand
+        pairs = [(i, lp) for i, lp in pairs if i != int(dedup_token)]
+    if not pairs:
+        return [int(x) for x in row_ids if x is not None], []
+    return [i for i, _ in pairs], [lp for _, lp in pairs]
 
 
 def select_fork_from_topk(
