@@ -50,6 +50,12 @@ verl/experimental/agent_loop/
 
 recipe/alfworld_opd/
   train_inrepo_opd.sh           # PRIMARY: main_ppo + k1 PG OPD (4B <- 30B-A3B)
+                                #   doubles as the TB-OPD-Turn arm under TB_ENABLE=True
+  run_tbopd_turn.sh             # thin wrapper: the TB-OPD-Turn arm + its ablations
+  analyze_rollouts.py           # offline dump analysis (protocol health + 3-arm recovery)
+  eval_inrepo.sh                # val_only: one model, one split, no distillation
+  run_eval_suite.sh             # 3 models (4B / 30B-A3B / OPD ckpt) x seen+unseen
+  count_split_games.py          # AlfredTWEnv registered game counts
   preflight_inrepo.py           # job-side: registry + one env reset/step
   prepare_text_stubs.py         # offline parquet (no HF geometry3k)
   install_job_deps.sh           # pip --user alfworld/textworld/... on the job python
@@ -108,6 +114,26 @@ python3 _sco_exec.py --worker worker --wait-s 240 -- \
 
 Logs: `iclr/logs/alfworld_inrepo_opd_qwen3_4b_from_30ba3b/`.
 
+## Eval (base 4B / base 30B-A3B / OPD student @ step 200)
+
+`val_only`, no teacher pool. Covers **full** `valid_seen` + `valid_unseen`
+(stub rows = AlfredTWEnv registered game count). Protocol matches training val
+(`temperature=0.4`, `n=1`, `enable_thinking=True`, 50 env steps, 20k response).
+Old no-think dumps are under `iclr/logs/_backup_alfworld_nothink_20260831/`.
+
+On an idle 8-GPU node (Ray head already up, or via `_relaunch_alfworld_eval.sh`):
+
+```bash
+# merge FSDP ckpt + 3 models × 2 splits
+bash /mnt/afs_reason/chendongyang/code/iclr/verl/recipe/alfworld_opd/run_eval_suite.sh
+
+# or one cell
+MODEL_PATH=.../Qwen3-4B EVAL_SPLIT=valid_unseen VAL_ROWS=134 \
+  bash /mnt/afs_reason/chendongyang/code/iclr/verl/recipe/alfworld_opd/eval_inrepo.sh
+```
+
+Outputs: `iclr/logs/verl_agent_alfworld_eval/eval_<tag>_<split>/`.
+
 ## Knobs (in-repo stack)
 
 | Env | Default | Meaning |
@@ -122,7 +148,8 @@ Logs: `iclr/logs/alfworld_inrepo_opd_qwen3_4b_from_30ba3b/`.
 | `MAX_RESPONSE_LENGTH` | `20480` | full episode transcript budget (one row = one episode); sized so 50 steps are reachable |
 | `ALFWORLD_MAX_STEPS` | `50` | max env steps (assistant turns) per episode (ATOD parity) |
 | `ALFWORLD_POOL_SIZE` | `16` | TextWorld envs per rollout process; need ≥ `batch*n/num_workers` |
-| `ALFWORLD_MAX_TURN_TOKENS` | `512` | per-turn generation cap (ATOD parity) |
+| `ALFWORLD_MAX_TURN_TOKENS` | `2048` | per-turn generation cap (raised for real `<think>` blocks) |
+| `ENABLE_THINKING` | `True` | Qwen3 chat-template flag; `True` = do **not** pre-fill empty think tags |
 | `LOSS_AGG_MODE` | `token-mean` | matches plain-OPD (B1) |
 | `ROLLOUT_TEMPERATURE` | `1.0` | sample from the student's own distribution |
 | `ALFWORLD_TRAIN_EVAL` | `train` | env split for training rollouts |
@@ -132,10 +159,88 @@ Logs: `iclr/logs/alfworld_inrepo_opd_qwen3_4b_from_30ba3b/`.
 | `DISTILLATION_TOPK` | `64` | teacher top-k logits |
 | `TEACHER_TP` / `ROLLOUT_TP` | `8` / `2` | teacher / student rollout TP |
 
+## TB-OPD-Turn arm
+
+`TB_ENABLE=True` turns the same script into the turn-branching arm, so the arm and its
+baseline differ in exactly one thing: a failed episode spends `k` extra rollout slots on
+branches resumed from its most uncertain assistant turn. `run_tbopd_turn.sh` is a thin
+wrapper that sets the arm's defaults.
+
+```bash
+bash recipe/alfworld_opd/train_inrepo_opd.sh   # baseline (native OPD, n=1)
+bash recipe/alfworld_opd/run_tbopd_turn.sh     # arm       (TB-OPD-Turn, n=1+k)
+```
+
+`rollout.n` is derived as `1+k` automatically, and `experiment_name` encodes the arm
+(`alfworld_inrepo_tbturn_entropy_a1.0_blend_all_k2_...`) so ablations cannot overwrite
+each other's dumps. Branch slots are played *sequentially* after the main slot, so
+`ALFWORLD_POOL_SIZE` does not need to grow with `k`, but a step costs roughly `(1+k)`
+episodes of wall clock.
+
+Every scoring axis defaults to the math token arm's value, so an ALFWorld run and a math
+run differ only in the candidate set. One env var changes one axis:
+
+| Variant | Setting |
+|---|---|
+| default (= math token arm) | truncated entropy, rank-normalized, `fork_alpha=1.0`, `blend`, no positional prior, B=1 |
+| ARPO-style | `TB_FORK_METRIC=dHtool TB_TURN_ONLY_POST_TOOL=True` |
+| KL-fork | `TB_FORK_ALPHA=0.5` (blends in teacher disagreement) |
+| ATOD T-DUR | `TB_FORK_FUSE=soft_or TB_FORK_NORMALIZE=minmax TB_FORK_METRIC=dHtool` |
+| branch the thinking | `TB_FORK_ELIGIBILITY=reasoning` |
+| branch the action | `TB_FORK_ELIGIBILITY=action` |
+| wider budget | `TB_MAX_BRANCHES_PER_TRAJ=2 TB_K=4` |
+| skip confident trajectories | `TB_FORK_MIN_ENTROPY=0.5` (the math arms' floor) |
+
+`TB_FORK_MIN_ENTROPY` is a floor on the **raw** entropy, applied before normalization —
+a floor on the normalized score cannot work, since rank and min-max both map the best
+candidate to `1.0`. The threshold is in the units of whichever estimator ran: truncated
+top-k entropy when the rollout carried per-position top-k (which it does here,
+`TB_TOPK_LOGPROBS=20`), otherwise a mean-NLL proxy on a different scale. The dump field
+`tb_opd_fork_estimator` records which one.
+
+`TB_FORK_ELIGIBILITY=reasoning|action` needs `record_action_spans`, which the wrapper
+turns on. Branches resume by resetting the game and replaying the recorded actions;
+`alfworld_replay_ok` in the dump is `0` for any branch whose replay diverged from the
+observation fingerprints of its prefix, so a corrupted resume is visible rather than
+silent.
+
+## Reading the dumps (`analyze_rollouts.py`)
+
+Stdlib-only, no GPU, no model. Point it at any rollout dump:
+
+```bash
+python3 recipe/alfworld_opd/analyze_rollouts.py \
+  $LOGS/eval_student_base_eval_out_of_distribution \
+  $LOGS/eval_student_opd_step200_eval_out_of_distribution \
+  --label base --label opd200
+```
+
+**Protocol health.** The column that matters after the thinking switch is
+`NON-EMPTY think %`. A dump made under `enable_thinking=False` contains `<think>` in
+100% of episodes — Qwen3's template pre-fills an *empty* pair — so a substring check
+cannot tell the protocols apart. On the pre-thinking dumps this metric reads `0.0`
+for the 4B base, the OPD student and the 30B-A3B teacher alike, which is the direct
+evidence that none of those runs did any reasoning.
+
+**Three-arm comparison.** When a dump carries `tb_opd_slot` the script groups
+`main + k branches` by sample uid and reports the recovery rate — of the episodes the
+main slot lost, the share a branch rescued. Run three arms and read the two gaps:
+
+| arm | how to produce | isolates |
+|---|---|---|
+| `fork` | `TB_BRANCH_MODE=forced_topk` (default) | branch diverges at the *selected* turn |
+| `resample` | `TB_BRANCH_MODE=resample` | same fork point, no forced token |
+| `continue` | `TB_ENABLE=False ROLLOUT_N=3` | independent episodes, no shared prefix |
+
+`fork` vs `resample` isolates *where* the branch diverges; `resample` vs `continue`
+isolates the shared prefix from simply drawing more samples. `squandered %` should stay
+at 0 under `only_fail`, and `replay diverged %` should stay at 0 — anything else means
+branches resumed into an env state that does not match their token prefix.
+
 ## Relation to ATOD's ALFWorld config
 
 Reference: `refs/ATOD/examples/sod_trainer/run_alfworld_sod_qwen3_4b.sh`. Matched:
-`lr=1e-6`, `adv_estimator=grpo`, `use_kl_loss=False`, `enable_thinking=False`,
+`lr=1e-6`, `adv_estimator=grpo`, `use_kl_loss=False`,
 `val_kwargs.temperature=0.4 / do_sample=True`, `val_data_size=128`,
 `max_prompt_length=2048`, `env.max_steps=50`. Deliberate divergences:
 
@@ -148,16 +253,15 @@ Reference: `refs/ATOD/examples/sod_trainer/run_alfworld_sod_qwen3_4b.sh`. Matche
 - **stub rows (16 → 6400).** ATOD sets `train_data_size == train_batch_size`, i.e.
   one step per epoch over a fixed 16 games, repeated for 150 epochs. We instead
   sweep the full ~6.4k-game train split; step count ends up comparable (200 vs 150).
-- **No `<think>` block requested (ATOD asks for one).** We pass
-  `enable_thinking=False`, and Qwen3's chat template answers that by pre-filling an
-  empty `<think></think>` into *every* generation prompt (`enable_thinking is defined
-  and ... is false`). The tag therefore can never appear in generated text, so both
-  the prompt instruction and ATOD's `<think>` validity check are dropped — keeping the
-  check pinned `alfworld_invalid_action_frac` to exactly 1.0 and masked whether
-  `<action>` itself parsed. To restore real thinking, drop the `enable_thinking` kwarg
-  entirely (leaving it *undefined* injects nothing) and re-budget: Qwen3 think blocks
-  run to hundreds of tokens per turn, so `ALFWORLD_MAX_TURN_TOKENS` and
-  `MAX_RESPONSE_LENGTH` both need to grow substantially.
+- **Real `<think>` generation (ATOD asks for think in the prompt but still sets
+  `enable_thinking=False`, which pre-fills an empty block).** We set
+  `enable_thinking=True` so Qwen3 does **not** pre-fill `<think></think>`; the
+  model must emit the tags. Prompt and `alfworld_projection` again require a
+  `<think>` block (ATOD's validity check). Per-turn cap is 2048 (was 512).
+  Thinking tokens also eat the episode `MAX_RESPONSE_LENGTH` budget — raise it
+  (and `PPO_MAX_TOKEN_LEN_PER_GPU`) if 50-step episodes start dying mid-task.
+  The previous no-think protocol and dumps are snapshotted at
+  `iclr/logs/_backup_alfworld_nothink_20260831/`.
 - **`use_invalid_action_penalty` not ported.** It edits `token_level_scores`, which
   never reaches the advantage when `use_task_rewards=False`. The signal is still
   observable via the `alfworld_invalid_action_frac` extra field.

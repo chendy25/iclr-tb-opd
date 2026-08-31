@@ -80,10 +80,45 @@ if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
     --val_data_size "${alfworld_val_rows}"
 fi
 
+# ---- TB-OPD-Turn (off by default: this script doubles as the native-OPD baseline) ----
+# TB_ENABLE=True turns the same script into the turn-branching arm. Every scoring axis
+# defaults to the math token arm's value, so the agentic arm differs from the math arm
+# only in which candidates exist (assistant turns / spans instead of tokens).
+tb_enable=${TB_ENABLE:-False}
+tb_k=${TB_K:-2}                                   # branch slots per prompt
+tb_only_fail=${TB_ONLY_FAIL:-True}                # branch only trajectories that lost
+tb_fork_metric=${TB_FORK_METRIC:-entropy}         # entropy (== ent) | dHtool (ARPO)
+tb_fork_eligibility=${TB_FORK_ELIGIBILITY:-null}  # null|post_tool|turn_open|reasoning|action|all
+tb_fork_alpha=${TB_FORK_ALPHA:-1.0}               # 1.0 = pure uncertainty; <1 pulls in the teacher
+tb_fork_fuse=${TB_FORK_FUSE:-blend}               # blend | max | union | soft_or
+tb_fork_normalize=${TB_FORK_NORMALIZE:-rank}      # rank (math) | minmax (ATOD)
+tb_fork_kl_window=${TB_FORK_KL_WINDOW:-128}
+tb_disagreement_signed=${TB_DISAGREEMENT_SIGNED:-True}
+tb_fork_min_entropy=${TB_FORK_MIN_ENTROPY:-0.0}   # raw-entropy floor; math arms run 0.5
+tb_branch_mode=${TB_BRANCH_MODE:-forced_topk}     # forced_topk | resample
+tb_topk_logprobs=${TB_TOPK_LOGPROBS:-20}
+tb_max_branches=${TB_MAX_BRANCHES_PER_TRAJ:-1}
+tb_fork_min_turn_gap=${TB_FORK_MIN_TURN_GAP:-1}
+tb_turn_first_k=${TB_TURN_FIRST_K:-16}
+tb_turn_only_post_tool=${TB_TURN_ONLY_POST_TOOL:-False}
+tb_turn_skip_first=${TB_TURN_SKIP_FIRST:-0}
+# fork_eligibility=reasoning|action needs to know where each turn's <action> block is,
+# which costs a few tail decodes per turn. On whenever branching is on, so the
+# reasoning-vs-action ablation needs no second rollout.
+tb_record_action_spans=${TB_RECORD_ACTION_SPANS:-${tb_enable}}
+
 # ---- scale ----
 # Native OPD: advantage is per-token (logπ_T − logπ_S), so there is no group to
 # compare against -> n=1. (n>1 only buys something for GRPO / TB-OPD branching.)
-rollout_n=${ROLLOUT_N:-1}
+# Under TB-OPD the group is one fixed-slot fan-out: slot 0 is the main trajectory and
+# the other k are its branches, so n must be 1+k. Branch slots are played *sequentially*
+# after the main slot, so the env pool below does not scale with n -- but wall-clock per
+# step does, roughly by (1+k).
+if [[ "${tb_enable}" == "True" ]]; then
+  rollout_n=${ROLLOUT_N:-$(( 1 + tb_k ))}
+else
+  rollout_n=${ROLLOUT_N:-1}
+fi
 train_batch_size=${TRAIN_BATCH_SIZE:-64}
 # Keep mini == train batch: verl scales both by rollout.n, so this yields exactly
 # ONE optimizer step per rollout batch, i.e. genuinely on-policy distillation.
@@ -113,10 +148,12 @@ actor_lr=${ACTOR_LR:-1e-6}
 alfworld_max_steps=${ALFWORLD_MAX_STEPS:-50}
 # Needs >= ceil(train_batch_size * rollout_n / rollout.agent.num_workers).
 alfworld_pool_size=${ALFWORLD_POOL_SIZE:-16}
-# ATOD parity. ALFWorld actions are short ("go to shelf 1"), but the cap must leave
-# room for the whole turn: truncating before the closing </action> makes the action
-# unparseable and silently falls back to a garbage tail slice.
-alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-512}
+# Per-turn generation cap. 512 was enough when thinking was template-prefilled
+# empty; real <think> blocks need more headroom so </action> is not truncated.
+alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-2048}
+# True: Qwen3 does not pre-fill <think></think>; the model must emit the tags.
+# False restores the old no-think protocol (do not mix with the thinking prompt).
+enable_thinking=${ENABLE_THINKING:-True}
 alfworld_config_path=${ALFWORLD_CONFIG_PATH:-${CODE_DIR}/verl/experimental/agent_loop/alfworld_env/config_tw.yaml}
 
 # ---- rollout / teacher parallelism ----
@@ -143,7 +180,13 @@ DISTILL_NGPUS_PER_NODE=${DISTILL_NGPUS_PER_NODE:-8}
 
 # ---- trainer bookkeeping ----
 project_name=${PROJECT_NAME:-verl_agent_alfworld}
-experiment_name=${EXPERIMENT_NAME:-alfworld_inrepo_opd_qwen3_4b_from_30ba3b}
+if [[ "${tb_enable}" == "True" ]]; then
+  _arm_tag="tbturn_${tb_fork_metric}_a${tb_fork_alpha}_${tb_fork_fuse}_$(
+    [[ "${tb_fork_eligibility}" == "null" ]] && echo all || echo "${tb_fork_eligibility}")_k${tb_k}"
+else
+  _arm_tag="opd"
+fi
+experiment_name=${EXPERIMENT_NAME:-alfworld_inrepo_${_arm_tag}_qwen3_4b_from_30ba3b_thinking}
 trainer_logger=${TRAINER_LOGGER:-"['console','swanlab']"}
 # steps/epoch = alfworld_train_rows / train_batch_size (drop_last). With the
 # defaults above that is 6400/64 = 100 steps, so a couple of epochs is plenty.
@@ -176,7 +219,7 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     data.truncation='error' \
     data.shuffle=True \
     data.return_raw_chat=True \
-    +data.apply_chat_template_kwargs.enable_thinking=False \
+    +data.apply_chat_template_kwargs.enable_thinking=${enable_thinking} \
     actor_rollout_ref.model.path="${STUDENT_MODEL}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -209,6 +252,7 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     +alfworld.max_steps=${alfworld_max_steps} \
     +alfworld.pool_size=${alfworld_pool_size} \
     +alfworld.max_turn_tokens=${alfworld_max_turn_tokens} \
+    +alfworld.record_action_spans=${tb_record_action_spans} \
     +alfworld.config_path="${alfworld_config_path}" \
     +alfworld.train_eval=${ALFWORLD_TRAIN_EVAL} \
     +alfworld.eval_split=${ALFWORLD_EVAL_SPLIT} \
@@ -240,6 +284,24 @@ ${OPYTHON} -m verl.trainer.main_ppo \
     distillation.distillation_loss.use_policy_gradient=${use_policy_gradient} \
     distillation.distillation_loss.loss_max_clamp=10.0 \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
-    distillation.tb_opd.enable=False \
+    distillation.tb_opd.enable=${tb_enable} \
+    distillation.tb_opd.fork_unit=turn \
+    distillation.tb_opd.k=${tb_k} \
+    distillation.tb_opd.only_fail=${tb_only_fail} \
+    distillation.tb_opd.fork_metric=${tb_fork_metric} \
+    distillation.tb_opd.fork_eligibility=${tb_fork_eligibility} \
+    distillation.tb_opd.fork_alpha=${tb_fork_alpha} \
+    distillation.tb_opd.fork_fuse=${tb_fork_fuse} \
+    distillation.tb_opd.fork_normalize=${tb_fork_normalize} \
+    distillation.tb_opd.fork_kl_window=${tb_fork_kl_window} \
+    distillation.tb_opd.disagreement_signed=${tb_disagreement_signed} \
+    distillation.tb_opd.fork_min_entropy=${tb_fork_min_entropy} \
+    distillation.tb_opd.branch_mode=${tb_branch_mode} \
+    distillation.tb_opd.topk_logprobs=${tb_topk_logprobs} \
+    distillation.tb_opd.max_branches_per_traj=${tb_max_branches} \
+    distillation.tb_opd.fork_min_turn_gap=${tb_fork_min_turn_gap} \
+    distillation.tb_opd.turn_first_k=${tb_turn_first_k} \
+    distillation.tb_opd.turn_only_post_tool=${tb_turn_only_post_tool} \
+    distillation.tb_opd.turn_skip_first=${tb_turn_skip_first} \
     "$@" \
     2>&1 | tee "${result_dir}/train-$(date +%Y%m%d_%H%M%S).log"
