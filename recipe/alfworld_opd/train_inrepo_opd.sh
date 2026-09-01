@@ -184,7 +184,12 @@ alfworld_config_path=${ALFWORLD_CONFIG_PATH:-${CODE_DIR}/verl/experimental/agent
 
 # ---- rollout / teacher parallelism ----
 rollout_tp=${ROLLOUT_TP:-2}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.55}
+# 0.45 not 0.55: colocated FSDP actor + vLLM on the student node leaves ~4.5 GiB
+# free at 0.55, which is just under the 4.64 GiB logits slab
+# (max_num_batched_tokens=8192 * vocab=151936 * 4). The 24576 ATOD-protocol
+# run completed val then OOM'd on the first training generate. 0.45 keeps
+# that slab allocatable. Thinking/30720 survived 0.55 by luck (80.3/81.5).
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.45}
 teacher_tp=${TEACHER_TP:-8}
 teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.85}
 
