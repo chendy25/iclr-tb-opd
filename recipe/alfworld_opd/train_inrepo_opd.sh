@@ -191,7 +191,11 @@ rollout_tp=${ROLLOUT_TP:-2}
 # that slab allocatable. Thinking/30720 survived 0.55 by luck (80.3/81.5).
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.45}
 teacher_tp=${TEACHER_TP:-8}
-teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.85}
+# 0.75 not 0.85: teacher is 30B-A3B TP=8 on the worker node. At 0.85 the first
+# training prompt_logprobs pass OOM'd trying to allocate the same 4.64 GiB
+# logits slab (8192 * 151936 * 4) with only 3.89 GiB free. Student 0.45 already
+# survived; this is the remaining colocated-KV squeeze on the teacher.
+teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.75}
 
 # ---- OPD hyperparams (native OPD == k1 + PG, no task reward) ----
 distillation_loss_mode=${DISTILLATION_LOSS_MODE:-k1}
