@@ -1308,6 +1308,16 @@ class AgentLoopWorker:
         return results
 
     @staticmethod
+    def _teacher_logprob_at(teacher_ids, teacher_logprobs, idx: int, tok: int) -> float:
+        """Teacher logprob of ``tok`` at sequence position ``idx`` of the ``(S, K)`` rows."""
+        row_ids, row_lp = teacher_ids[idx], teacher_logprobs[idx]
+        if int(row_ids[0]) == tok:
+            return float(row_lp[0])
+        hit = (row_ids == tok).nonzero()
+        # Token outside the teacher's top-k: bound it by the least likely one kept.
+        return float(row_lp[int(hit[0][0])]) if hit.numel() else float(row_lp.min())
+
+    @staticmethod
     def _tb_teacher_token_logprobs(output: AgentLoopOutput, prompt_len: int) -> Optional[list[float]]:
         """Teacher logprob of each token the student actually emitted, per response position.
 
@@ -1327,14 +1337,42 @@ class AgentLoopWorker:
             idx = prompt_len + p
             if idx >= total:
                 break
-            row_ids, row_lp = teacher_ids[idx], teacher_logprobs[idx]
-            if int(row_ids[0]) == int(tok):
-                out.append(float(row_lp[0]))
-                continue
-            hit = (row_ids == int(tok)).nonzero()
-            # Token outside the teacher's top-k: bound it by the least likely one kept.
-            out.append(float(row_lp[int(hit[0][0])]) if hit.numel() else float(row_lp.min()))
+            out.append(AgentLoopWorker._teacher_logprob_at(teacher_ids, teacher_logprobs, idx, int(tok)))
         return out
+
+    @staticmethod
+    def _record_first_token_probe(output: AgentLoopOutput) -> None:
+        """Log what the teacher thinks of the student's very first generated token.
+
+        Under a pre-filled empty think block (``enable_thinking=False``) that position
+        sits right after a ``</think>`` the template already wrote, and the student
+        answers with a second, redundant one. Whether the *teacher* also wants it there
+        decides the fix: if the teacher's logprob is low, the tag is the student's own
+        quirk and banning it at rollout is safe; if it is high, KD is actively teaching
+        it and the position has to be masked out of the loss instead -- banning would
+        then leave the mass to grow unobserved and reappear the moment sampling is
+        unconstrained. With ``k1`` the teacher returns ``K == 1``, so this is only
+        readable while the student is still the one emitting the token.
+        """
+        teacher_ids = output.extra_fields.get("teacher_ids")
+        teacher_logprobs = output.extra_fields.get("teacher_logprobs")
+        info = output.extra_fields.get("reward_extra_info")
+        if teacher_ids is None or teacher_logprobs is None or not isinstance(info, dict):
+            return
+        if not output.response_ids:
+            return
+        idx = len(output.prompt_ids)
+        if idx >= int(teacher_logprobs.shape[0]):
+            return
+        tok = int(output.response_ids[0])
+        info["first_token_id"] = float(tok)
+        info["first_token_teacher_logprob"] = AgentLoopWorker._teacher_logprob_at(
+            teacher_ids, teacher_logprobs, idx, tok
+        )
+        if output.response_logprobs:
+            # Paired so the k1 term at this one position (student - teacher) is
+            # readable directly, which is the quantity the OPD advantage negates.
+            info["first_token_student_logprob"] = float(output.response_logprobs[0])
 
     async def _tb_generate_branch_turn(
         self,
@@ -1637,6 +1675,8 @@ class AgentLoopWorker:
             validate=validate,
             sample_kwargs=kwargs,
         )
+        # Must run before the pop below, which is what strips the raw teacher rows.
+        self._record_first_token_probe(output)
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
             output.extra_fields.pop("teacher_logprobs", None),

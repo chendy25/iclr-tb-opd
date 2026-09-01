@@ -121,6 +121,45 @@ class AlfWorldAgentLoop(AgentLoopBase):
         # turn's <action> block starts. Locating it costs a few tail decodes per turn,
         # so it is opt-in.
         self.record_action_spans = bool(_cfg("record_action_spans", False))
+        # ``</think>`` id for the redundant-closing-tag probe. Left at None when the
+        # tokenizer has no such token, which disables the probe instead of silently
+        # counting the unk id.
+        close_id = self.tokenizer.convert_tokens_to_ids("</think>")
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+        self._close_think_id = None if close_id is None or close_id == unk_id else int(close_id)
+        self._blank_token_cache: dict[int, bool] = {}
+
+    def _is_blank_token(self, tok: int) -> bool:
+        """Whether a token decodes to whitespace only (cached; few distinct ids)."""
+        cached = self._blank_token_cache.get(tok)
+        if cached is None:
+            cached = self.tokenizer.decode([tok]).strip() == ""
+            self._blank_token_cache[tok] = cached
+        return cached
+
+    def _count_leading_close_think(self, ids: list[int]) -> int:
+        """Redundant ``</think>`` tokens at the start of one generated turn.
+
+        With ``enable_thinking=False`` the chat template pre-fills a *closed* empty
+        think block, so a ``</think>`` the model generates on top of it closes
+        nothing. Exactly one is this protocol's steady state. A run of them is a
+        repetition attractor: once two are in context the pattern is self-similar
+        and the model copies it, the turn never reaches ``<action>``, and the
+        episode burns its whole step budget on "Nothing happens". That is what took
+        the reward from 0.50 to 0.016 over steps 26-33 of the first 200-step run
+        (median 8-36 leading tags, max 136 in one turn), and the count moved two
+        steps before the reward did. Whitespace between tags is skipped so
+        ``</think>\\n\\n</think>`` counts as two rather than stopping at the newline.
+        """
+        if self._close_think_id is None:
+            return 0
+        n = 0
+        for tok in ids:
+            if tok == self._close_think_id:
+                n += 1
+            elif not self._is_blank_token(tok):
+                break
+        return n
 
     def _char_to_token(self, ids: list[int], char_idx: int) -> int:
         """Smallest ``t`` with ``len(decode(ids[:t])) >= char_idx`` (binary search)."""
@@ -244,6 +283,14 @@ class AlfWorldAgentLoop(AgentLoopBase):
         won = False
         num_env_steps = 0
         invalid_actions = 0
+        # Degeneration probes (see _count_leading_close_think). Counted on the raw
+        # generation before projection, so they stay meaningful if a rollout-side
+        # guard that strips or bans the redundant tag is added later.
+        turns_generated = 0
+        turns_no_action = 0
+        lead_close_first = 0
+        lead_close_max = 0
+        lead_close_total = 0
         gamefile = None
         replay_ok = True
         env_actions: list[str] = []
@@ -341,6 +388,16 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 assistant_ids = output.token_ids
                 if not assistant_ids:
                     break
+                # Only a real turn start can carry a redundant closing tag: a fork
+                # resumes mid-turn (carry_ids non-empty), where a ``</think>`` may be
+                # closing a think block the prefix actually opened.
+                if not carry_ids:
+                    n_lead_close = self._count_leading_close_think(assistant_ids)
+                    lead_close_total += n_lead_close
+                    lead_close_max = max(lead_close_max, n_lead_close)
+                    if turns_generated == 0:
+                        lead_close_first = n_lead_close
+                turns_generated += 1
                 turn_start = len(response_mask) - len(carry_ids)
                 turn_ids = carry_ids + assistant_ids
                 carry_ids = []
@@ -370,6 +427,11 @@ class AlfWorldAgentLoop(AgentLoopBase):
                 action, valid = alfworld_projection(assistant_text)
                 if not valid:
                     invalid_actions += 1
+                # Narrower than ``valid``, which also fails on Chinese characters.
+                # This is the failure the repetition attractor produces: the turn
+                # runs out of tokens before it ever emits an action block.
+                if "<action>" not in assistant_text:
+                    turns_no_action += 1
                 if self.record_action_spans:
                     local = self._action_span(turn_ids)
                     action_spans.append(
@@ -443,6 +505,17 @@ class AlfWorldAgentLoop(AgentLoopBase):
             # Episode seed == the game index. Dumped so that "how many distinct games
             # did this batch actually play" is checkable against distinct gamefiles.
             "alfworld_seed": float(seed),
+            # Redundant-``</think>`` probe (see _count_leading_close_think). Baseline
+            # for this protocol is ~1 on the first turn and 0 afterwards; the first
+            # run drifted to a steady 2 after its collapse. ``_max`` is what separates
+            # a benign excursion (3, seen at steps 44-45 with no reward impact) from
+            # the runaway that costs the episode (8+).
+            "alfworld_lead_close_think_first": float(lead_close_first),
+            "alfworld_lead_close_think_max": float(lead_close_max),
+            "alfworld_lead_close_think_per_turn": float(lead_close_total) / max(1, turns_generated),
+            # Fraction of generated turns that never emitted an action block. Tracks
+            # the collapse one-for-one and, unlike the reward, says *why*.
+            "alfworld_turn_no_action_frac": float(turns_no_action) / max(1, turns_generated),
         }
         extra_fields: dict[str, Any] = {
             "alfworld_split": split,
