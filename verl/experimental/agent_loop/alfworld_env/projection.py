@@ -14,10 +14,15 @@
 # limitations under the License.
 """Parse an assistant turn into an ALFWorld env action.
 
-Ported from ATOD ``env_package/alfworld/projection.py`` (single-sample form). The
-contract matches the SOD/ATOD ALFWorld rollout: the action must be wrapped in
-``<action>...</action>`` and the turn must contain a ``<think>...</think>`` block;
-Chinese characters invalidate the action.
+Ported from ATOD ``env_package/alfworld/projection.py`` (single-sample form).
+Validity is a well-formed ``<action>`` block and no Chinese characters.
+
+ATOD also requires a ``<think>...</think>`` pair in the *generated* string.
+That check is dropped: with ``enable_thinking=False`` Qwen3 pre-fills an empty
+think into the prompt, and the model writes its reasoning *after* ``</think>``
+without opening a new tag. Checking the generated tokens for ``<think>`` would
+pin ``valid`` to 0 on every turn (measured ``invalid_action_frac=1.0``) while
+the extracted ``<action>`` is still well-formed.
 """
 
 import re
@@ -32,9 +37,9 @@ def alfworld_projection(text_action: str) -> tuple[str, int]:
     Returns:
         (action, valid): ``action`` is the lowercased command to send to the env
         (a best-effort tail slice when no valid ``<action>`` block is found);
-        ``valid`` is 1 when the turn has a well-formed ``<think>`` block, a
-        well-formed ``<action>`` block, and no Chinese characters; else 0.
-        Matches ATOD ``env_package/alfworld/projection.py``.
+        ``valid`` is 1 when the turn has a well-formed ``<action>`` block and
+        no Chinese characters; else 0. The ATOD ``<think>`` check is omitted
+        (see module docstring).
     """
     original_str = text_action
     lowered = text_action.lower()
@@ -50,11 +55,6 @@ def alfworld_projection(text_action: str) -> tuple[str, int]:
     else:
         action = lowered[start_idx + len(start_tag) : end_idx].strip().lower()
         valid = 1
-
-    think_start = original_str.find("<think>")
-    think_end = original_str.find("</think>")
-    if think_start == -1 or think_end == -1 or think_end <= think_start:
-        valid = 0
 
     # Reject Chinese characters (matches ATOD).
     if re.search(r"[\u4e00-\u9fff]", original_str):

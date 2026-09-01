@@ -96,7 +96,7 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 # Tracks train_inrepo_opd.sh ATOD/TCOD protocol (enable_thinking=False, ~294 tok/step).
 # Thinking-protocol evals must override MAX_RESPONSE_LENGTH=30720 and
 # PPO_MAX_TOKEN_LEN_PER_GPU=40960 or they measure the cap instead of the checkpoint.
-max_response_length=${MAX_RESPONSE_LENGTH:-20480}
+max_response_length=${MAX_RESPONSE_LENGTH:-24576}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 # Must exceed max_num_tokens (22529 here); these two move together.
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}

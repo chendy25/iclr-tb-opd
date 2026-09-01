@@ -145,7 +145,7 @@ Outputs: `iclr/logs/verl_agent_alfworld_eval/eval_<tag>_<split>/`.
 | `ALFWORLD_VAL_ROWS` | `128` | validation episodes (`valid_unseen` has ~255 games) |
 | `TOTAL_EPOCHS` | `2` | 200 steps total at the defaults |
 | `MAX_PROMPT_LENGTH` | `2048` | initial turn only; agent loop silently left-truncates above this |
-| `MAX_RESPONSE_LENGTH` | `20480` | full episode transcript budget (one row = one episode); sized for ATOD-protocol ~294 tok/step — see [Sizing the budget](#sizing-the-budget) |
+| `MAX_RESPONSE_LENGTH` | `24576` | full episode transcript budget (one row = one episode); sized for ATOD-protocol p90 ~484 tok/step — see [Sizing the budget](#sizing-the-budget) |
 | `PPO_MAX_TOKEN_LEN_PER_GPU` | `32768` | must stay above `MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1`; move it with the budget |
 | `ALFWORLD_MAX_STEPS` | `50` | max env steps (assistant turns) per episode (ATOD parity) |
 | `ALFWORLD_POOL_SIZE` | `16` | TextWorld envs per rollout process; need ≥ `batch*n/num_workers` |

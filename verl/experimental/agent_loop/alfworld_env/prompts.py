@@ -25,8 +25,9 @@ The answer contract matches ATOD: a ``<think>`` block then an ``<action>``
 block. Training / eval pass ``enable_thinking=False`` (ATOD/TCOD parity):
 Qwen3's chat template pre-fills an empty ``<think></think>``, so the model
 starts generating after thinking is already closed and typically emits only
-``<action>``. The prompt still *asks* for think -- that is ATOD's prompt, and
-the pre-filled tags satisfy ``alfworld_projection``'s validity check.
+``<action>``. The prompt still *asks* for think -- that is ATOD's prompt. The model
+writes the reasoning after the pre-filled ``</think>``; projection does
+not require a generated ``<think>`` pair.
 
 The previous no-think protocol (``enable_thinking=False`` + "Output nothing
 else", no think requested) is snapshotted under

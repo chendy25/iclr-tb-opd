@@ -156,13 +156,13 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 # turn (history re-injected into the prompt), here one row is a whole episode.
 #
 # Sized for the ATOD/TCOD protocol (enable_thinking=False): template-prefilled empty
-# think, model emits <action> only, ~294 tokens per env step (p90 409). 20480 lets
-# ~90% of episodes reach the 50-step cap. Do NOT reuse the 30720 thinking budget
-# here -- that was sized for real <think> blocks (~493 tok/step).
-# The earlier 12288 cap cut 45% of no-think episodes mid-task (all scoring 0).
-max_response_length=${MAX_RESPONSE_LENGTH:-20480}
+# think each turn, model writes reasoning AFTER </think> then <action>. Measured
+# 375 tok/step (p90 484) over 192 early episodes -- above the 410 that 20480 covers
+# for 50 steps, which left 53% of losses token-bound. 24576 covers 50 steps at up
+# to 491 tok/step. PPO cap 32768 still exceeds 2048+24576+1=26625.
+max_response_length=${MAX_RESPONSE_LENGTH:-24576}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
-# Must exceed max_num_tokens (22529 here) or a single full-length episode cannot form
+# Must exceed max_num_tokens (26625 here) or a single full-length episode cannot form
 # a micro-batch under use_dynamic_bsz -- these two have to move together.
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 actor_lr=${ACTOR_LR:-1e-6}
