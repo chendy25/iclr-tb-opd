@@ -155,25 +155,16 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 # NOT comparable to ATOD's max_response_length=512: there one row is a single
 # turn (history re-injected into the prompt), here one row is a whole episode.
 #
-# Sized so the *policy*, not the budget, decides the outcome. Two measurements, both
-# on 192 episodes, both of which found the budget deciding it instead:
-#   no-think, 12288: 45% of episodes cut off mid-task with ~13 steps unused, all scoring 0.
-#   thinking, 20480: 90% of *losses* were token-bound (median 11 steps unused, all
-#     scoring 0), while wins averaged 6.1k tokens / 13 steps and never exceeded 36
-#     steps. Only 5.7% ever reached the 50-step cap.
-# Real thinking costs ~493 tokens per env step (p90 647) against the no-think ~294, so
-# enabling it consumed the entire headroom the 12288 -> 20480 bump had bought.
-# Trimming the per-turn instruction boilerplate (see alfworld_env/prompts.py) takes
-# ~38 tokens a step back off that. 30720 covers 50 steps at up to 614 tokens/step.
-# Measured after the change, same 192-episode window: 455.6 tokens/step (p90 604.8),
-# token-bound losses 88.3% -> 11.9%, episodes reaching the 50-step cap 5.7% -> 39.6%.
-# p90 now sits just under the 614 capacity, which is the intended design point --
-# the step cap, not the token cap, is what ends a long episode.
-max_response_length=${MAX_RESPONSE_LENGTH:-30720}
+# Sized for the ATOD/TCOD protocol (enable_thinking=False): template-prefilled empty
+# think, model emits <action> only, ~294 tokens per env step (p90 409). 20480 lets
+# ~90% of episodes reach the 50-step cap. Do NOT reuse the 30720 thinking budget
+# here -- that was sized for real <think> blocks (~493 tok/step).
+# The earlier 12288 cap cut 45% of no-think episodes mid-task (all scoring 0).
+max_response_length=${MAX_RESPONSE_LENGTH:-20480}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
-# Must exceed max_num_tokens (32769 here) or a single full-length episode cannot form
+# Must exceed max_num_tokens (22529 here) or a single full-length episode cannot form
 # a micro-batch under use_dynamic_bsz -- these two have to move together.
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 actor_lr=${ACTOR_LR:-1e-6}
 
 # ---- alfworld env loop ----
@@ -182,12 +173,13 @@ actor_lr=${ACTOR_LR:-1e-6}
 alfworld_max_steps=${ALFWORLD_MAX_STEPS:-50}
 # Needs >= ceil(train_batch_size * rollout_n / rollout.agent.num_workers).
 alfworld_pool_size=${ALFWORLD_POOL_SIZE:-16}
-# Per-turn generation cap. 512 was enough when thinking was template-prefilled
-# empty; real <think> blocks need more headroom so </action> is not truncated.
-alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-2048}
-# True: Qwen3 does not pre-fill <think></think>; the model must emit the tags.
-# False restores the old no-think protocol (do not mix with the thinking prompt).
-enable_thinking=${ENABLE_THINKING:-True}
+# Per-turn generation cap. 512 matches ATOD's max_response_length (one turn) and
+# is enough when think is template-prefilled empty. Raise to 2048 only if
+# ENABLE_THINKING=True so a real <think> block does not truncate </action>.
+alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-512}
+# False = ATOD/TCOD: Qwen3 pre-fills empty <think></think>, model emits <action>.
+# True = model generates the think tags itself (experiment names end in _thinking).
+enable_thinking=${ENABLE_THINKING:-False}
 alfworld_config_path=${ALFWORLD_CONFIG_PATH:-${CODE_DIR}/verl/experimental/agent_loop/alfworld_env/config_tw.yaml}
 
 # ---- rollout / teacher parallelism ----
@@ -220,12 +212,15 @@ if [[ "${tb_enable}" == "True" ]]; then
 else
   _arm_tag="opd"
 fi
-experiment_name=${EXPERIMENT_NAME:-alfworld_inrepo_${_arm_tag}_qwen3_4b_from_30ba3b_thinking}
+# _atodproto: ATOD/TCOD protocol (enable_thinking=False + prompt still asks for
+# think). Distinct from the old "Output nothing else" dumps (no suffix) and from
+# the real-thinking dumps (_thinking).
+experiment_name=${EXPERIMENT_NAME:-alfworld_inrepo_${_arm_tag}_qwen3_4b_from_30ba3b_atodproto}
 trainer_logger=${TRAINER_LOGGER:-"['console','swanlab']"}
 # steps/epoch = alfworld_train_rows / train_batch_size (drop_last). With the
 # defaults above that is 6400/64 = 100 steps, so a couple of epochs is plenty.
 total_epochs=${TOTAL_EPOCHS:-2}
-save_freq=${SAVE_FREQ:-50}
+save_freq=${SAVE_FREQ:-25}
 test_freq=${TEST_FREQ:-25}
 val_before_train=${VAL_BEFORE_TRAIN:-True}
 ckpt_dir=${CKPT_DIR:-${DATA_ROOT}/../iclr/logs/${experiment_name}/ckpt}

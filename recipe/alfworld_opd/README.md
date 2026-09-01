@@ -145,12 +145,12 @@ Outputs: `iclr/logs/verl_agent_alfworld_eval/eval_<tag>_<split>/`.
 | `ALFWORLD_VAL_ROWS` | `128` | validation episodes (`valid_unseen` has ~255 games) |
 | `TOTAL_EPOCHS` | `2` | 200 steps total at the defaults |
 | `MAX_PROMPT_LENGTH` | `2048` | initial turn only; agent loop silently left-truncates above this |
-| `MAX_RESPONSE_LENGTH` | `30720` | full episode transcript budget (one row = one episode); sized so 50 steps are reachable at the p90 cost/step — see [Sizing the budget](#sizing-the-budget) |
-| `PPO_MAX_TOKEN_LEN_PER_GPU` | `40960` | must stay above `MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1`; move it with the budget |
+| `MAX_RESPONSE_LENGTH` | `20480` | full episode transcript budget (one row = one episode); sized for ATOD-protocol ~294 tok/step — see [Sizing the budget](#sizing-the-budget) |
+| `PPO_MAX_TOKEN_LEN_PER_GPU` | `32768` | must stay above `MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1`; move it with the budget |
 | `ALFWORLD_MAX_STEPS` | `50` | max env steps (assistant turns) per episode (ATOD parity) |
 | `ALFWORLD_POOL_SIZE` | `16` | TextWorld envs per rollout process; need ≥ `batch*n/num_workers` |
-| `ALFWORLD_MAX_TURN_TOKENS` | `2048` | per-turn generation cap (raised for real `<think>` blocks) |
-| `ENABLE_THINKING` | `True` | Qwen3 chat-template flag; `True` = do **not** pre-fill empty think tags |
+| `ALFWORLD_MAX_TURN_TOKENS` | `512` | per-turn generation cap (ATOD's per-turn `max_response_length`; raise to 2048 only with `ENABLE_THINKING=True`) |
+| `ENABLE_THINKING` | `False` | ATOD/TCOD: Qwen3 pre-fills empty `<think></think>`; set `True` for real think generation (`_thinking` experiment names) |
 | `LOSS_AGG_MODE` | `token-mean` | matches plain-OPD (B1) |
 | `ROLLOUT_TEMPERATURE` | `1.0` | sample from the student's own distribution |
 | `ALFWORLD_TRAIN_EVAL` | `train` | env split for training rollouts |
@@ -403,15 +403,14 @@ Reference: `refs/ATOD/examples/sod_trainer/run_alfworld_sod_qwen3_4b.sh`. Matche
 - **stub rows (16 → 6400).** ATOD sets `train_data_size == train_batch_size`, i.e.
   one step per epoch over a fixed 16 games, repeated for 150 epochs. We instead
   sweep the full ~6.4k-game train split; step count ends up comparable (200 vs 150).
-- **Real `<think>` generation (ATOD asks for think in the prompt but still sets
-  `enable_thinking=False`, which pre-fills an empty block).** We set
-  `enable_thinking=True` so Qwen3 does **not** pre-fill `<think></think>`; the
-  model must emit the tags. Prompt and `alfworld_projection` again require a
-  `<think>` block (ATOD's validity check). Per-turn cap is 2048 (was 512).
-  Thinking tokens also eat the episode `MAX_RESPONSE_LENGTH` budget — raise it
-  (and `PPO_MAX_TOKEN_LEN_PER_GPU`) if 50-step episodes start dying mid-task.
-  The previous no-think protocol and dumps are snapshotted at
-  `iclr/logs/_backup_alfworld_nothink_20260831/`.
+- **Think protocol matches ATOD/TCOD.** Prompt asks for `<think>` then `<action>`;
+  `enable_thinking=False` so Qwen3 pre-fills an empty `<think></think>` and the
+  model emits the action. `alfworld_projection` still requires a `<think>` block
+  (the pre-filled tags satisfy it). Experiment name suffix `_atodproto`. The
+  earlier "Output nothing else" dumps (no think requested) are at
+  `iclr/logs/_backup_alfworld_nothink_20260831/`; real think generation
+  (`enable_thinking=True`) is under `_thinking` and is a separate, non-comparable
+  protocol — it collapsed around step 28 via `</think>` / `<tool_call>` loops.
 - **`use_invalid_action_penalty` not ported.** It edits `token_level_scores`, which
   never reaches the advantage when `use_task_rewards=False`. The signal is still
   observable via the `alfworld_invalid_action_frac` extra field.

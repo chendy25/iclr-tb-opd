@@ -93,29 +93,28 @@ fi
 
 val_n=${VAL_N:-1}
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
-# Tracks train_inrepo_opd.sh. Eval has to be no more budget-starved than training or
-# it measures the cap instead of the checkpoint: at 20480 with thinking on, 90% of
-# losing episodes ended token-bound with steps still unused. Dumps produced before
-# this bump (and the no-think ones) ran at 12288/20480, so absolute success rates are
-# only comparable within a budget -- see the run_eval_seen_resp28k.sh sweep.
-max_response_length=${MAX_RESPONSE_LENGTH:-30720}
+# Tracks train_inrepo_opd.sh ATOD/TCOD protocol (enable_thinking=False, ~294 tok/step).
+# Thinking-protocol evals must override MAX_RESPONSE_LENGTH=30720 and
+# PPO_MAX_TOKEN_LEN_PER_GPU=40960 or they measure the cap instead of the checkpoint.
+max_response_length=${MAX_RESPONSE_LENGTH:-20480}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
-# Must exceed max_num_tokens (32769 here); these two move together.
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-40960}
+# Must exceed max_num_tokens (22529 here); these two move together.
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}
 alfworld_max_steps=${ALFWORLD_MAX_STEPS:-50}
 alfworld_pool_size=${ALFWORLD_POOL_SIZE:-16}
-alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-2048}
+alfworld_max_turn_tokens=${ALFWORLD_MAX_TURN_TOKENS:-512}
 alfworld_config_path=${ALFWORLD_CONFIG_PATH:-${CODE_DIR}/verl/experimental/agent_loop/alfworld_env/config_tw.yaml}
 # Match the training-time val protocol (val_kwargs.temperature=0.4).
 val_temperature=${VAL_TEMPERATURE:-0.4}
-# True: do not pre-fill empty <think></think>; the model generates the tags.
-enable_thinking=${ENABLE_THINKING:-True}
+# False = ATOD/TCOD: template pre-fills empty <think></think>.
+# True = model generates the think tags (pair with MAX_RESPONSE_LENGTH=30720).
+enable_thinking=${ENABLE_THINKING:-False}
 
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 TRAINER_NNODES=${TRAINER_NNODES:-1}
 
 project_name=${PROJECT_NAME:-verl_agent_alfworld_eval}
-experiment_name=${EXPERIMENT_NAME:-eval_${MODEL_TAG}_${split_tag}_thinking}
+experiment_name=${EXPERIMENT_NAME:-eval_${MODEL_TAG}_${split_tag}_atodproto}
 trainer_logger=${TRAINER_LOGGER:-"['console','swanlab']"}
 result_dir=${RESULT_DIR:-${DATA_ROOT}/../iclr/logs/${project_name}/${experiment_name}}
 ckpt_dir=${result_dir}/ckpt

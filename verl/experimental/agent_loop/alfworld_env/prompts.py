@@ -22,11 +22,16 @@ therefore only render:
   - a compact follow-up user turn carrying the new observation each step.
 
 The answer contract matches ATOD: a ``<think>`` block then an ``<action>``
-block. Training / eval pass ``enable_thinking=True`` (or omit the kwarg) so
-Qwen3's chat template does **not** pre-fill an empty ``<think></think>``;
-the model has to emit the tags itself. The previous no-think protocol
-(``enable_thinking=False`` + "Output nothing else") is snapshotted under
-``iclr/logs/_backup_alfworld_nothink_20260831/``.
+block. Training / eval pass ``enable_thinking=False`` (ATOD/TCOD parity):
+Qwen3's chat template pre-fills an empty ``<think></think>``, so the model
+starts generating after thinking is already closed and typically emits only
+``<action>``. The prompt still *asks* for think -- that is ATOD's prompt, and
+the pre-filled tags satisfy ``alfworld_projection``'s validity check.
+
+The previous no-think protocol (``enable_thinking=False`` + "Output nothing
+else", no think requested) is snapshotted under
+``iclr/logs/_backup_alfworld_nothink_20260831/``. The real-thinking protocol
+(``enable_thinking=True``) lives under experiment names ending in ``_thinking``.
 """
 
 from typing import List
@@ -39,21 +44,15 @@ Now it's your turn to take an action.
 You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
 Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
-# The follow-up carries a *compact* restatement of the answer contract rather than
-# the initial turn's full one. Every env step appends one of these to the response,
-# so each token here is paid ~50 times per episode: the long form measured 89 tokens
-# a turn, 2279 per episode, 17.7% of the entire response budget spent re-explaining
-# a format the model had already followed correctly for 30 turns.
-#
-# It is not dropped outright. Empty <think> blocks are ~0% for the first third of an
-# episode and climb to ~6% by the last, i.e. the model drifts off-protocol as the
-# transcript grows -- exactly where a reminder earns its keep. This keeps both tag
-# names and "admissible" (the three things the model actually has to get right) and
-# drops the prose around them.
+# Same answer contract as ATOD's per-turn prompt. Every env step appends one of
+# these to the response; with enable_thinking=False the model is not generating
+# a real think block, so the extra tokens are cheap relative to observations.
 ALFWORLD_FOLLOWUP_TEMPLATE = """Your new observation is: {current_observation}
 Your admissible actions of the current situation are: [{admissible_actions}].
 
-Now it's your turn: reason step-by-step within <think> </think> tags, then give one admissible action within <action> </action> tags."""
+Now it's your turn to take an action.
+You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags.
+Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags."""
 
 
 def _format_admissible(admissible_actions: List[str]) -> str:

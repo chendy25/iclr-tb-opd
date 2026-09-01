@@ -30,7 +30,7 @@
 # Cost: branch slots are played sequentially after the main slot, so a step costs
 # roughly (1+k) episodes of wall clock. The env pool does NOT need to grow with k.
 #
-# Prereq: the thinking-protocol baseline must exist for comparison --
+# Prereq: the ATOD-protocol OPD baseline must exist for comparison --
 #   bash recipe/alfworld_opd/train_inrepo_opd.sh
 set -xeuo pipefail
 
